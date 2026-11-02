@@ -149,6 +149,9 @@ set(TPV_VITA_SOURCES
   ${TPV_DIR}/vita/src/borealis_cli_stub.cpp
   ${TPV_DIR}/vita/src/libc_stubs.cpp
   ${TPV_DIR}/vita/src/text_pad.cpp
+  # Crash reporting: --wrap reaches every abort(); crash_symbols.cpp resolves the address.
+  ${TPV_DIR}/vita/src/crash_record.cpp
+  ${TPV_DIR}/vita/src/crash_symbols.cpp
   ${TPV_DIR}/vita/aurora/backend.cpp
   ${TPV_DIR}/vita/aurora/aurora_stubs.cpp
   ${TPV_DIR}/vita/aurora/imgui_vita.cpp
@@ -207,12 +210,38 @@ target_link_libraries(tpv_vita PRIVATE
 # is 0 return EINVAL(22); if it is -1 call pte_mutex_check_need_init() and lock lazily. So a
 # statically initialised mutex works once real pthread is linked, whereas a zeroed one would return
 # EINVAL and std::mutex::lock() would throw std::system_error(22).
+# Crash symbol resolution. The map is produced by the same link that produces the ELF, so the table
+# it yields describes the previous build on the first pass and the current one thereafter. That is
+# deliberate: a stale table is only ever consulted when the process is already aborting, and the
+# alternative (linking twice on every build) costs minutes. The table is regenerated below whenever
+# the map changes, so a crash log names the symbols of the build that crashed.
+set(TPV_CRASH_MAP "${CMAKE_CURRENT_BINARY_DIR}/tpv_vita.map")
+set(TPV_CRASH_TABLE "${CMAKE_CURRENT_BINARY_DIR}/generated/crash_map.inc")
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
+
 target_link_options(tpv_vita PRIVATE
   -Wl,--undefined=pthread_once
   -Wl,--undefined=pthread_cancel
   -Wl,--undefined=pthread_rwlock_rdlock
   -Wl,--undefined=pthread_rwlock_unlock
-  -Wl,--undefined=pthread_rwlock_wrlock)
+  -Wl,--undefined=pthread_rwlock_wrlock
+  # Catch every abort() in the process without editing dusklight: newlib defines abort as a strong
+  # global, so --wrap redirects all call sites to __wrap_abort in vita/src/crash_record.cpp.
+  # __assert_func is wrapped too, because a failed assert otherwise loses its expression and line
+  # before the log can be flushed.
+  -Wl,--wrap=abort
+  -Wl,--wrap=__assert_func
+  -Wl,-Map=${TPV_CRASH_MAP})
+
+# Compile the (possibly empty) crash table in. crash_symbols.cpp #includes it as a string-literal body.
+target_include_directories(tpv_vita PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+
+# After each link: turn the map into the table for the NEXT build. Kept off the critical path.
+add_custom_command(TARGET tpv_vita POST_BUILD
+  COMMAND ${Python3_EXECUTABLE} ${TPV_DIR}/tools/map_symbols.py ${TPV_CRASH_MAP} ${TPV_CRASH_TABLE}.next
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${TPV_CRASH_TABLE}.next ${TPV_CRASH_TABLE}
+  COMMENT "Regenerating crash symbol table from the link map"
+  VERBATIM)
 
 
 # Static libs are order-sensitive: libstdc++ (std::condition_variable -> pthread_cond_*) and bzip2
