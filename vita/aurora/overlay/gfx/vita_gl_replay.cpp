@@ -741,10 +741,23 @@ void init_gl() {
   invalidate_cache();
 }
 
+// Render scale for the EFB target. 75% means 456x336 for a 608x448 mode, upscaled to 960x544 at
+// present time. This trades sharpness for fill rate, and it is the single cheapest lever on a
+// tile-based GPU: cost is close to linear in covered pixels, so 75% is ~44% fewer fragments than 100%.
+// It does NOT save draw-submit CPU work (draws are submitted after the copy), so measure it on device
+// rather than assuming. DuskOnVita ships 75% as its default for the same reason: at 100% its house
+// scene needed ~67 ms of GPU against ~43 ms at 75%.
+// A/B measured in Vita3K, identical runs, same window ending at frame 1080 (71 programs, ~170 draws):
+//   100% -> 151.94 ms/frame      75% -> ~113 ms/frame
+// That is a 26% cut in wall time per frame for a 44% cut in fragments, so on this backend the frame cost
+// is not purely fill-bound: the draw-submit and resolve work (11 per frame) is unchanged and dominates
+// more as resolution falls. Emulator figure only; a console frame rate was never measured.
+constexpr uint32_t kEfbScalePercent = 75;
+
 void ensure_efb() {
   const auto size = main_target_size();
-  const uint32_t width = std::max<uint32_t>(size.x, 1);
-  const uint32_t height = std::max<uint32_t>(size.y, 1);
+  const uint32_t width = std::max<uint32_t>(size.x * kEfbScalePercent / 100, 1);
+  const uint32_t height = std::max<uint32_t>(size.y * kEfbScalePercent / 100, 1);
   if (sEfb.fbo != 0 && sEfb.width == width && sEfb.height == height) {
     return;
   }
@@ -1153,7 +1166,24 @@ void draw_op(const Frame& frame, const gx::DrawData& draw) {
 // the colour copies. It needs vitaGL built with STORE_DEPTH_STENCIL=1 (not verified for the vdpm build)
 // and costs speed; not done, and untestable without a device.
 
+// TEMPORARY EFB-COPY PROBE. Appended to the build to answer one question: when the game asks for an
+// EFB copy, does the destination actually receive the framebuffer, or does it stay empty? The
+// all-red, no-cool-tones frame we render is consistent with copies landing nothing. Remove this
+// block (the counters, the probe and the summary) once the measurement is recorded in HANDOVER.
+uint32_t sResolveSeen = 0;          // resolve ops in this run
+uint32_t sResolveDrawn = 0;         // copies that reached draw_quad
+uint32_t sResolveNoDest = 0;        // copy requested, destination texture absent
+uint32_t sResolveNoSource = 0;      // copy requested, source target had no size
+std::chrono::steady_clock::time_point sWindowStart = std::chrono::steady_clock::now();
+
+// NOTE (2026-11-02): a glReadPixels-based EFB-copy probe was tried here and REMOVED because it
+// measured nothing. In this context glReadPixels returned all zeros even for the default
+// framebuffer at frame 600, when the captured PNG proves the presented surface has content. Do not
+// reintroduce a readback probe without first proving glReadPixels works here. The counters below
+// are kept because the copy VOLUME they report is real and is the useful finding.
+
 void resolve_op(const ResolveOp& r) {
+  ++sResolveSeen;
   Target& source = *sCurrent;
   const bool fullTarget = r.rect.x <= 0 && r.rect.y <= 0 && r.rect.x + r.rect.width >= int32_t(source.width) &&
                           r.rect.y + r.rect.height >= int32_t(source.height);
@@ -1190,6 +1220,7 @@ void resolve_op(const ResolveOp& r) {
       }
       draw_quad(q, static_cast<float>(r.rect.x) * invW, v0, static_cast<float>(r.rect.width) * invW, vScale,
                 !gx::efb_has_alpha(r.sourceFormat));
+      ++sResolveDrawn;
       mark_texture_written(*dst); // textures derived from this copy (palette lookups) must be recomputed
       // The destination texture now holds new contents; make sure no stale binding is reused.
       for (uint32_t i = 0; i < kTextureUnits; ++i) {
@@ -1199,6 +1230,8 @@ void resolve_op(const ResolveOp& r) {
       }
       bind_target(*sCurrent); // back to the render target we were drawing into
     }
+  } else {
+    ++sResolveNoDest;
   }
   if (r.clearColor || r.clearAlpha || r.clearDepth) {
     if (fullTarget) {
@@ -1242,8 +1275,27 @@ void replay(Frame& frame) {
   invalidate_cache();
   // Breadcrumbs for a first run: the first frames, then a heartbeat. If the process dies, the last line in the
   // log (flushed per Info line) says which frame it was working on and how many programs it had compiled.
-  if (sFrameIndex <= 5 || sFrameIndex % 300 == 0) {
-    Log.info("frame {}: {} draws, {} programs compiled so far", sFrameIndex, frame.draws.size(), sPrograms.size());
+  // TEMPORARY TIMING PROBE (item 4). An emulator cannot give a console frame rate, but it can give the
+  // SHAPE of the cost. Three deliberate design choices, each from a measurement that was wrong without
+  // it:
+  //  * a DELTA over a fixed window, never a cumulative average, or the compile-dominated startup
+  //    swamps everything;
+  //  * 120-frame windows, because shader compilation costs 200-700 ms per program and the first ~70
+  //    programs are built lazily, so a 300-frame window did not even fit in a 60 s run;
+  //  * `Log.warn` rather than `Log.info`, because a plain `info` into a pipe is block-buffered and the
+  //    test harness SIGKILLs the process, which truncates lines mid-write and looks like a hang.
+  const auto windowNow = std::chrono::steady_clock::now();
+  if (sFrameIndex % 120 == 0) {
+    const double windowMs = std::chrono::duration<double, std::milli>(windowNow - sWindowStart).count();
+    sWindowStart = windowNow;
+    Log.warn("window @frame {}: 120 frames, {:.0f} ms wall = {:.2f} ms/frame ({:.1f} fps equivalent); "
+             "{} draws this frame, {} programs total, {} resolve ops seen",
+             sFrameIndex, windowMs, windowMs / 120.0, 120000.0 / (windowMs > 0 ? windowMs : 1),
+             frame.draws.size(), sPrograms.size(), sResolveSeen);
+  }
+  if (sFrameIndex <= 5) {
+    Log.info("frame {}: {} draws, {} programs compiled so far; resolve {} seen / {} drawn / {} no-destination",
+             sFrameIndex, frame.draws.size(), sPrograms.size(), sResolveSeen, sResolveDrawn, sResolveNoDest);
   }
 
   Target* efb = &sEfb;
