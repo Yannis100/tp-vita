@@ -1,10 +1,15 @@
 # Handover: Twilight Princess on PS Vita
 
 **Written:** 2026-10-29
-**Updated:** 2026-11-02 — §7.2 (BMD null deref) root-caused and fixed; §7.3 (every texture upload
-failing) root-caused and fixed, which raised rendered colour counts ~20-28x; traps 12-15 added in
-§8; dusklight uncommitted-file count is now 14. §7.1 is still open and unchanged. The next highest
-value item is a reference desktop render (§7.4).
+**Updated:** 2026-11-02 (second revision) — the DuskOnVita audit (§7.5) changed two conclusions.
+**§7.1 is now partly solved:** the retail GameCube arena trim was live and was removing 24 MiB from
+the guest arena on every run; it is now guarded, measured at 40 MiB before and 64 MiB after. The
+`0xBF18265F` allocation itself is still unexplained. **§7.2 is downgraded:** the null dereference is
+real and fixed, but DuskOnVita ships byte-identical code and boots, so it is latent and is not
+established as our crash cause. §7.3 (texture upload) stands and was independently confirmed by that
+port. Also added: `NOTICE` and `LICENSES/`, and an honest statement of the vitaGL LGPL position,
+which currently makes this repository source-only. The next highest value item is still a reference
+desktop render (§7.4).
 **For:** a fresh ZooCode session picking up this port
 **Read this first, then `PLAN.md` and `README.md`.**
 
@@ -59,14 +64,17 @@ verified from emulator artefacts, not assumed.
 
 Verified as of this handover:
 
-- Build is clean: `cmake --build build -j` exits 0, produces `build/tpv_vita.vpk`
-  (15,886,724 bytes), text→data gap 111,956 bytes.
+- Build is clean: `cmake --build build -j` exits 0, produces `build/tpv_vita.vpk`,
+  text→data gap 111,116 bytes.
 - `mDoMch_Create()` returns 1 (previously it never returned).
 - `main01()` enters its `do { ... } while (dusk::IsRunning)` loop and keeps iterating.
 - Vita3K renders real frames: after the §7.3 texture fix, screenshots carry 78,360–87,870 distinct
   colours each (before it: 1,614–3,979, i.e. untextured), with content
   bounding box `(271,128)–(1008,671)` on a 1280×800 canvas.
-- Zero failing allocations, zero crash markers during a clean run.
+- Zero failing allocations, zero crash markers, zero `GL error uploading` warnings during a clean
+  run, and `JKRExpHeap::create` succeeds repeatedly with ~21.9 MiB free in `gameHeap`.
+- The guest arena is now **64 MiB** (`67092240` bytes). Until this revision the retail GameCube
+  trim was silently removing 24 MiB from it every run (§7.1).
 - All host test suites pass (numbers in §6).
 
 **What that does not prove.** Vita3K is an emulator; nothing here has run on real hardware.
@@ -405,45 +413,66 @@ link flags for that test, **stop and read `run.sh` first**.
 
 ## 7. Open problems
 
-### 7.1 (Priority) Intermittent garbage-size allocation — undiagnosed
+### 7.1 Heap budget — the retail arena trim was live, and is now gone (2026-11-02)
 
-One run in seven failed with:
+**Status: the size arithmetic is now sane; the `0xBF18265F` allocation itself is still unexplained.**
+
+What used to happen: one run in seven failed with
 
 ```
 JKRExpHeap: do_alloc FAILING size=0xBF18265F align=32 heap=archiveHeap
             heapsize=0x8DFF50 used=0x6B4678 free=0x22B794
 ```
 
-`0xBF18265F` is 3.2 GiB against a heap with 2.27 MiB free — a **corrupted size argument, not
-exhaustion**. It is a different fault from the two heap bugs in §4.4.
+`0xBF18265F` is 3.0 GiB against a heap with 2.27 MiB free — a **corrupted size argument, not
+exhaustion**.
 
-What is ruled out, by arithmetic rather than guesswork:
+**Found this session, and it is a different bug from the one we were hunting.** At
+[`m_Do_machine.cpp`](dusklight/src/m_Do/m_Do_machine.cpp:790) `mDoMch_Create()` ran the **retail
+GameCube arena trim**, unguarded:
+
+```cpp
+uintptr_t arenaHi = (uintptr_t)OSGetArenaHi();
+if (arenaHi > 0x81800000 && arenaHi - 0x1800000 > arenaLo)
+    OSSetArenaHi((void*)(arenaHi - 0x1800000));
+```
+
+`0x81800000` is a physical GameCube address. A Vita process relocates the guest arena, so the
+comparison describes a machine that is not there — and **it fired anyway**. Measured in Vita3K:
+
+| | `arena lo` | `arena hi` | `size` | MiB |
+|---|---|---|---|---|
+| with the trim (old build) | `0x8314c1c0` | `0x859481c0` | 41926416 | **40** |
+| trim compiled out (this build) | `0x8314c1a8` | `0x871481a8` | 67092240 | **64** |
+
+The delta is exactly `0x1800000` = 24 MiB. So every run until now handed the game a guest arena
+24 MiB smaller than the platform actually provided, and the heaps carved from it (§4.4's bounded
+budget) were sized against a figure the hardware never returns. That is a plausible reason the
+budget has felt tight and a plausible contributor to allocation failures at room-load time.
+
+The fix is `#if !DEBUG && !TARGET_VITA` around the block, with the measurement recorded in the
+comment so nobody re-adds it. Verified: `0x81800000` no longer appears anywhere in
+`mDoMch_Create` (`0x810b5648`, size `0xb64`) in the built ELF, and the trace reports 64 MiB.
+
+**What is still open.** This does not explain a 3.0 GiB size argument, and it must not be recorded
+as if it did. Still ruled out by arithmetic:
 
 - [`daMP_THPPlayerCalcNeedMemory()`](dusklight/src/d/actor/d_a_movie_player.cpp:3673) — every term
   is `ALIGN_NEXT(..., 32)`, so its result is always a multiple of 32. The observed value has
   `& 0x1F == 0x1F`. **Not the source.**
-- The room expand buffer at [`d_s_room.cpp:494`](dusklight/src/d/d_s_room.cpp:494) is plain data
-  and not obviously culpable, but also not cleared.
+- `0xBF18265F` as IEEE-754 is ≈ -0.594, which looked promising as a float-as-size bug, but the
+  value is not 32-aligned, so it does not come from a 32-aligned calculator.
 
-Ruled out as non-signature: `0xBF18265F` as IEEE-754 is ≈ -0.594, which looked promising as a
-float-as-size bug, but the value is not 32-aligned so it does not come from a 32-aligned
-calculator.
-
-**Instrumentation is in place.** The failure path in `JKRExpHeap::do_alloc` records
-`__builtin_return_address(0)`, so if it recurs the trace will name the caller:
+The failure path in `JKRExpHeap::do_alloc` still records `__builtin_return_address(0)`:
 
 ```
 exp_trace("do_alloc FAILING size=0x%X align=%d heap=%s heapsize=0x%X used=0x%X free=0x%X "
           "caller=%p", ...);
 ```
 
-Six consecutive trials afterwards were clean, so it is genuinely intermittent. My **guess**
-(labelled a guess) is a race: it appeared once in seven runs and vanished for six, and the
-plausible actors during room loading are the DVD worker thread and the tracker allocator. Do not
-act on that without a reproduction.
-
-**Next step:** loop the emulator run until it reproduces, then symbolise `caller=%p` against the
-ELF. `arm-vita-eabi-addr2line -e build/tpv_vita` with the guest address.
+**Next step:** with 24 MiB more arena in place, watch whether the frequency changes at all. If it
+still recurs, loop the run and symbolise `caller=%p` with
+`arm-vita-eabi-addr2line -e build/tpv_vita`.
 
 ### 7.2 BMD loader invalid reads — ROOT-CAUSED AND FIXED (2026-11-02)
 
@@ -498,13 +527,21 @@ explicit `cmp.w ip, #0` / `beq` guard before any store. Rebuild is clean; a Vita
 reaches `main01: entering main loop`, renders two frames with the exact expected bbox
 `(271,128)–(1008,671)`, and shows no allocation failure and no crash marker.
 
-**What remains unproven:** whether these were the reads reported earlier. The original report lost
-the faulting instruction, and neither address can be re-symbolised now. The null-deref path is real
-and reachable and is now closed, but treat "§7.2 is fixed" as "the one reachable null dereference
-in this area is fixed", not as "the earlier log is explained".
+**What remains unproven, and is now weaker than it looked.** Whether these were the reads reported
+earlier. The original report lost the faulting instruction, and neither address can be
+re-symbolised now.
 
-Note that `do_alloc` on `TARGET_PC` **aborts** on failure, so if these reads are the same defect as
-§7.1 they will present as `SIGABRT`, not as a graceful failure.
+The DuskOnVita audit (§7.5) made this sharper. That port pins dusklight `34a144a`, three commits
+behind our base, and its [`J3DJointTree.cpp`](dusklight/libs/JSystem/src/J3DGraphAnimator/J3DJointTree.cpp:24)
+is **byte-identical** to ours — same NULL `pJoint`, same `'NJNT'` constant, same shadowing nested
+`newMaterial`. **None of its 34 patches touch J3D, joints, BMD or the hierarchy loader, and it boots
+and plays on hardware.** So this defect is real, inherited and worth fixing, but on a well-formed
+disc image it is latent rather than routinely taken, and it is **not** established as the cause of
+our earlier crash. Correct wording: *a genuine reachable null dereference on this path is fixed;
+the earlier log is still unexplained.*
+
+Note that `do_alloc` on `TARGET_PC` **aborts** on failure, so if these reads were the same defect as
+§7.1 they would present as `SIGABRT`, not as a graceful failure.
 
 ### 7.3 Every texture upload was failing — ROOT-CAUSED AND FIXED (2026-11-02)
 
@@ -582,15 +619,89 @@ and the `1` was the wrong pack alignment for RGBA anyway.
   every visual judgement here — including the missing cool tones above — is a guess.
 - Card saves, pause menu, gameplay content.
 
+### 7.5 The DuskOnVita audit: what another port already answered (2026-11-02)
+
+[`NathanKneT/DuskOnVita`](https://github.com/NathanKneT/DuskOnVita) is an independent,
+MIT-licensed Twilight Princess Vita port — **not a fork of ours**, and materially further along. It
+is the reference implementation for everything left on our board. Clone it to `/tmp/DuskOnVita` to
+read it; nothing from it is vendored here.
+
+**What it establishes, with console measurements (PS Vita 1000, 28 Oct 2026, build b2):**
+
+| Scene | FPS | Bottleneck |
+|---|---:|---|
+| Ordon, outside Link's house | 27.9 / 27.4 | GX worker |
+| Castle Town, twilight | 21.7 / 19.4 | main thread |
+| Faron fight | 18.3 / 14.6 | main thread |
+| Hyrule Field bridge | 17.6 / 19.2 | main thread and GX worker |
+| Kakariko, twilight | 12.1 / 12.7 | main thread |
+| Ordon village centre | 11.9 / 12.5 | main thread |
+
+Its first build (22 Oct) did **6.3 FPS**; this is 4x in six days. It reaches the title screen, starts
+a new game, plays the Ordon opening, saves, and runs at 444 MHz via `scePower` with no plugin,
+rendering at 75 % (720x408) scaled to 960x544, with game ticks pinned to 30 Hz so speed holds down
+to 15 FPS.
+
+**Conclusion for us: the port is feasible on real hardware.** That question is now closed, and it
+never needed to be answered by our own VPK.
+
+Where the two ports differ, and what each choice bought:
+
+| | `tp-vita` | DuskOnVita |
+|---|---|---|
+| Integration | merged tree built at configure time (`tools/build_aurora_tree.py`); upstream checkout untouched | git submodule + `patches/` applied to a build *mirror*; submodules never patched |
+| Local delta | 14 dusklight edits, 1 aurora overlay | **34** dusklight, 11 aurora, 2 borealis, 5 vitaGL patches |
+| Renderer | vitaGL only | vitaGL **and** a hand-written SceGxm backend (`gfx_gxm/`), GXM the default |
+| Deps | `tools/fetch_deps.sh`, no hashes | `deps.lock` with **SHA-256 per archive**, digest-pinned VitaSDK container, network off |
+| vitaGL | SDK prebuilt `libvitaGL.a` | built from pinned source `7635e3c` |
+| Tests | host suites, no goldens | ~100 host tests plus `tests/fixtures/baseline/<sha>/` frozen goldens |
+| Base | dusklight `77705f8` | dusklight `34a144a` (3 commits older) |
+
+**Independent confirmation of §7.3.** Its
+[`gpu_api.cpp:431`](https://github.com/NathanKneT/DuskOnVita/blob/main/platform/vita/gfx_vgl/gpu_api.cpp)
+carries the comment *"vitaGL's unpack API supports row length, not GL_UNPACK_ALIGNMENT. Every upload
+here is tightly packed RGBA8, already four-byte aligned."* It never calls `glPixelStorei` at all.
+Two ports found the same trap by different routes — that is what makes it worth promoting to the
+skill rather than treating as a local quirk. It also drains `glGetError()` once per frame and keeps
+the enum, which is the rule in §8 trap 15.
+
+**Its open bug is our open bug.** "Some textures flicker", and its request for help is *"a matched
+Dolphin capture of the same scene"* — the same missing artefact as our §7.4 reference render. It
+also notes it *"skips draws that would read an empty copy rather than drawing them black"*, which
+tells us the saturation we saw was an **EFB-copy read path**, not the texture path; both ports hit
+that wall, and it chose to skip rather than sample.
+
+**Taken from it (all done this session):**
+
+- The `#if !TARGET_VITA` guard on the retail arena trim (§7.1). Their `dusklight/0009` states the
+  reason plainly: *"the retail physical-address check that removes 24 MiB must not run on relocated
+  Vita pointers"*. **Our version was live and removing 24 MiB on every run**; theirs never was,
+  because they guarded it from the start.
+- `NOTICE` plus `LICENSES/`, recording every pin and licence, and stating the vitaGL LGPL position
+  honestly instead of leaving it implicit.
+- The golden-fixture idea for tests, and `--vita-exit-after` / `sequence.txt` for self-terminating
+  repeatable bench runs (we currently depend on an external timer).
+
+**Deliberately not taken:** its 34 dusklight patches. Those are whole-game optimisation work that
+assumes behaviour may be rewritten per system, which contradicts the "behaviour comes from the
+decompilation" posture this port has held throughout. We cannot validate them, and pulling them in
+would make every future upstream diff unreadable. Read its `docs/` as a specification for what to
+optimise, not as code to import.
+
 ---
 
 ## 8. Traps and gotchas
 
-1. **`tp-vita/` has no git.** Before any sweeping change, snapshot it:
+1. **`tp-vita/` is a git repo now** (`Yannis100/tp-vita`, public), but `build/` and `deps/` are
+   gitignored, so **a commit does not protect the tree you actually build from**. Before a sweeping
+   change still snapshot the build products:
    `tar -czf ../snapshot-$(date +%Y%m%d)/aurora_lib-merged.tar.gz -C build aurora_lib`.
-   There is a precedent at `.snapshot-pre-aurora-upgrade-20261029/` which contains
+   There is a precedent at `.snapshot-pre-aurora-upgrade-20261029/` with
    `aurora_lib-merged.tar.gz`, `dusklight-local-changes.patch`, `dusklight-status.txt` and a
-   known-good `tpv_vita.known-good.vpk`. **Do the same for any large refactor.**
+   known-good `tpv_vita.known-good.vpk`.
+   **Also:** the dusklight fixes (including §7.1 and §7.2) live in the separate `dusklight/`
+   checkout, which is **not** part of the `tp-vita` remote. `git log` in `tp-vita` will not show
+   them, and `git status` there is clean while the game is still patched.
 2. **Never edit `build/aurora_lib`.** It is regenerated. Edit `overlay/` or `patches.py`.
 3. **`patches.py` anchors must match exactly once.** A silent no-match is a build failure by design.
 4. **A short Vita3K run gives blank screenshots.** Use `75 4`, not `40 2`, before concluding anything.
@@ -631,6 +742,18 @@ and the `1` was the wrong pack alignment for RGBA anyway.
     and a code such as `GL_INVALID_ENUM` immediately rules out an entire class of causes. Log each
     distinct `(label, code, size)` once instead of every occurrence, or a single broken path will
     bury 30k identical warnings in the game log.
+16. **GameCube *physical* addresses still compare against relocated Vita pointers, and the compares
+    can pass.** `OSGetArenaHi() > 0x81800000` looked obviously dead on a Vita; it was live and it
+    removed 24 MiB of guest arena per run (§7.1). The same class of bug hides in any unguarded
+    check against a fixed GameCube address — arena limits, MEM1/MEM2 ranges, `0x80000000`-based
+    pointer validation, `OSPhysicalToCached`. **Do not reason about these branches, measure them.**
+    The cheap test is to log both operands either side of the branch and compare against the same
+    run with the block compiled out; here the tell was `0x1800000` appearing exactly in the delta.
+17. **A defect being real is not evidence that it caused the symptom.** §7.2's null dereference was
+    genuine, reachable and worth fixing, but another port ships the identical source and boots, so
+    it cannot be claimed as our crash cause. Before writing "root-caused", ask whether a second
+    independent build that lacks the fix also lacks the symptom. If one exists, downgrade the claim
+    to "latent defect fixed, causality unproven".
 
 ---
 
@@ -644,6 +767,8 @@ tp-vita/
 ├── PLAN.md                     route to a playable port; milestones M1..M5
 ├── README.md                   build, install, run instructions
 ├── HANDOVER.md                 this file
+├── NOTICE                      every component, its exact pin and its licence
+├── LICENSES/                   the upstream licence texts NOTICE refers to
 ├── cmake/
 │   ├── aurora.cmake            aurora core sources
 │   └── aurora_gx.cmake         GX frontend sources
@@ -684,11 +809,21 @@ The interesting Vita-specific rendering work lives in
 
 ## 11. If you have to choose one thing to do next
 
-Reproduce §7.1. It is now the only known defect that kills a run, and it is already instrumented
-(the failure path records `caller=%p`). §7.2 no longer needs to be folded into it — that null
-dereference was found by static analysis and closed (see §7.2). Everything else on the board is
-either long-running work (hardware testing, audio) or optional polish.
+**Do the reference desktop render (§7.4).** It is the only item that converts the rest of this
+document from "the geometry is right" into "the picture is right", and it is the one artefact that
+two independent ports are both blocked on: DuskOnVita's open bug is texture flicker and its own ask
+is a matched Dolphin capture of the same scene (§7.5). Build dusklight for desktop (WebGPU/Dawn),
+boot the same `GZ2P01.iso`, capture the same first scene, and compare against the Vita3K frame. That
+single comparison settles the open questions about the missing cool tones (§7.3) and gives a target
+for every later rendering fix.
 
-If it will not reproduce, the honest position is: the port boots, reaches the main loop and renders
-correctly-shaped frames on an emulator, with one unexplained intermittent crash in roughly 1 run
-in 7.
+Second, if a run dies: §7.1's size arithmetic is now sane (the arena is 24 MiB larger, §7.1), so
+watch whether the `0xBF18265F` failure rate changes at all before doing anything else with it. The
+instrumentation already records `caller=%p`.
+
+For reference, the honest position as of this revision: the port boots, reaches the main loop and
+renders correctly-shaped frames with plausible colour counts on an emulator. **A separate port does
+the same thing on real hardware at 12-28 FPS with working saves and input (§7.5), so feasibility is
+no longer in question.** What remains unproven here is scene correctness (no reference image),
+performance, audio, and hardware behaviour — plus one intermittent allocation failure in roughly 1
+run in 7 whose cause is not yet known.
