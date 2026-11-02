@@ -1,0 +1,44 @@
+# Build output. `build/aurora_lib` is generated at configure time by
+# tools/build_aurora_tree.py from upstream aurora + vita/aurora/overlay/ + patches.py.
+# Never edit it, and never commit it.
+/build/
+
+# Third-party sources fetched by tools/fetch_deps.sh, pinned to Dusklight's versions.
+# 110 MB of upstream code that is not ours; run the script instead.
+/deps/
+
+# Packaging output: the VPK, and the intermediate ELF/SELF files.
+*.vpk
+*.velf
+*.self
+*.suprx
+*.skprx
+
+# Snapshots of the merged tree and of known-good builds (see HANDOVER.md section 8).
+.snapshot-*/
+
+# Host test artefacts.
+__pycache__/
+*.pyc
+*.o
+*.out
+*.ppm
+*.pcm
+*.log
+
+# Editors and OS noise.
+*.swp
+*~
+.DS_Store
+
+# Nothing commercial ever goes here. You supply your own disc image; the build only
+# reads it from ux0:data/tpvita/ at run time. Guarded here so an accident cannot
+# publish one.
+*.iso
+*.gcm
+*.ciso
+*.rvz
+*.wia
+*.nkit.iso
+*.pup
+PSVUPDAT.PUP
