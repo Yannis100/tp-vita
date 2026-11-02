@@ -827,3 +827,91 @@ the same thing on real hardware at 12-28 FPS with working saves and input (§7.5
 no longer in question.** What remains unproven here is scene correctness (no reference image),
 performance, audio, and hardware behaviour — plus one intermittent allocation failure in roughly 1
 run in 7 whose cause is not yet known.
+
+### 7.6 First performance baseline, and why EFB copies are *not* the missing piece (2026-11-02)
+
+**A `glReadPixels` probe of EFB copies was attempted and is VOID. Do not repeat it.** The idea was
+sound — read the EFB before a copy and the destination after, and compare — but in this context
+`glReadPixels` returned **all zeros even for the default framebuffer (fbo 0) at frame 600**, at a
+moment when the captured PNG proves the presented surface has content. A control read at fbo 0 was
+added specifically to catch this, and it is what saved the measurement from being misreported: without
+it, "SRC all zero, DST all zero" would have looked like a broken EFB copy, and it is not.
+
+**What the counters did establish, and this is solid:** the resolve path is very much alive.
+
+| Measure | Value |
+|---|---|
+| Resolve (EFB copy) ops, first 1000 frames | **11,338** |
+| Per frame | **~11** |
+| Copies that reached `draw_quad` | 11,338 / 11,338 (0 skipped, 0 with no destination) |
+| Typical shapes | 608x448 → 304x224 (half) or 608x448 → 608x448, formats `0x13` and `0x6` |
+
+So the "our EFB copies are missing" hypothesis is **wrong**: copies are emitted and drawn at ~11 per
+frame. Whether their *contents* are correct is still unknown, and cannot be settled by readback here.
+It needs a real reference image (§7.4), not a probe.
+
+**First timing baseline (Vita3K, emulator only — this is not a console frame rate).** One 1000-frame
+window:
+
+| Measure | Value |
+|---|---|
+| Wall per frame | **151.94 ms** (6.6 fps equivalent) |
+| Draws in that frame | 174 |
+| Shader programs compiled | 71 |
+| Resolve ops per frame | ~11 |
+
+For scale, DuskOnVita measured **154 ms/frame on real hardware** for its first build (6.34 fps in
+Link's house, 22 Oct, 333 MHz, everything on one core). Our emulator figure is of the same order as
+their *worst* console figure, which is the useful reading: emulator timing here is dominated by
+software rendering and by shader compilation, and it should be treated as an upper bound on cost, not
+as a prediction. **No FPS claim about our port on hardware can be made from this.**
+
+**Caveat on the probe code that remains.** The `sResolveSeen` / `sResolveDrawn` / `sResolveNoDest`
+counters and the 300-frame timing window are still in
+[`vita_gl_replay.cpp`](tp-vita/vita/aurora/overlay/gfx/vita_gl_replay.cpp). They are cheap and they
+are what produced the table above. Remove them once a reference render exists, along with the
+`mch_trace` bring-up tracing.
+
+### 7.7 Render scale: 75%, measured (2026-11-02)
+
+The EFB target is now rendered at 75% and upscaled by `present()` to 960x544. This is a **behaviour
+change**: the picture is softer. It is currently a `constexpr` in
+[`ensure_efb()`](tp-vita/vita/aurora/overlay/gfx/vita_gl_replay.cpp:745); it should become a switch
+before anyone plays this.
+
+**A/B, Vita3K, identical runs, window ending at frame 1080 (71 programs compiled, ~170 draws/frame):**
+
+| EFB scale | Wall per frame | Equivalent | Distinct colours in the screenshot |
+|---|---:|---:|---|
+| 100% | 151.94 ms | 6.6 fps | 78,360–87,870 |
+| 75% | ~113 ms | ~8.8 fps | 80,137–84,554 |
+
+That is a **26% cut in wall time for a 44% cut in fragments**. The gap is the useful finding: the frame
+cost is *not* purely fill-bound. Draw submission and the ~11 resolve ops per frame are unchanged by
+resolution and dominate proportionally more as the target shrinks. Do not expect a 44% win from
+resolution alone, and do not assume more aggressive scaling keeps paying.
+
+**Both numbers are emulator figures and neither is a console frame rate.** Vita3K renders in software
+here; the absolute values mean little, the ratio is the transferable part.
+
+### 7.8 Three measurement traps that each produced a wrong conclusion (2026-11-02)
+
+Every one of these cost a session and each is a general lesson.
+
+1. **A "hang" that was a SIGKILL during a buffered write.** Runs appeared to freeze while compiling
+   `gx-1a49877e`, with the log line truncated mid-way (`... vertex 1113` and nothing after). The
+   conclusion "that shader hangs the compiler" was wrong: the shader compiled in 283 ms in an earlier
+   run. [`in_container.sh:25`](tp-vita/tests/vita3k/in_container.sh:25) ends every run with
+   `kill $pid; sleep 2; kill -9 $pid`, and a `Log.info` into a pipe is block-buffered, so the last
+   line is cut mid-write. **A truncated log line means the process was killed, not that it stalled.**
+   Use `Log.warn`/stderr for final-state reporting.
+2. **A window that did not fit in the run.** A 300-frame timing window never fired in a 60 s run,
+   because shader compilation costs 200–700 ms per program and the first ~70 programs are built
+   lazily, so startup alone can consume the whole budget. Windows were cut to 120 frames.
+3. **Two blank-frame regressions that read as wins.** Forcing `separatePresentation` produced a
+   rock-steady **33.33 ms/frame, 30.0 fps equivalent** — which is the simulation clock pacing an empty
+   loop, because the interpolation presentation path (`dusk::interp::begin_presentation` with
+   `fpcM_DrawIterater((fpcM_DrawIteraterFunc)fpcM_Draw)`) does not draw on this backend. The
+   screenshots were 263 bytes. **Check pixels before believing a frame time**: a blank frame is
+   263 bytes, a rendered one is 30 KB–360 KB, and `mode=1` versus `mode=RGB` in the PNG header is the
+   cheapest possible assertion.
