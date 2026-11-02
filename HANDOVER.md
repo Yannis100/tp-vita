@@ -991,3 +991,29 @@ test is a one-character change plus a console.
 The general lesson, recorded because it applies to every remaining optimisation on this port: **in this
 emulator, measure the component, not the frame.** A frame timer here cannot resolve a 1 ms change
 because the noise is ±100 ms, and host/guest CPU cost ratios are not transferable.
+
+#### Correction: the intermittent core dump is a guest abort, not an unrelated fault (2026-11-02)
+
+Two Vita3K runs during the work above died with `Undefined instruction at 0x8227A58E` and a
+`Trace/breakpoint trap (core dumped)`. That was first written off here as "an unrelated guest fault,
+reproducible with the cache compiled out". The second half was true and the first half was wrong.
+
+- `0x8227A58E` is **inside our own image**, not firmware: [`tpv_vita.velf`](tp-vita/build/tpv_vita.velf)
+  has `.text` at `0x81000040`..`0x822879D8`, and `build/tpv_vita` resolves that address via
+  `arm-vita-eabi-addr2line` to **`_kill_r`**, newlib's syscall wrapper.
+- `_kill_r` is what the guest calls when it raises a signal against itself, i.e. `abort()` from an
+  assert or a fatal path. `Trace/breakpoint trap` on the host is the emulator tear-down after that.
+  So this is **our process choosing to die**, and the aborting call is the thing to find, not an
+  emulator bug.
+- It is **not** the long-standing `0xBF18265F` allocation failure: [`dvd_trace.txt`](tp-vita/tests)
+  from the crashed run ends with successful `JKRExpHeap::create` calls and `parentFree=0x734CA0`
+  (7.5 MiB free), with no failing allocation logged.
+- What is missing is the reason. `boot.log` was empty and the fatal path evidently does not flush a
+  message before `abort()`, so nothing in the surviving artefacts says which assertion fired.
+
+To make the next occurrence explain itself, the cheap and durable move is a custom assert/signal
+handler that writes the failing expression, file and line to `ux0:data/tpvita/` **before** dying, plus
+`-rdynamic`-style symbolication through the existing `.map`-less build (add `-Wl,-Map=` — there is none
+today, which is why naming the caller needed the 666 MB debug ELF). Do not classify a
+`Trace/breakpoint trap` as an emulator fault again without resolving the address first; one
+`addr2line` would have saved this correction.
