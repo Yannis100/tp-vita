@@ -1,0 +1,10 @@
+# Environment for running the Linux Vita3K build headless: Qt6, Mesa software rendering (llvmpipe), Xvfb, a screenshot tool.
+# Arch is used because the official Vita3K Linux builds need a very recent glibc (2.43 when this was written) and Qt6.
+#   podman build -t localhost/tpv-vita3k-env tests/vita3k
+FROM docker.io/library/archlinux:latest
+RUN pacman -Syu --noconfirm --needed \
+      qt6-base qt6-svg qt6-multimedia qt6-multimedia-ffmpeg mesa vulkan-swrast vulkan-icd-loader libglvnd \
+      xorg-server-xvfb xdotool imagemagick libxkbcommon-x11 \
+      xcb-util-cursor xcb-util-keysyms xcb-util-image xcb-util-renderutil xcb-util-wm xcb-util \
+      ttf-dejavu libsm libice brotli zstd openssl zlib \
+ && pacman -Scc --noconfirm
