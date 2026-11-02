@@ -53,6 +53,12 @@ namespace aurora::gx::vita {
 // A vertex's own attributes (aPos, aPnMtxIdx, tex coords, colors, ...) come from its own endpoint,
 // exactly like upstream (which loads every attribute through the selected endpoint index; only
 // position/matrix index of both endpoints are needed for the direction).
+// Content-addressed vertex decode cache (gx/vita_vertex.cpp). Keyed on the source bytes and the decoded
+// layout, never on recorded offsets, because Frame::storage is rebuilt every frame.
+void vertex_cache_clear() noexcept;
+// Logs hit/miss/eviction counters and the bytes held. Temporary diagnostic; remove with the probe set.
+void vertex_cache_report(const char* label) noexcept;
+
 struct DecodedAttr {
   enum class Kind : uint8_t { Float, UByte4Norm };
   GXAttr attr;        // GX_VA_*

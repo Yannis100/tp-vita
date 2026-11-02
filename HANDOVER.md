@@ -76,6 +76,9 @@ Verified as of this handover:
 - The guest arena is now **64 MiB** (`67092240` bytes). Until this revision the retail GameCube
   trim was silently removing 24 MiB from it every run (§7.1).
 - All host test suites pass (numbers in §6).
+- The vertex decode path is **measured separately from the frame** at 3.95–6.45 ms/frame in Vita3K
+  (§7.9), which is the number to compare against when optimising it. A content-addressed decode cache
+  exists, is correct, hits 74%, and is **off** because that is too small a share here to measure.
 
 **What that does not prove.** Vita3K is an emulator; nothing here has run on real hardware.
 The screenshots show a rendered 3D scene, but nobody has confirmed it is the *correct* scene
@@ -817,6 +820,14 @@ boot the same `GZ2P01.iso`, capture the same first scene, and compare against th
 single comparison settles the open questions about the missing cool tones (§7.3) and gives a target
 for every later rendering fix.
 
+**Do not spend more time on frame-rate micro-optimisations in Vita3K.** §7.8 and §7.9 both ended with
+the same answer: this emulator cannot resolve a change worth 1-2 ms because its own noise is ±100 ms,
+and it runs guest ARM on a host roughly an order of magnitude faster than a Cortex-A9, so CPU gains
+measured here do not transfer. The vertex cache in §7.9 is the worked example: correct, 74% hit rate,
+halves the decode work, and still not a measurable win on the emulator. Anything in this list that is
+pure CPU (vertex cache, static geometry by reference, the GX worker thread) belongs on hardware.
+Something that reduces **GPU** work or **draw count** is more likely to show up even here.
+
 Second, if a run dies: §7.1's size arithmetic is now sane (the arena is 24 MiB larger, §7.1), so
 watch whether the `0xBF18265F` failure rate changes at all before doing anything else with it. The
 instrumentation already records `caller=%p`.
@@ -915,3 +926,68 @@ Every one of these cost a session and each is a general lesson.
    screenshots were 263 bytes. **Check pixels before believing a frame time**: a blank frame is
    263 bytes, a rendered one is 30 KB–360 KB, and `mode=1` versus `mode=RGB` in the PNG header is the
    cheapest possible assertion.
+
+### 7.9 Vertex decode cache: correct, 74% hit rate, and still not worth it here (2026-11-02)
+
+DuskOnVita's frame profile puts vertex preparation first at **66 ms of a 154 ms frame**, so a decode
+cache was the obvious thing to take from them. It is implemented in
+[`vita_vertex.cpp`](tp-vita/vita/aurora/overlay/gx/vita_vertex.cpp) and it is **switched off**
+(`kVertexCacheEnabled = 0`). This section is the reason, and it is deliberately blunt because the first
+version of this cache had a silent correctness bug that would have been very expensive to find later.
+
+#### The first version was unsound, and its 83.8% hit rate was meaningless
+
+Two defects, both found by reading the decoder back rather than by any test:
+
+1. **Wrong buffer.** Indexed attributes read from `frame.storage` (that is `Ctx::arr`), not
+   `frame.verts`. The first key computed a size as "vertices + `indexed_array_bytes()`" and then hashed
+   and copied that many bytes starting at `frame.verts[vertStart]`. That is an overread past the vertex
+   range, and the array bytes the decode actually consumes were never part of the key. Two draws with
+   identical index bytes over different snapshotted arrays could **false-hit** and silently render each
+   other's positions. A false hit is the worst failure mode a cache has.
+2. **Incomplete key.** Decode also depends on the `PipelineConfig` and on `draw.immediateData`
+   (`currentPnMtx`, per-attribute `arrayStart`). Identical vertex bytes under two pipelines decode
+   differently. Neither was hashed.
+
+The fix builds real `ArrayRange`s for the indexed arrays and folds the per-frame `frame.storage`
+digest, the pipeline config and the immediate data into the key, with `memcmp` as the authority on the
+vertex bytes:
+
+```cpp
+key = config_key(config, draw);
+key ^= hash_bytes(src, srcBytes);
+for (each indexed array range) { digest = (digest ^ hash_bytes(range)) * FNV_Prime; key ^= digest; }
+```
+
+Every hit-rate number taken before this fix is void and was re-taken.
+
+#### Re-measured, sound, same scene (frames 1080–1200, ~165 draws/frame, 71 programs)
+
+| build | decode | hash + copy | total vertex cost | per frame |
+|---|---:|---:|---:|---:|
+| cache OFF | 474.3 ms | — | 474.3 ms | **3.95 ms** |
+| cache ON | 382.9 ms | 177.1 ms | 560.0 ms | **4.67 ms** |
+| cache OFF (heavier window) | 773.4 ms | — | 773.4 ms | **6.45 ms** |
+| cache ON (same window) | 344.3 ms | 235.8 ms | 580.1 ms | **4.83 ms** |
+
+Hit rate **74–76%**, which is real: the decode work roughly halves. But the entire vertex path is only
+**4–6 ms of a ~130 ms frame in Vita3K**, so the change is smaller than the run-to-run noise, and on a
+faster host the hash+copy overhead eats the win. Wall-clock A/B was inconclusive by construction
+(171–504 ms for the same configuration); this table exists because timing the cache internally gives a
+low-noise number that a whole-frame timer cannot.
+
+Also measured and worth knowing: 20k–47k requests per window exceed `kVertexCacheSourceMax = 32768`
+and are never cached (`too-big`), and evictions roughly equal misses — the working set is larger than
+the 12 MiB budget at this scene.
+
+#### Why it stays off, and what would change that
+
+Vita3K runs guest ARM on a fast x86-64 host, so it **understates** CPU-bound guest work by roughly an
+order of magnitude. DuskOnVita's 66 ms was measured on a **real Vita 1000**. If that figure transfers,
+this cache is worth 15–45 ms/frame there — a fifth to a third of the frame — and should be turned on.
+That is a decision for hardware. The code is kept, correct and behind one constant, precisely so that
+test is a one-character change plus a console.
+
+The general lesson, recorded because it applies to every remaining optimisation on this port: **in this
+emulator, measure the component, not the frame.** A frame timer here cannot resolve a 1 ms change
+because the noise is ±100 ms, and host/guest CPU cost ratios are not transferable.
