@@ -1292,6 +1292,7 @@ void replay(Frame& frame) {
              "{} draws this frame, {} programs total, {} resolve ops seen",
              sFrameIndex, windowMs, windowMs / 120.0, 120000.0 / (windowMs > 0 ? windowMs : 1),
              frame.draws.size(), sPrograms.size(), sResolveSeen);
+    gx::vita::vertex_cache_report("window");
   }
   if (sFrameIndex <= 5) {
     Log.info("frame {}: {} draws, {} programs compiled so far; resolve {} seen / {} drawn / {} no-destination",
