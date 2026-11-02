@@ -162,12 +162,18 @@ Decisions:
 - `ATTRIBUTE2=12` (365 MiB main) already set in CMake; heap/stack retuned by measurement
   (see `HANDOVER.md` §4.4 — root reserve 192 KiB, game heap 23 MiB); the game asks
   `aurora_initialize` for `mem1Size=256 MiB`.
+- **Feasibility on real hardware is no longer an open question.** A separate port
+  ([`NathanKneT/DuskOnVita`](https://github.com/NathanKneT/DuskOnVita)) runs this same game code
+  on a PS Vita 1000 at **12-28 FPS**, with working saves, input, touch and gyro, and a native GXM
+  renderer as its default backend. Its first build did 6.3 FPS on 22 Oct. Its base commit is 3
+  commits behind ours on the same Aurora pin, so the route is confirmed. This does not validate
+  *our* port, but it removes the risk that the approach cannot work. See `HANDOVER.md` §7.5.
 
 ## Key facts
 
 | Item | Value |
 |---|---|
-| Game code | Dusklight (CC0), branch `vita` (**14 uncommitted edits**, incl. endian.h ARM LE, mods/api.h 64-bit-only checks, d_event_lib.h `_C` macro, main.h no process restart, audio/DspStub.cpp CRASH -> no-op, heap sizes + root reserve in m_Do_machine.cpp, JKRExpHeap `dataPtr` ordering, and the J3DJointTree null-deref fix) |
+| Game code | Dusklight (CC0), branch `vita` (**14 uncommitted edits**, incl. endian.h ARM LE, mods/api.h 64-bit-only checks, d_event_lib.h `_C` macro, main.h no process restart, audio/DspStub.cpp CRASH -> no-op, heap sizes + root reserve + the `!TARGET_VITA` guard on the retail arena trim in m_Do_machine.cpp, JKRExpHeap `dataPtr` ordering, and the J3DJointTree null-deref fix) |
 | Backend today | Aurora WebGPU/Dawn (desktop) → **vitaGL/GXM** (Vita) |
 | GX entry points the game calls | ~325 across `GX*/GD*` (per undefined-symbol scan), many via J3D `J3DGDWrite*` |
 | Proven reference | ACGC (GameCube C decomp → Vita GX-HLE on vitaGL, 52 precompiled TEV shaders, playable) |
@@ -181,8 +187,18 @@ Decisions:
   colours per screenshot, up from ~1,600–4,000 while every texture upload was silently failing). Nobody has confirmed the
   rendered scene is the *correct* scene — there is no reference comparison against a real GameCube or the desktop
   build. Audio is disabled, and card saves, the pause menu and most content are untested. One unexplained
-  intermittent crash remains (`HANDOVER.md` §7.1, ~1 run in 7). The GL replay has also run on the
-  host against Mesa (synthetic scenes only, no game content, no vitaGL). See the M3 verification table.
+  intermittent crash remains (`HANDOVER.md` §7.1, ~1 run in 7); its size arithmetic is now sane
+  (the retail arena trim that silently removed 24 MiB per run is guarded, arena 40 → 64 MiB) but the
+  failing 3.0 GiB allocation itself is still unexplained and must not be described as solved. The GL
+  replay has also run on the host against Mesa (synthetic scenes only, no game content, no vitaGL).
+  See the M3 verification table.
+- Two claims were **downgraded** after the DuskOnVita audit (`HANDOVER.md` §7.5): the J3DJointTree
+  null dereference is real and fixed but *latent*, since that port ships byte-identical code and
+  boots, so it is not established as our crash cause; and feasibility is no longer an open question,
+  because that port runs on hardware at 12-28 FPS.
+- **Not releasable as a binary yet.** vitaGL is LGPL-3.0-or-later and we link the prebuilt VitaSDK
+  archive rather than a named source revision, so the relink right is not demonstrable. `NOTICE`
+  records the two ways to fix it. Until then this is a source-only project.
 - The Aurora `gfx/*` + `webgpu/*` layer is deeply wgpu-typed and is **not**
   carried to Vita; we implement the narrow surface the game + command processor
   actually need (state + draw + texture + TEV).

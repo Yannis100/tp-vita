@@ -1,0 +1,88 @@
+THIRD-PARTY NOTICES AND SOURCE PROVENANCE
+
+This file records where every component of the build comes from, which revision it is pinned to, and
+what its licence is. The licence texts themselves are in LICENSES/.
+
+The code in this repository covers only the Vita platform layer, the build glue and the test
+harnesses. It does not replace or relicense anything below.
+
+Game code and libraries (git submodules of the Dusklight checkout)
+
+  Dusklight
+    Source: https://github.com/TwilitRealm/dusklight
+    Pin:    77705f8bb95ef7b7dca4675b149c4bcb6a48da34
+    Licence: CC0 1.0 Universal (LICENSES/Dusklight.txt).
+    Dusklight is the native build of the Twilight Princess decompilation,
+    https://github.com/zeldaret/tp, which is credited here as its origin.
+
+  Aurora (Dusklight's submodule, extern/aurora)
+    Source: https://github.com/encounter/aurora
+    Pin:    3227d76c60e1e782ca576610bce61c9e7744d8be (tag pre-upgrade-3227d76)
+    Licence: MIT, Copyright (c) 2022 Luke Street (LICENSES/Aurora.txt).
+
+  Borealis (Dusklight's submodule, extern/borealis)
+    Source: https://github.com/encounter/borealis
+    Pin:    4ac5e7052a8c49a122f8d57f626b5c75c5ca6968
+    Licence: MIT, Copyright (c) 2026 Luke Street (LICENSES/Borealis.txt).
+
+  The Dusklight checkout is built from source in place. This port's edits to it are ordinary local
+  modifications and are listed in HANDOVER.md; they are not applied to the upstream repository.
+  No copy of the Dusklight tree is redistributed here.
+
+  Aurora is built from a merged tree generated at configure time by tools/build_aurora_tree.py, from
+  upstream lib/** plus the whole-file replacements in vita/aurora/overlay/ and the substitutions in
+  vita/aurora/patches.py. build/aurora_lib is a build product and is never edited or committed.
+
+Pinned source archives (fetched by tools/fetch_deps.sh, never committed)
+
+  Every archive is downloaded at configure time into deps/ and is not part of this repository.
+  Version pins are in tools/fetch_deps.sh.
+
+    tracy        v0.14.1                                 MIT                LICENSES/Tracy.txt
+    xxHash       v0.8.3                                  BSD-2-Clause       LICENSES/xxHash-library.txt
+    abseil       20240722.0                              Apache-2.0         LICENSES/Abseil.txt
+    nlohmann/json v3.12.0                                MIT                LICENSES/nlohmann-json.txt
+    cxxopts      v3.3.1                                  MIT                LICENSES/cxxopts.txt
+    PicoSHA2     v1.0.1                                  MIT                LICENSES/PicoSHA2.txt
+    miniz        3.0.2                                   MIT                LICENSES/miniz.txt
+    imgui        v1.91.9b-docking                        MIT                LICENSES/ImGui.txt
+    RmlUi        f00a0fee38391b2f927114e11bea18dc0a7dba1e MIT               LICENSES/RmlUi.txt
+    sqlite3      amalgamation 3510300                    public domain      https://sqlite.org/copyright.html
+
+  patches/abseil-vita.patch is applied to the abseil archive at build time so that absl compiles for
+  arm-vita-eabi. It adds __vita__ beside the existing __native_client__ / __myriad2__ / __EMSCRIPTEN__
+  cases and disables the ELF memory-image path. A patch does not change the licence of the file it
+  applies to, and the patched source is not redistributed.
+
+vitaGL (LGPL-3.0-or-later) — read this before publishing a binary
+
+  Source:  https://github.com/Rinnegatamante/vitaGL
+  Build:   linked from the prebuilt archive in VitaSDK, vdpm package
+           `vitaGL 0.0.0.r1448.gcd3791e-1` (arm-vita-eabi/lib/libvitaGL.a)
+  Licence: LGPL version 3 or later, as stated in its source headers. Its licence texts are NOT
+           reproduced here because no vitaGL source is included in this repository.
+
+  This is the one place where the licence position needs care. vitaGL is LGPL, and LGPL requires that
+  a user be able to modify it and relink the application against the modified library. Today this
+  port links an opaque prebuilt archive that comes from a different build than any clearly identified
+  source revision, so that relink right cannot be demonstrated from this repository alone.
+
+  Before any binary release that links vitaGL, do one of the following:
+
+    1. Build vitaGL from a named source revision inside this project and link that archive, keeping
+       the source, the build recipe and any local patches here, so the relink is reproducible. This is
+       the approach used by https://github.com/NathanKneT/DuskOnVita (pinned archive plus SHA-256 in
+       deps.lock, patches in patches/deps/vitagl/), and it is the recommended fix.
+    2. Otherwise, ship the archive as a separate replaceable file plus a written offer of the
+       corresponding source and link instructions, and say so in the release notes.
+
+  Until one of those is done, treat this repository as source-only and do not publish a VPK.
+
+Sony and Nintendo material — never included
+
+  This repository contains no game disc image, no extracted game data, no Nintendo or Sony software,
+  and no shader compiler. In particular `libshacccg.suprx` is never copied or bundled; each user
+  extracts it from their own console to ur0:data/. Users supply their own legally obtained disc image.
+
+The Legend of Zelda and Twilight Princess are trademarks of Nintendo. This project is unofficial and
+is not affiliated with or endorsed by Nintendo, Sony, the Dusklight team or the zeldaret project.

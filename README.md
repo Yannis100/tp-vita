@@ -161,4 +161,15 @@ and the borealis source; the screens are checked on the host as pixels, not on a
 
 Ports only open-source code. No commercial game data is included; users must
 supply their own dumped copy of Twilight Princess. Dusklight is CC0-1.0;
-Aurora is MIT; the Vita layer in this repo is CC0-1.0.
+Aurora and Borealis are MIT; the Vita layer in this repo is CC0-1.0.
+
+[`NOTICE`](NOTICE) records every component, the exact revision or archive it is
+built from, and its licence; the licence texts are in [`LICENSES/`](LICENSES/).
+Nothing there is redistributed: the Dusklight checkout is a submodule built in
+place, and the dependency archives are fetched at configure time and gitignored.
+
+**One caveat before publishing a binary:** vitaGL is LGPL-3.0-or-later, and this
+port currently links the prebuilt archive shipped in VitaSDK rather than a source
+revision named in this repository. That makes the LGPL relink right hard to
+demonstrate. `NOTICE` spells out the two ways to fix it. Until one is done, treat
+this repository as source-only.
