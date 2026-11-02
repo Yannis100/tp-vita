@@ -79,6 +79,9 @@ Verified as of this handover:
 - The vertex decode path is **measured separately from the frame** at 3.95–6.45 ms/frame in Vita3K
   (§7.9), which is the number to compare against when optimising it. A content-addressed decode cache
   exists, is correct, hits 74%, and is **off** because that is too small a share here to measure.
+- A fatal path now **names itself**: `abort()` is intercepted link-time and every death writes
+  `ux0:data/tpvita/crash.log` with the caller resolved to a symbol from an embedded link-map table
+  (§7.10). Proven by a deliberate abort, which recorded `abort_caller=0x81009b3d main`.
 
 **What that does not prove.** Vita3K is an emulator; nothing here has run on real hardware.
 The screenshots show a rendered 3D scene, but nobody has confirmed it is the *correct* scene
@@ -1017,3 +1020,67 @@ handler that writes the failing expression, file and line to `ux0:data/tpvita/` 
 today, which is why naming the caller needed the 666 MB debug ELF). Do not classify a
 `Trace/breakpoint trap` as an emulator fault again without resolving the address first; one
 `addr2line` would have saved this correction.
+
+### 7.10 The abort now names itself (2026-11-02)
+
+The conclusion of §7.9's correction was that a `Trace/breakpoint trap` was our own `abort()`, and that
+nothing recorded which one. This implements the fix, and the fix was verified by deliberately crashing.
+
+#### What was actually wrong
+
+Three things, each found by looking rather than guessing:
+
+1. **Every reachable abort site is silent.** `PPCHalt()` and `OSSwitchStack()`/`OSSwitchFiber()` are a
+   bare `abort()` (`dusklight/src/dusk/stubs.cpp`, `OSContext.cpp`), and
+   `ConfigVarBase::markRegistered()/unmarkRegistered()` abort on a double (un)register with no message
+   at all (`src/dusk/config.cpp`). A double registration is a plausible intermittent trigger for the
+   ~1-in-7 death, but it is not provable yet — which is exactly the point.
+2. **No log had a critical line.** Checked all 10 surviving game logs: `grep -ciE "\|C\||fatal|assert|
+   abort|panic"` returns **0 for every one**. The death never reaches the logger, so no amount of
+   log-reading could have explained it.
+3. **`boot.log` was empty** because the fatal path does not flush before dying.
+
+#### What was added
+
+- [`vita/src/crash_record.cpp`](tp-vita/vita/src/crash_record.cpp) — `__wrap_abort()` catches **every**
+  `abort()` in the process via `-Wl,--wrap=abort`, so dusklight needs no edits and the
+  "behaviour comes from the decompilation" posture is intact. It writes the context note, the caller
+  address resolved to a symbol, and a SIGABRT handler dump, all flushed line by line to
+  `ux0:data/tpvita/crash.log` (previous run kept as `crash.log.1`). Opening the file is deferred to the
+  first line, so a clean run leaves nothing behind.
+- [`vita/src/crash_symbols.cpp`](tp-vita/vita/src/crash_symbols.cpp) + [`tools/map_symbols.py`](tp-vita/tools/map_symbols.py)
+  — the link map is turned into a 36,686-entry table and embedded, so naming an address needs no
+  filesystem access and no allocation on the fatal path. There is now a `-Wl,-Map=` too; there was none.
+- [`tests/host/crash/`](tp-vita/tests/host/crash/run.sh) — 7 assertions against the real generated
+  table (resolve, zero-size extent, below-image, truncation, null buffer). All pass.
+
+Measured proof, from a deliberately planted trigger:
+
+```
+=== abort() from selftest: deliberate abort() from main() ===
+abort_caller=0x81009b3d  main
+=== SIGABRT ===
+last_context=selftest: deliberate abort() from main()
+maps: /proc/self/maps unavailable
+```
+
+The caller was **named from the embedded map**, which is the capability that was missing: no
+`addr2line`, no 666 MB ELF, no assuming link-time equals run-time.
+
+#### Two honest limits
+
+- **`assert()` is compiled out.** `TPV_GAME_DEFS` sets `NDEBUG=1` (CMakeLists.txt:139) and the binary
+  contains **zero** `assert` references. So `__wrap___assert_func` is defensive only and fires on
+  nothing today. Deliberately not changed: enabling assertions in a release build of a game with
+  inherited asserts would trade one mystery for a new class of deaths. If a build ever defines
+  `DEBUG`, the wrapper is already in place.
+- **`/proc/self/maps` is unavailable** in Vita3K, so the load base is not recorded. That did not matter
+  here because Vita3K evidently maps the ELF at its link address, which the `main` resolution
+  demonstrates. On hardware this line only matters if the loader relocates the image.
+
+#### What to do when it fires
+
+`crash.log` now names the aborting function. For the four silent sites above, that is the whole
+answer: `PPCHalt` or `OSSwitchFiber` means a stub was reached that this port has not implemented, and
+`ConfigVarBase::registerConfigVar` means a double registration, which is a real bug in the config
+system rather than a port defect. Fix the caller, not the wrapper.
