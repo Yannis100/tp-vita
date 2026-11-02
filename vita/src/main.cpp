@@ -25,6 +25,7 @@
 
 #include "boot_diag.hpp"
 #include "boot_screen.hpp"
+#include "crash_record.hpp"
 #include "disc_probe.hpp"
 
 // dusk/settings.h (pulled in by iso_validate.hpp) expects the dolphin OS constants; the game gets them from its PCH.
@@ -194,6 +195,10 @@ tpv::DiscDecision check_discs(tpv::BootLog& log) {
 } // namespace
 
 extern "C" int main(int argc, char* argv[]) {
+    // First, before anything that can abort. A silent abort is what cost two sessions here: the
+    // address resolved to _kill_r, so the process chose to die, and nothing recorded why.
+    tpv_crash_install();
+
     set_clocks();
 
     // The folder the user is told to fill: create it so that it exists after the first launch.
