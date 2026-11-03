@@ -5,6 +5,10 @@
 #   tests/vita3k/run.sh run [interval] [shots] [key ...]   install + start the VPK; screenshots in $work/out/shot_N.png,
 #                                                     the emulator log in $work/out/vita3k.log; keys are pressed afterwards
 #                                                     (x = Cross in Vita3K's default keyboard map)
+#   tests/vita3k/run.sh script <script-file> [prefix]  install + start the VPK and replay a fixed action script,
+#                                                     so the game is DRIVEN past the first screen. Screenshots are
+#                                                     taken at the points the script asks for (see
+#                                                     in_container_script.sh for the grammar and its honest limits).
 # Environment:
 #   VITA3K_DIR   the extracted official Vita3K Linux build (the folder with the Vita3K binary)   [required]
 #   TPV_V3K_WORK work directory: emulator data (firmware, ux0/), config, outputs   [default $HOME/vita3k-work]
@@ -46,5 +50,15 @@ case "$cmd" in
     interval=${1:-15}; shots=${2:-2}; if [ $# -ge 2 ]; then shift 2; else shift $#; fi # the rest are keys
     podman run --rm -v "$VITA3K_DIR:/opt/vita3k:ro" -v "$vpk:/vpk/app.vpk:ro" -v "$here/in_container.sh:/work/in_container.sh:ro" \
       $common "$image" sh /work/in_container.sh "$interval" "$shots" "$@" ;;
-  *) sed -n 2,16p "$0"; exit 1 ;;
+  script)
+    # Replay a fixed action script so the game is driven past the first screen. The script file is
+    # mounted read-only; screenshots land in $work/out/<prefix>N_<name>.png.
+    need_dir; [ -f "$vpk" ] || { echo "no VPK at $vpk (build first)" >&2; exit 2; }
+    script=${1:?usage: run.sh script <script-file> [shot-prefix]}; prefix=${2:-shot_}
+    [ -f "$script" ] || { echo "no script at $script" >&2; exit 2; }
+    script=$(cd "$(dirname "$script")" && pwd)/$(basename "$script")
+    podman run --rm -v "$VITA3K_DIR:/opt/vita3k:ro" -v "$vpk:/vpk/app.vpk:ro" \
+      -v "$here/in_container_script.sh:/work/in_container_script.sh:ro" -v "$script:/work/script.txt:ro" \
+      $common "$image" sh /work/in_container_script.sh /work/script.txt "$prefix" ;;
+  *) sed -n 2,19p "$0"; exit 1 ;;
 esac
