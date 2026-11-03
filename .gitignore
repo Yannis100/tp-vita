@@ -42,3 +42,5 @@ __pycache__/
 *.nkit.iso
 *.pup
 PSVUPDAT.PUP
+build-dev/
+build-debug/
