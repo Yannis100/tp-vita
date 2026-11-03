@@ -16,7 +16,18 @@ set -e
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 work=${TPV_V3K_WORK:-$HOME/vita3k-work}
-vpk=${TPV_VPK:-$root/build/tpv_vita.vpk}
+# Default to the dev VPK when it exists: this harness is for reproducing failures, and a dev build
+# names its own variant in the log. Set TPV_VPK to run a specific one (the release build is
+# build/tpv_vita-release.vpk).
+if [ -n "${TPV_VPK:-}" ]; then
+  vpk=$TPV_VPK
+elif [ -f "$root/build/tpv_vita-dev.vpk" ]; then
+  vpk=$root/build/tpv_vita-dev.vpk
+elif [ -f "$root/build/tpv_vita-release.vpk" ]; then
+  vpk=$root/build/tpv_vita-release.vpk
+else
+  vpk=$root/build/tpv_vita.vpk
+fi
 image=localhost/tpv-vita3k-env
 cmd=${1:-}; [ $# -gt 0 ] && shift
 # the preference directory must exist before Vita3K starts: with a missing one --firmware aborts ("cannot create directories: Invalid argument")

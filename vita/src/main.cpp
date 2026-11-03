@@ -196,6 +196,23 @@ tpv::DiscDecision check_discs(tpv::BootLog& log) {
 }
 } // namespace
 
+// States which build this is, first thing in the log. A dev VPK and a release VPK are different
+// programs (asserts on vs off, -O1 vs -O3) and they have different title ids, but a log file, a
+// screenshot or a pasted frame count carries none of that with it. One line removes the doubt.
+static void log_build_variant(tpv::BootLog& log) {
+#ifdef TPV_DEV_BUILD
+    log.line("BUILD: dev (asserts ON, optimised) -- NOT the shipping build; see TPV_ENABLE_ASSERTS");
+#else
+    log.line("BUILD: release (asserts compiled out)");
+#endif
+#ifdef TPV_VERTEX_CACHE
+    log.line("BUILD: vertex decode cache forced ON for this build (TPV_DEV_VERTEX_CACHE)");
+#endif
+#ifdef TPV_BOOT_TRACE
+    log.line("BUILD: verbose boot tracing ON (TPV_DEV_BOOT_TRACE)");
+#endif
+}
+
 // A deliberate abort, for testing the crash recorder itself. It exists because the recorder's whole
 // job is to explain a death that happens rarely and unpredictably: without a way to provoke one, the
 // fatal path is only ever exercised by a bug, and a bug in the fatal path then looks like the bug it
@@ -253,6 +270,7 @@ extern "C" int main(int argc, char* argv[]) {
     tpv::make_dir(kDataDir);
     static tpv::BootLog log; // static: the log stays open while the game runs
     log.open(kDataDir);
+    log_build_variant(log);
     log_environment(log, argc, argv);
     log_crash_symbols(log);
     maybe_selftest_abort(log);
