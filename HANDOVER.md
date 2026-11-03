@@ -164,6 +164,84 @@ future run disagrees, something in `present()` changed.
 
 ---
 
+### 3b. Build variants: what ships vs what you debug with (2026-11-03)
+
+Two deliverable builds, selectable with one command. Before this, `CMAKE_BUILD_TYPE` was nearly inert
+and `-g` was unconditional, so "Release" was not a considered release and there was no dev build.
+
+```
+tools/build.sh release   -> build/tpv_vita-release.vpk      -O3, NDEBUG,   title TPLG00001
+tools/build.sh dev       -> build-dev/tpv_vita-dev.vpk      -O1, asserts,  title TPLG10001
+tools/build.sh debug     -> build-debug/tpv_vita-debug.vpk  -O0, asserts,  title TPLG20001
+```
+
+`dev` is the one to reproduce a failure with. Not `-O0`: this runs in an emulator that is already slow,
+and an unoptimised build can fall below the frame rate where an intermittent bug appears, which defeats
+the purpose. `-O1` keeps frame pointers and stays close to the shipped code.
+
+#### The one invariant: struct layout must not differ
+
+CMake's stock Debug flags inject `-DDEBUG`, and dusklight adds members under `#if DEBUG`
+(`d_meter_HIO.h`, `f_ap_game.h`, `d_map.h`, ...). That changes `sizeof()` of game objects, so a dev
+build would be a *different program* from the one that ships and a reproduced bug might not be the
+shipped bug. `-DDEBUG`/`-D_DEBUG` are therefore stripped in every variant and `DEBUG` is pinned to `0`,
+verified by preprocessing `dusk_pch.hpp` with the dev build's exact flags: `debug_is_on = 0`.
+`PARTIAL_DEBUG=1` is the safe half of that instrumentation and is already on everywhere.
+
+#### Three traps found while wiring this, all silent
+
+1. **The toolchain owns the build-type flags.** `vita.toolchain.cmake` sets
+   `CMAKE_CXX_FLAGS_DEBUG="-O0 -g -DDEBUG -D_DEBUG"`, and build-type flags are appended *after*
+   `add_compile_options`, so a variant flag added as a compile option loses. That is also where the
+   unwanted `-DDEBUG` came from.
+2. **A custom build type drops every flag.** CMake reads `CMAKE_CXX_FLAGS_<UPPERCASE BUILD TYPE>`, so
+   `CMAKE_BUILD_TYPE=Dev` reads an all-empty `CMAKE_CXX_FLAGS_DEV`. Measured: the cache held the right
+   value in `CMAKE_CXX_FLAGS_DEBUG` while the generated compile line had no `-O` flag at all.
+3. **`add_compile_options` does not split on spaces.** `"-O1 -fno-omit-frame-pointer"` reached the
+   compiler as ONE argument, giving `cc1plus: error: argument to '-O' should be a non-negative
+   integer`. `separate_arguments` is required.
+
+Resolution: build-type flags are cleared to empty (removing the toolchain defaults and `-DDEBUG`) and
+one `add_compile_options` list is the only authority. One place to read, no ordering question.
+
+#### Smaller choices worth keeping
+
+- **Distinct title IDs and VPK names.** Both builds used to be `TPLG00001` / `tpv_vita.vpk`, so
+  installing the dev build overwrote the release one and a screenshot or frame count could not be
+  attributed to a build. The ID must be 4 uppercase letters + 5 digits (`check_vpk.py` enforces it),
+  so the variant goes in the digit field: `00001` / `10001` / `20001`.
+- **`boot.log` states its own variant** (`BUILD: dev (asserts ON, ...)`), so a pasted log is
+  self-describing.
+- **The Vita3K harness prefers the dev VPK** when present; `TPV_VPK=` overrides.
+
+### 3c. The intermittent death is a borealis FATAL — proven, not inferred (2026-11-03)
+
+The dev build reproduced the crash on its first run and the §7.11 recorder named it:
+
+```
+=== abort() from abort() ===
+abort_caller=0x81a8fbbb  borealis::log::detail::write_fatal(std::basic_string_view<char, ...>, ...)
+symbols: table matches this build
+```
+
+So the earlier guesses — `PPCHalt`, `OSSwitchFiber`, a config double-registration — were wrong for this
+crash: it is a `LogLevel::Fatal` raised through borealis. This is the first time the project has known
+*what kind* of death it is, and it came from the fixed recorder rather than from reading logs.
+
+What is still missing is the **message**, which is why [`dusklight/src/dusk/logging.cpp`](../dusklight/src/dusk/logging.cpp)
+now installs `Options::onFatal`: it writes to stderr (which lands in `vita3k.log`) and to
+`ux0:data/tpvita/fatal.txt`. The hook is necessary because of a real gap in borealis: when the logger is
+not initialised a fatal goes to `write_bootstrap_locked`, which pushes onto `state.bootstrap`, and that
+queue is replayed **only inside `init()`** — so a fatal after init began but before it completed is
+never written anywhere. `onFatal` is called in both branches, before `std::abort()`.
+
+**Six subsequent dev runs did not reproduce it.** Recorded rather than explained away: with asserts on
+and `-O1` the death did not recur, which is consistent with it being sensitive to the optimised build.
+It does not prove that, and it does not mean the bug is gone. The honest state is that the site is now
+identified and the message will be captured the next time it happens.
+
+---
+
 ## 4. What was done this session (chronological)
 
 ### 4.1 Aurora upgrade attempt, abandoned and fully reverted
