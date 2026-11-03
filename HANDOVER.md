@@ -65,7 +65,7 @@ verified from emulator artefacts, not assumed.
 Verified as of this handover:
 
 - Build is clean: `cmake --build build -j` exits 0, produces `build/tpv_vita.vpk`,
-  text→data gap 111,116 bytes.
+  text→data gap 105,200 bytes.
 - `mDoMch_Create()` returns 1 (previously it never returned).
 - `main01()` enters its `do { ... } while (dusk::IsRunning)` loop and keeps iterating.
 - Vita3K renders real frames: after the §7.3 texture fix, screenshots carry 78,360–87,870 distinct
@@ -79,9 +79,12 @@ Verified as of this handover:
 - The vertex decode path is **measured separately from the frame** at 3.95–6.45 ms/frame in Vita3K
   (§7.9), which is the number to compare against when optimising it. A content-addressed decode cache
   exists, is correct, hits 74%, and is **off** because that is too small a share here to measure.
-- A fatal path now **names itself**: `abort()` is intercepted link-time and every death writes
-  `ux0:data/tpvita/crash.log` with the caller resolved to a symbol from an embedded link-map table
-  (§7.10). Proven by a deliberate abort, which recorded `abort_caller=0x81009b3d main`.
+- A fatal path now **names itself, correctly**: `abort()` is intercepted link-time and every death
+  writes `ux0:data/tpvita/crash.log` with the caller resolved to a symbol (§7.10, §7.11). The first
+  version named the *wrong* function (43.8% of symbols were missing from its table, and every size was
+  0); the table now comes from `nm -S -C` on the shipped ELF, rides in the VPK, and carries an anchor
+  address that is checked on **every boot** and again at crash time. Proven by a deliberate abort,
+  which recorded `abort_caller=0x81009bab main`, verified against `nm` to be inside `main`.
 
 **What that does not prove.** Vita3K is an emulator; nothing here has run on real hardware.
 The screenshots show a rendered 3D scene, but nobody has confirmed it is the *correct* scene
@@ -1051,8 +1054,12 @@ Three things, each found by looking rather than guessing:
 - [`vita/src/crash_symbols.cpp`](tp-vita/vita/src/crash_symbols.cpp) + [`tools/map_symbols.py`](tp-vita/tools/map_symbols.py)
   — the link map is turned into a 36,686-entry table and embedded, so naming an address needs no
   filesystem access and no allocation on the fatal path. There is now a `-Wl,-Map=` too; there was none.
+
+  **Superseded by §7.11**: that table was missing 43.8% of the symbols and every size was 0, so it named
+  the wrong function. The table is now generated from the ELF with `nm -S -C` and shipped as a file in
+  the VPK; the `-Wl,-Map=` is gone.
 - [`tests/host/crash/`](tp-vita/tests/host/crash/run.sh) — 7 assertions against the real generated
-  table (resolve, zero-size extent, below-image, truncation, null buffer). All pass.
+  table (resolve, zero-size extent, below-image, truncation, null buffer). All pass. Now 19.
 
 Measured proof, from a deliberately planted trigger:
 
@@ -1066,6 +1073,9 @@ maps: /proc/self/maps unavailable
 
 The caller was **named from the embedded map**, which is the capability that was missing: no
 `addr2line`, no 666 MB ELF, no assuming link-time equals run-time.
+
+**That name was wrong.** `main` happened to be correct; the next crash reported
+`borealis::log::file_descriptor()` for an address inside `write_fatal`. See §7.11.
 
 #### Two honest limits
 
@@ -1084,3 +1094,101 @@ The caller was **named from the embedded map**, which is the capability that was
 answer: `PPCHalt` or `OSSwitchFiber` means a stub was reached that this port has not implemented, and
 `ConfigVarBase::registerConfigVar` means a double registration, which is a real bug in the config
 system rather than a port defect. Fix the caller, not the wrapper.
+
+### 7.11 The recorder named the wrong function, and the fix (2026-11-03)
+
+§7.10 shipped and then lied on its first real crash. The log said:
+
+```
+=== abort() from abort() ===
+abort_caller=0x81c7f805  borealis::log::file_descriptor()
+```
+
+`file_descriptor()` is a one-line atomic load (`return g_fileFd.load(...)`) at `0x81c7f3d8`, 0x10 bytes
+long. It cannot abort. `addr2line` against the real ELF put the true site at
+`borealis::log::detail::write_fatal()` (`dusklight/extern/borealis/src/log.cpp:646`, the
+`write_bootstrap_locked` branch, immediately before `std::abort()` at 654). So the finding was real and
+useful — the death is a `LogLevel::Fatal` from borealis — but the name pointing at it was wrong, and a
+wrong name is worse than no name because it sends the reader to innocent code.
+
+**My first diagnosis was also wrong**, and it is worth recording because it was plausible and I acted
+on it: I concluded the embedded table was "one build stale by construction". Measurement killed that.
+Comparing two consecutive tables, **0 of 34,572 symbols changed address**, and the ELF timestamp
+matched. Staleness was not the mechanism.
+
+#### The two real defects, both in the generator
+
+1. **It threw away 43.8% of the table.** [`tools/map_symbols.py`](tp-vita/tools/map_symbols.py) rejected
+   any name containing a space. C++ demangled names contain spaces *and* commas —
+   `write_fatal(std::basic_string_view<char, ...>, ...)` is one — so 31,439 of 71,787 parsed rows were
+   silently dropped. `write_fatal` was not in the table at all, so the nearest *surviving* symbol was
+   reported instead.
+2. **Every size was 0.** ld `-Map` symbol lines carry no size column, so the "is the address actually
+   inside this symbol" check could never fire. It was dead code that looked like protection.
+
+`nm -S --defined-only -C` supplies both. It is the right source and it was available all along; the
+map was chosen only because the build already produced one.
+
+#### Why the table is now a file, not an embedded blob
+
+A complete text-symbol table is **4.2 MiB**, and `.text`+`.rodata` has **118 KiB** of slack before the
+data segment (see `tools/check_text_gap.py`). The old table fit at 1.69 MiB only *because* it had
+discarded 43.8% of the symbols. So the table now ships as `app0:data/tpvita/crash_symbols.txt` inside the
+VPK — 5.16 MB, 61,749 symbols, opened only while dying. That also removes the staleness class of bug
+entirely, because the table is generated from the same ELF that ships, in the same build.
+
+The generator no longer writes C string literals; it writes **real tabs and newlines**. Both forms were
+tried and the C-literal form silently produced a table the resolver read as one malformed line.
+
+#### The check that makes a name trustworthy, and the bug it found immediately
+
+The table records the address of `tpv_crash_table_anchor`, a function defined in
+[`vita/src/crash_symbols.cpp`](tp-vita/vita/src/crash_symbols.cpp). Validity is that recorded address
+matching the live one. When they disagree, the recorder prints addresses only and says so.
+
+That check ran on its first boot and **failed on a table that was actually correct**:
+
+```
+crash symbols: MISMATCH, table 0x8108f570 vs live 0x8108f571
+```
+
+Off by exactly 1: the ARM **Thumb bit**. A function pointer has bit 0 set; the ELF symbol value that
+`nm` prints has it clear. Both are now normalised before comparing. This is the argument for running
+the check on every boot instead of only during a crash — a check you can only run when something has
+already gone wrong cannot be validated at all.
+
+#### Verified, in Vita3K, end to end
+
+Every boot now logs one line, so the capability is confirmed without waiting for a rare bug:
+
+```
+[   0.061] crash symbols: table matches this build (anchor 0x8108f570); crash logs will name
+```
+
+A deliberate abort (`ux0:data/tpvita/selftest-abort`, a permanent opt-in trigger that deletes itself)
+produced:
+
+```
+=== abort() from crash self-test (ux0:data/tpvita/selftest-abort) ===
+abort_caller=0x81009bab  main
+symbols: table matches this build
+```
+
+and `main` really does span `0x81008560`+`0x1814` = `0x81009d74`, so `0x81009baa` is inside it. The
+name is true.
+
+The specific regression that caused the misnaming is now pinned in the host test: an address in the
+middle of `write_fatal` resolves to `write_fatal`, and an address past the end of `file_descriptor()`
+resolves to the *next* symbol rather than to `file_descriptor()`.
+
+[`tests/host/crash/`](tp-vita/tests/host/crash/run.sh) is 19 assertions, all passing, against the real
+generated table. They read addresses out of the table instead of hardcoding them, because hardcoded
+addresses test the build rather than the resolver.
+
+#### The lesson, stated plainly
+
+The recorder was built to remove an unknown and instead introduced a confident wrong answer, which is
+strictly worse. Three things would each have caught it: assert on the artefact (43.8% of rows dropped
+is visible in a row count), use a source that carries the field you are checking (sizes), and make the
+tool state its own reliability rather than assuming it. Only the third was in the original design, and
+it was defeated by a bug one layer down.

@@ -34,6 +34,8 @@
 
 #include <sys/stat.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -194,6 +196,52 @@ tpv::DiscDecision check_discs(tpv::BootLog& log) {
 }
 } // namespace
 
+// A deliberate abort, for testing the crash recorder itself. It exists because the recorder's whole
+// job is to explain a death that happens rarely and unpredictably: without a way to provoke one, the
+// fatal path is only ever exercised by a bug, and a bug in the fatal path then looks like the bug it
+// was meant to explain. Triggered by a file rather than an environment variable because the Vita3K
+// harness does not forward the host environment into the guest, and a file works on hardware too.
+//
+// This is not dead code and should not be removed: it is the only way to verify on a real Vita that
+// a crash log names functions. Opt-in, and it says so loudly in the log before it fires.
+static void maybe_selftest_abort(tpv::BootLog& log) {
+    const char* const trigger = "ux0:data/tpvita/selftest-abort";
+    FILE* file = std::fopen(trigger, "rb");
+    if (file == nullptr) {
+        return;
+    }
+    std::fclose(file);
+    std::remove(trigger); // so the next launch does not die too
+    log.line("crash self-test: %s was present, aborting deliberately in 2 seconds", trigger);
+    log.close();
+    // Give the log a moment to reach the card before the process dies.
+    sceKernelDelayThread(2 * 1000 * 1000);
+    tpv_crash_note("crash self-test (ux0:data/tpvita/selftest-abort)");
+    abort();
+}
+
+// Proves on every boot that a crash log will be able to name addresses, rather than finding out
+// only during the crash that the symbol table did not match. This is the whole point of generating
+// the table from the shipped ELF and checking an anchor address: the check is cheap and it can run
+// when nothing is wrong. With the old compiled-in table this could not be tested at all, because
+// the table described the *previous* link and the mismatch was only visible after a death.
+static void log_crash_symbols(tpv::BootLog& log) {
+    uintptr_t recorded = 0;
+    uintptr_t live = 0;
+    if (tpv_crash_table_anchor_pair(&recorded, &live) == 0) {
+        log.line("crash symbols: NO TABLE (crash logs will show raw addresses only)");
+        return;
+    }
+    if (recorded == live) {
+        log.line("crash symbols: table matches this build (anchor 0x%08x); crash logs will name",
+                 static_cast<unsigned>(live));
+        return;
+    }
+    log.line("crash symbols: MISMATCH, table 0x%08x vs live 0x%08x; a crash log will refuse to name "
+             "functions and print addresses only",
+             static_cast<unsigned>(recorded), static_cast<unsigned>(live));
+}
+
 extern "C" int main(int argc, char* argv[]) {
     // First, before anything that can abort. A silent abort is what cost two sessions here: the
     // address resolved to _kill_r, so the process chose to die, and nothing recorded why.
@@ -206,6 +254,8 @@ extern "C" int main(int argc, char* argv[]) {
     static tpv::BootLog log; // static: the log stays open while the game runs
     log.open(kDataDir);
     log_environment(log, argc, argv);
+    log_crash_symbols(log);
+    maybe_selftest_abort(log);
 
     // Inject --dvd <disc> if a disc image exists and the caller did not already pass one.
     std::string disc;
