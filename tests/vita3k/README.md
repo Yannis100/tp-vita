@@ -9,8 +9,25 @@ export VITA3K_DIR=/path/to/extracted/vita3k        # the folder that contains th
 tests/vita3k/run.sh image                           # once: build the container image from Containerfile
 tests/vita3k/run.sh firmware /path/to/PSVUPDAT.PUP  # once, optional: install your own firmware
 tests/vita3k/run.sh run 15 2 x                      # start the VPK, screenshots after 15 s and 30 s, then hold x (Cross) for 0.3 s
+tests/vita3k/run.sh script tests/vita3k/scripts/opening.txt   # replay a fixed action script instead
 # results: $TPV_V3K_WORK (default ~/vita3k-work): out/shot_N.png, out/vita3k.log, home/.local/share/Vita3K/Vita3K/ux0/data/tpvita/boot.log
 ```
+
+## Driving the game instead of watching the title screen
+
+`run` never touches the pad until after the last screenshot, so an idle run stays in the title/attract
+loop and never loads new scene data. `script` replays a fixed sequence of taps and held directions
+(`in_container_script.sh`, which also documents the grammar), taking screenshots at the points the
+script asks for.
+
+Its honest limit is written into its header: the **key sequence is fixed, the timing is not**. Presses
+are wall-clock, so the emulator's variable speed means a press can land on a different frame each run.
+That is a reproducible *sequence*, not a reproducible *run*. A frame-counted injector would need a hook
+inside the app, not an `xdotool` driver.
+
+What it found the first time it was used: the port stops at a GameCube memory-card prompt ("No Memory
+Card found in Slot A") in a self-perpetuating loop, so the game cannot be played past file select. See
+`HANDOVER.md` §3d.
 
 To test the disc diagnosis, put files in `<work>/home/.local/share/Vita3K/Vita3K/ux0/data/tpvita/` (the Vita's `ux0:data/tpvita/`) before `run`.
 Fixtures that are made of your own bytes work: a 1088-byte `GZ2E01.iso` (game ID, then the GameCube magic `C2 33 9F 3D` at offset 0x1C)

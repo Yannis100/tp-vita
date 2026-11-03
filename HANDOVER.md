@@ -235,10 +235,76 @@ not initialised a fatal goes to `write_bootstrap_locked`, which pushes onto `sta
 queue is replayed **only inside `init()`** — so a fatal after init began but before it completed is
 never written anywhere. `onFatal` is called in both branches, before `std::abort()`.
 
-**Six subsequent dev runs did not reproduce it.** Recorded rather than explained away: with asserts on
-and `-O1` the death did not recur, which is consistent with it being sensitive to the optimised build.
-It does not prove that, and it does not mean the bug is gone. The honest state is that the site is now
-identified and the message will be captured the next time it happens.
+**Correction to the paragraph that used to be here.** It claimed "six subsequent dev runs did not
+reproduce it" and that the death might be "sensitive to the optimised build". Both claims were wrong:
+the dev build is where the `write_fatal` frame came *from*, and a `frame=9` run was a short harness
+window, not a death. Recorded here because I wrote it down as fact at the time.
+
+**14 consecutive release runs then produced no fatal at all** — 8 at 60 s, 3 at 150 s, and 3 at
+240 s × 2 shots that reached frame 7,200–7,500 — with no `crash.log`, no `fatal.txt`, and no guest
+exception in any emulator log. That retires the "roughly 1 run in 7" figure below, which was measured
+on an older tree. Either one of the intervening changes fixed it (§7.1's arena fix is the plausible
+candidate: it removed a 24 MiB shortfall that made allocation failure fatal on `TARGET_PC`), or its
+rate is simply low enough that 14 runs establish nothing. **Both readings fit the data and neither is
+proven.**
+
+### 3d. The idle runs never left the attract loop — and the game stops at a memory-card prompt
+
+The negative result above has a cause, and it is a measurement error of exactly the kind §7.8 collects.
+
+Idle runs do not play the game. The twilight-sky frames they produce are the **title / attract loop**,
+not gameplay. An idle run therefore never loads new scene data, and the data-dependent fatal sites
+cannot fire:
+
+- [`gx.cpp:161`](vita/aurora/overlay/gx/gx.cpp:161) calls `comp_cnt_count()`, which `fatal()`s on an
+  unsupported `GXAttr`/`GXCompCnt` pair;
+- it is reached per display list from [`dl.cpp:62`](../dusklight/build/aurora_lib/gx/dl.cpp:62) and
+  [`command_processor.cpp:366`](../dusklight/build/aurora_lib/gx/command_processor.cpp:366).
+
+New geometry with new vertex attribute formats is what moving through the game produces. 7,500 idle
+frames on one screen cannot produce it. So "14 clean runs" is weaker evidence than it looks.
+
+To test this properly, [`tests/vita3k/in_container_script.sh`](tests/vita3k/in_container_script.sh)
+replays a **fixed action script** (grammar in that file; scripts live in `tests/vita3k/scripts/`), and
+`run.sh script <file> [prefix]` mounts and runs it. Its header states the honest limit plainly: the
+**key sequence is fixed, the timing is not** — presses are wall-clock, so the emulator's variable speed
+means a press can land on a different frame each run. That is a reproducible sequence, not a
+reproducible run. A frame-counted injector would need a hook inside the app, not an `xdotool` driver.
+
+**Input does reach the game.** A tap moved the screen from "No Memory Card found in Slot A" to
+"Continue without saving?" with the cursor shown, so the SDL3 → `aurora::input` → `PADRead` path works.
+
+**But the game cannot get past it.** Every route returns to the same check:
+
+| Step | Code | Result |
+|---|---|---|
+| status read | [`mDoMemCd_Ctrl_c::getStatus`](../dusklight/src/m_Do/m_Do_MemCard.cpp:388) | `CARD_STATE_NO_CARD_e` → `0` |
+| `case 0` | [`dFile_select_c::MemCardStatCheck`](../dusklight/src/d/d_file_select.cpp:4934) | `ERRMSG_WAIT_KEY` then `NO_SAVE_SEL_DISP` |
+| after the prompt | `MemCardStatCheck` again | `0` again → the same dialog |
+
+So it is a **self-perpetuating loop**: answering "Continue without saving?" re-runs the check that
+fails, and A-pressing never opens the game. The "Checking Memory Card in Slot A…" header is permanent
+chrome on that screen, not a transient status — which is why it is still there minutes later.
+
+One hypothesis was tested and **ruled out**: that the card file could not be created because its parent
+was the disc image rather than a directory (an earlier Vita3K log showed `.../GZ2P01.iso/EUR/Card A`).
+`VitaUserPath` is `ux0:data/tpvita/` ([`backend.cpp:58`](vita/aurora/backend.cpp:58)), and creating
+`ux0:data/tpvita/EUR/Card A` by hand **did not change the state**: same shots, same md5, and the
+directory was still empty afterwards. The parent-path theory is dead.
+
+What is established, and what is not:
+
+- **Established:** status is `0`; the loop is self-perpetuating; input works; creating the card
+  directory by hand does not help; `CARDMount` always returns `CARD_RESULT_READY`
+  ([`card.cpp:664`](../dusklight/extern/aurora/lib/dolphin/card.cpp:664)), so "no card" is decided by
+  `CARDCheck` → `card->getError()`, not by the mount.
+- **Not established:** *why* the GCI-folder channel reports `NOCARD` on this port. The next step is to
+  print `mCardState`/`getError()` on the card thread and read `CardGciFolder::open`/`probeCardFile`,
+  which should take minutes now that the question is narrow.
+
+This also outranks the intermittent `write_fatal`: **the port cannot currently be played at all past
+file select**, which is a hard blocker for every other test. It was invisible for the whole project
+because nothing had ever driven the game with input.
 
 ---
 
@@ -920,8 +986,18 @@ For reference, the honest position as of this revision: the port boots, reaches 
 renders correctly-shaped frames with plausible colour counts on an emulator. **A separate port does
 the same thing on real hardware at 12-28 FPS with working saves and input (§7.5), so feasibility is
 no longer in question.** What remains unproven here is scene correctness (no reference image),
-performance, audio, and hardware behaviour — plus one intermittent allocation failure in roughly 1
-run in 7 whose cause is not yet known.
+performance, audio, and hardware behaviour.
+
+**Corrections to the two claims that used to end this section (2026-11-03).**
+
+- The "roughly 1 run in 7" allocation failure was measured on an older tree. 14 consecutive release
+  runs afterwards produced no fatal at all (§3c). Either it was fixed by an intervening change
+  (§7.1's arena fix is the plausible candidate) or its rate is low enough that 14 runs prove nothing.
+  Both fit the data; neither is proven.
+- More importantly, those runs were **idle**, and an idle run never leaves the title/attract loop, so
+  none of them played the game. The port currently **stops dead at a GameCube memory-card prompt** and
+  cannot be played past file select at all (§3d). That is now the top blocker, and it was invisible
+  for the whole project because no test had ever driven the game with input.
 
 ### 7.6 First performance baseline, and why EFB copies are *not* the missing piece (2026-11-02)
 
