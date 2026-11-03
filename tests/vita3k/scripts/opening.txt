@@ -1,0 +1,73 @@
+# A fixed action script for in_container_script.sh: get Twilight Princess past the title/attract loop
+# and the GameCube memory-card prompt, and into actual gameplay.
+#
+# WHY THIS MATTERS (measured 2026-11-03): an idle run never leaves the title/attract loop. The
+# twilight-sky frames that 14 idle runs produced were the attract demo, not gameplay, so the
+# data-dependent fatal sites (gx.cpp:161 comp_cnt_count / comp_size, reached per display list from
+# dl.cpp:62 and command_processor.cpp:366) were never reachable. Input DOES work: a tap moved the
+# game from "No Memory Card found in Slot A" to "Continue without saving?".
+#
+# Keys are Vita3K's default map (tests/vita3k/config.yml):
+#   x = Cross (confirm / A)   c = Circle (cancel / B)   Enter = Start
+#   w/a/s/d = left stick up/left/down/right              ArrowUp/Down/Left/Right = D-pad
+#   q = L1   e = R1   o = R2 (R trigger)   u = L2
+#
+# HONEST LIMIT: the KEY SEQUENCE is fixed; the timing is wall-clock, so the emulator's variable speed
+# means a press can land on a different frame each run. Reproducible sequence, not a reproducible run.
+
+# Loading a 1.4 GB disc image under llvmpipe takes about a minute before the first screen appears;
+# anything pressed before that lands on Vita3K's own window and is lost.
+wait 75
+shot 00_first_screen
+
+# Title / attract loop -> start. Several presses, because how many are needed depends on where in the
+# attract cycle the wall clock landed.
+tap x
+wait 4
+tap x
+wait 4
+tap x
+wait 4
+shot 01_after_start
+
+# The GameCube memory-card check. There is no memory card, so the only way forward is
+# "Continue without saving?" -> yes. Forgive the repetition: this dialog can reappear.
+tap x
+wait 3
+tap x
+wait 3
+shot 02_memcard
+
+tap x
+wait 4
+tap x
+wait 4
+shot 03_after_memcard
+
+# Any further confirmations before control is handed over (file select / intro skip).
+tap x
+wait 4
+tap x
+wait 4
+shot 04_confirmations
+
+# From here on the game should be under control. Move, and watch for new geometry arriving with
+# vertex attribute formats the title screen never used.
+hold w 4
+shot 05_walked
+
+hold d 2
+hold w 3
+shot 06_turned
+
+tap x
+wait 3
+shot 07_interact
+
+hold w 4
+hold a 2
+hold w 4
+shot 08_roamed
+
+wait 10
+shot 09_final
