@@ -210,14 +210,16 @@ target_link_libraries(tpv_vita PRIVATE
 # is 0 return EINVAL(22); if it is -1 call pte_mutex_check_need_init() and lock lazily. So a
 # statically initialised mutex works once real pthread is linked, whereas a zeroed one would return
 # EINVAL and std::mutex::lock() would throw std::system_error(22).
-# Crash symbol resolution. The map is produced by the same link that produces the ELF, so the table
-# it yields describes the previous build on the first pass and the current one thereafter. That is
-# deliberate: a stale table is only ever consulted when the process is already aborting, and the
-# alternative (linking twice on every build) costs minutes. The table is regenerated below whenever
-# the map changes, so a crash log names the symbols of the build that crashed.
-set(TPV_CRASH_MAP "${CMAKE_CURRENT_BINARY_DIR}/tpv_vita.map")
-set(TPV_CRASH_TABLE "${CMAKE_CURRENT_BINARY_DIR}/generated/crash_map.inc")
-file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
+# Crash symbol resolution. The table is a FILE shipped in the VPK, not a blob compiled in, for two
+# measured reasons: a complete text-symbol table is ~4.2 MiB and .text+.rodata has ~118 KiB of slack
+# before the data segment, and a compiled-in table is always one link stale because it can only be
+# built from the ELF that just finished linking. See vita/src/crash_symbols.cpp.
+#
+# It is generated from the ELF, so it describes exactly the image in the VPK. Everything that names
+# an address checks the table's anchor address against the live one first, so a table left over from
+# another build is refused rather than trusted.
+set(TPV_CRASH_TABLE "${CMAKE_CURRENT_BINARY_DIR}/crash_symbols.txt")
+set(TPV_CRASH_ELF "${CMAKE_CURRENT_BINARY_DIR}/tpv_vita")
 
 target_link_options(tpv_vita PRIVATE
   -Wl,--undefined=pthread_once
@@ -230,17 +232,14 @@ target_link_options(tpv_vita PRIVATE
   # __assert_func is wrapped too, because a failed assert otherwise loses its expression and line
   # before the log can be flushed.
   -Wl,--wrap=abort
-  -Wl,--wrap=__assert_func
-  -Wl,-Map=${TPV_CRASH_MAP})
+  -Wl,--wrap=__assert_func)
 
-# Compile the (possibly empty) crash table in. crash_symbols.cpp #includes it as a string-literal body.
-target_include_directories(tpv_vita PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
-
-# After each link: turn the map into the table for the NEXT build. Kept off the critical path.
+# After each link: turn the ELF's symbol table into the table that ships beside it. nm is used rather
+# than the linker map because the map records neither symbol sizes nor the demangled names with
+# spaces, and both gaps produced a wrong answer on a real crash.
 add_custom_command(TARGET tpv_vita POST_BUILD
-  COMMAND ${Python3_EXECUTABLE} ${TPV_DIR}/tools/map_symbols.py ${TPV_CRASH_MAP} ${TPV_CRASH_TABLE}.next
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${TPV_CRASH_TABLE}.next ${TPV_CRASH_TABLE}
-  COMMENT "Regenerating crash symbol table from the link map"
+  COMMAND ${Python3_EXECUTABLE} ${TPV_DIR}/tools/map_symbols.py ${TPV_CRASH_ELF} ${TPV_CRASH_TABLE} ${CMAKE_NM}
+  COMMENT "Generating crash symbol table from the linked ELF"
   VERBATIM)
 
 
@@ -266,6 +265,8 @@ add_custom_command(TARGET tpv_vita POST_BUILD
 option(TPV_PACKAGE "Create the SELF and VPK" OFF)
 if(TPV_PACKAGE)
   vita_create_self(tpv_vita.self tpv_vita)
+  # The crash symbol table rides in the VPK at app0:data/tpvita/. It is ~4 MiB of text that is only
+  # opened if the process dies, and it is why a crash log can name the function that aborted.
   vita_create_vpk(tpv_vita.vpk ${VITA_TITLEID} tpv_vita.self
     VERSION ${VITA_VERSION}
     NAME ${VITA_APP_NAME}
@@ -273,5 +274,6 @@ if(TPV_PACKAGE)
     FILE ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/pic0.png sce_sys/pic0.png
     FILE ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/bg.png sce_sys/livearea/contents/bg.png
     FILE ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/startup.png sce_sys/livearea/contents/startup.png
-    FILE ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/template.xml sce_sys/livearea/contents/template.xml)
+    FILE ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/template.xml sce_sys/livearea/contents/template.xml
+    FILE ${TPV_CRASH_TABLE} data/tpvita/crash_symbols.txt)
 endif()

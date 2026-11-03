@@ -1,81 +1,128 @@
 #!/usr/bin/env python3
-"""Turn a GNU ld -Map file into a sorted symbol table the crash recorder can resolve against.
+"""Turn the linked ELF's symbol table into a table the crash recorder can resolve against.
 
-Why this exists. Naming a faulting address on this port used to mean grepping the section headers of
-tpv_vita.velf to work out whether the address was even in our image, then running addr2line against
-the 666 MB debug ELF, all while assuming the link-time address equals the run-time address. That
-assumption is what the crash log now records instead of assuming (see vita/src/crash_record.cpp).
+Why this exists. The recorder names the function that called abort(). It cannot use a backtrace
+(the Vita has no backtrace()), so it needs a symbol table compiled into the image and matched by
+address while the process is already dying.
 
-This script produces a compact table of (address, size, name) rows that is embedded in the ELF and
-matched by binary search when the process is already dying, so there is no filesystem read and no
-allocation on that path.
+Why NOT the linker map, which is what this used to read. The ld -Map file looked like the obvious
+source because the build already produced it, but it was wrong twice over, and both defects were
+invisible until a real crash was decoded:
 
-Output is the body of a C++ string literal (crash_map.inc), one symbol per line:
-    "0x82269aec,0x22,abort\\n"
-    "0x82269af0,0x10,abort_helper\\n"
-so it can be pasted into a constexpr const char* with #include and lands in .rodata with no loader
-support needed at crash time.
+  1. Half the symbols were missing. Map symbol lines carry no size column, and the old parser
+     rejected any name containing a space. C++ demangled names contain spaces and commas, so 43.8%
+     of symbols were silently discarded -- including every templated function and every function
+     with arguments. `borealis::log::detail::write_fatal(std::basic_string_view<...>, ...)` was one
+     of them, so an address inside write_fatal resolved to the nearest *surviving* symbol,
+     `borealis::log::file_descriptor()`, which is a 0x10-byte atomic load that cannot abort. The
+     log named innocent code, and that cost a session.
+  2. Every size was 0, because the map does not record one. A size of 0 disables the "is the
+     address actually inside this symbol" check, so nothing ever rejected a bad match.
 
-Usage: map_symbols.py <linker.map> <crash_map.inc>
+nm -S --defined-only supplies both: complete symbol coverage and real sizes. Demangled (-C) is used
+rather than mangled because it is what a reader needs, and it is no larger -- demangled names are
+frequently shorter than their mangling.
+
+Format. One row per symbol, TAB separated, because tab is the one byte that cannot appear in a
+demangled name (commas appear in 19,226 of them, so the old comma-separated format was ambiguous):
+
+    0x81000228	0x0	OSSwitchStack
+
+Output is a complete C++ definition, so the consumer is a bare #include at namespace scope with no
+surrounding syntax to get wrong:
+
+    static const char kTable[] =
+    "0x81000228\t0x0\tOSSwitchStack\n"
+    ;
+    static const unsigned kRowCount = 66975;
+
+The total size of the table depends only on the set of (size, name) pairs, not on the addresses,
+because addresses are padded to a fixed 8 hex digits. Do not "improve" that padding: it is what
+stops the table's own size from perturbing the layout it is about to describe.
+
+Usage: map_symbols.py <elf> <crash_map.inc> [nm]
 """
-import re
+import os
+import subprocess
 import sys
 
-# Map lines look like:
-#                 0x0000000082269aec                abort
-#   0x0000000082269aec    0x30 libc_stub.a(foo.o)   bar
-# The address is the first 0x token. A symbol line has exactly one 0x token (the address);
-# an input-file line has two (the section's start and, sometimes, its size).
-LINE = re.compile(r"^\s+(0x[0-9a-fA-F]+)(?:\s+(0x[0-9a-fA-F]+)\s+\S+)?\s+(\S.*?)\s*$")
+# Address, size, type letter, name. nm -S -C pads the fields, and the name may contain anything.
+# Splitting on whitespace with a max of 3 splits is what keeps names with spaces intact.
+USABLE_TYPES = "TtWw"  # text, and weak text of either binding
 
 
-def parse(path):
-    rows = []
-    with open(path, "r", errors="replace") as handle:
-        for line in handle:
-            match = LINE.match(line)
-            if match is None:
-                continue
-            address, size, name = match.groups()
-            # Skip anything that is clearly not a symbol name.
-            if not name or " " in name or name.startswith("0x"):
-                continue
-            try:
-                addr = int(address, 16)
-            except ValueError:
-                continue
-            length = int(size, 16) if size else 0
-            if addr == 0:
-                continue
-            rows.append((addr, length, name))
-
-    # Symbols can appear more than once in a map (section, then input file). Keep the first, which is
-    # the definition, and sort so the recorder can binary search.
-    seen = {}
-    for addr, length, name in rows:
-        if addr not in seen:
-            seen[addr] = (length, name)
-    return sorted((addr, length, name) for addr, (length, name) in seen.items())
+def read_nm(elf, nm):
+    try:
+        out = subprocess.run([nm, "-S", "-C", "--defined-only", elf],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    except OSError as exc:
+        sys.stderr.write("map_symbols.py: cannot run %s: %s\n" % (nm, exc))
+        return None
+    except subprocess.CalledProcessError as exc:
+        sys.stderr.write("map_symbols.py: %s failed: %s\n"
+                         % (nm, exc.stderr.decode("utf-8", "replace")[:400]))
+        return None
+    return out.stdout.decode("utf-8", "replace")
 
 
-def c_escape(name):
-    # Only a double quote or backslash would break the literal; symbol names are otherwise ordinary
-    # identifiers plus occasional C++ mangling. Newlines cannot appear inside a map symbol name.
-    return name.replace("\\", "\\\\").replace('"', '\\"')
+def parse(text):
+    rows = {}
+    for line in text.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        address, size, kind, name = parts
+        if kind not in USABLE_TYPES:
+            continue
+        try:
+            addr = int(address, 16)
+            length = int(size, 16)
+        except ValueError:
+            continue
+        if addr == 0 or not name:
+            continue
+        # One row per address. Aliases (identical address, several names) keep the first, which is
+        # the one nm printed first and the one the linker considers primary.
+        if addr in rows:
+            continue
+        rows[addr] = (length, name)
+    return sorted((addr, length, name) for addr, (length, name) in rows.items())
+
+
+def sanitize(name):
+    # Tab is the separator and a newline would split the row, so neither may survive in a name. In
+    # practice nm emits neither; this is a guard, not a transform.
+    return name.replace("\t", " ").replace("\r", " ").replace("\n", " ")
 
 
 def main(argv):
-    if len(argv) != 3:
-        sys.stderr.write("usage: map_symbols.py <linker.map> <crash_map.inc>\n")
+    if len(argv) not in (3, 4):
+        sys.stderr.write("usage: map_symbols.py <elf> <crash_map.inc> [nm]\n")
         return 2
-    rows = parse(argv[1])
-    if not rows:
-        sys.stderr.write("map_symbols.py: no symbols found in %s\n" % argv[1])
+    elf = argv[1]
+    if not os.path.exists(elf):
+        sys.stderr.write("map_symbols.py: no such ELF: %s\n" % elf)
         return 1
-    with open(argv[2], "w") as out:
+    nm = argv[3] if len(argv) == 4 else os.environ.get("NM", "arm-vita-eabi-nm")
+
+    text = read_nm(elf, nm)
+    if text is None:
+        return 1
+    rows = parse(text)
+    if not rows:
+        sys.stderr.write("map_symbols.py: no text symbols found in %s\n" % elf)
+        return 1
+
+    # NOTE: this is a runtime data file, not C source. It must contain REAL tab and newline bytes.
+    # Writing the two-character sequences "\t" and "\n" here (which is what the compiled-in version
+    # needed) produces a table the resolver parses as one giant malformed line and matches nothing.
+    with open(argv[2], "w", newline="\n") as out:
+        out.write("// Generated by tools/map_symbols.py -- do not edit.\n")
+        out.write("// %d symbols from %s\n" % (len(rows), os.path.basename(elf)))
         for addr, length, name in rows:
-            out.write('"0x%08x,0x%x,%s\\n"\n' % (addr, length, c_escape(name)))
-    sys.stderr.write("map_symbols.py: %d symbols -> %s\n" % (len(rows), argv[2]))
+            out.write("0x%08x\t0x%x\t%s\n" % (addr, length, name))
+    sys.stderr.write("map_symbols.py: %d symbols, %d bytes -> %s\n"
+                     % (len(rows), os.path.getsize(argv[2]), argv[2]))
     return 0
 
 

@@ -38,9 +38,11 @@
 #include <signal.h>
 #include <unistd.h>
 
-// Naming the aborting function requires either an unwind or a symbol map. The Vita has no
-// backtrace(); the link map (see TPV_CRASH_MAP in CMakeLists.txt) is the portable answer.
+// Naming the aborting function requires either an unwind or a symbol table. The Vita has no
+// backtrace(), so the table shipped in the VPK (see crash_symbols.cpp) is the portable answer.
 extern "C" int tpv_crash_map_symbol(uintptr_t address, char* out, unsigned outSize);
+extern "C" int tpv_crash_table_is_valid();
+extern "C" int tpv_crash_table_anchor_pair(uintptr_t* tableAddress, uintptr_t* liveAddress);
 
 // Provided by `-Wl,--wrap=abort`: the linker renames every reference to abort() to __wrap_abort and
 // every definition of it to __real_abort, so the real newlib abort stays reachable here.
@@ -87,19 +89,49 @@ void emit_hex(const char* label, uintptr_t value) {
   emit(line);
 }
 
+// Names are only printed when the table is known to describe this image. A name from a mismatched
+// table is confidently wrong, and one already sent a reader to innocent code, so the failure mode
+// here is deliberately "address only, and say why".
 void emit_symbol(const char* label, uintptr_t address) {
   char name[192];
   name[0] = '\0';
-  if (tpv_crash_map_symbol(address, name, sizeof(name)) != 0) {
+  if (tpv_crash_table_is_valid() != 0 && tpv_crash_map_symbol(address, name, sizeof(name)) != 0) {
     char line[320];
     std::snprintf(line, sizeof(line), "%s=0x%08lx  %s", label, static_cast<unsigned long>(address), name);
     emit(line);
-  } else {
-    char line[160];
-    std::snprintf(line, sizeof(line), "%s=0x%08lx  (not in the link map)", label,
-                  static_cast<unsigned long>(address));
-    emit(line);
+    return;
   }
+  char line[192];
+  if (tpv_crash_map_symbol(address, name, sizeof(name)) != 0) {
+    // There is a match but the table cannot be trusted; show it as a hint, clearly marked.
+    std::snprintf(line, sizeof(line), "%s=0x%08lx  (untrusted table, MAY BE WRONG: %s)", label,
+                  static_cast<unsigned long>(address), name);
+  } else {
+    std::snprintf(line, sizeof(line), "%s=0x%08lx  (not in the symbol table)", label,
+                  static_cast<unsigned long>(address));
+  }
+  emit(line);
+}
+
+// Explains a table that does not describe this build, once, rather than leaving the reader to
+// wonder why every address came back bare.
+void emit_table_state() {
+  uintptr_t recorded = 0;
+  uintptr_t live = 0;
+  if (tpv_crash_table_anchor_pair(&recorded, &live) == 0) {
+    emit("symbols: no table (app0:data/tpvita/crash_symbols.txt, ux0:data/tpvita/crash_symbols.txt)");
+    return;
+  }
+  if (recorded == live) {
+    emit("symbols: table matches this build");
+    return;
+  }
+  char line[224];
+  std::snprintf(line, sizeof(line),
+                "symbols: TABLE IS FROM A DIFFERENT BUILD (table 0x%08lx, live 0x%08lx); names are "
+                "refused, addresses only",
+                static_cast<unsigned long>(recorded), static_cast<unsigned long>(live));
+  emit(line);
 }
 
 char gWhat[96] = "unknown";
@@ -141,6 +173,7 @@ void on_sigabrt(int) {
   char line[192];
   std::snprintf(line, sizeof(line), "last_context=%s", gWhat);
   emit(line);
+  emit_table_state();
   emit_maps();
   emit("If this came from libstdc++ rather than game code, suspect an uncaught exception: a failed");
   emit("std::thread constructor throws std::system_error, which terminates.");
@@ -173,6 +206,7 @@ void __wrap_abort(void) {
   // Anything above 0 is unsafe without frame pointers, so only level 0 is used.
   const uintptr_t caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
   emit_symbol("abort_caller", caller);
+  emit_table_state();
 
   __real_abort();
 }
