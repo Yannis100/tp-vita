@@ -92,8 +92,17 @@ struct GXTexObj_ {
   GXTexWrapMode wrap_s() const noexcept { return static_cast<GXTexWrapMode>(get_bits(mode0, 2, 0)); }
   GXTexWrapMode wrap_t() const noexcept { return static_cast<GXTexWrapMode>(get_bits(mode0, 2, 2)); }
   GXTexFilter min_filter() const noexcept {
+    // Inverse of GXTexture.cpp's GX2HWFiltConv = {0x00,0x04,0x01,0x05,0x02,0x06}, which maps the
+    // GXTexFilter enum (NEAR=0, LINEAR=1, NEAR_MIP_NEAR=2, LIN_MIP_NEAR=3, NEAR_MIP_LIN=4,
+    // LIN_MIP_LIN=5) to the 3 hardware bits stored here. So hw 0x2 must decode to GX_NEAR_MIP_LIN (4)
+    // and hw 0x5 to GX_LIN_MIP_NEAR (3). This table had those two entries swapped, so a texture the
+    // game set to linear minification with the NEAREST mip came back as point minification blending
+    // two mip levels, and vice versa. vita_texture.cpp's gl_min_filter then sends that to
+    // GL_NEAREST_MIPMAP_LINEAR instead of GL_LINEAR_MIPMAP_NEAREST, i.e. nearest sampling where the
+    // game asked for linear: shimmering, aliased textures in motion.
+    // Same defect and same fix as upstream Aurora 26371ce (#293), backported to our pin 3227d76.
     constexpr GXTexFilter kHwToGxFilter[8] = {
-        GX_NEAR, GX_NEAR_MIP_NEAR, GX_LIN_MIP_NEAR, GX_NEAR, GX_LINEAR, GX_NEAR_MIP_LIN, GX_LIN_MIP_LIN, GX_NEAR,
+        GX_NEAR, GX_NEAR_MIP_NEAR, GX_NEAR_MIP_LIN, GX_NEAR, GX_LINEAR, GX_LIN_MIP_NEAR, GX_LIN_MIP_LIN, GX_NEAR,
     };
     return kHwToGxFilter[get_bits(mode0, 3, 5)];
   }

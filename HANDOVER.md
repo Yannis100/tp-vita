@@ -1305,6 +1305,58 @@ better, hardware.
   answered by eye, not by a desktop build.
 - Card saves, pause menu, gameplay content.
 
+### 7.4b Upstream status and the two fixes taken from DuskOnVita (2026-11-10)
+
+**Upstreams are quiet. Verify before re-deriving:**
+
+| Repo | Our pin | Upstream tip | New commits since our pin |
+|---|---|---|---|
+| `TwilitRealm/dusklight` | `77705f8` | `77705f8` | **0** |
+| `encounter/aurora` | `3227d76` | `f77492f` | **24** |
+
+So there is nothing to pull for dusklight, and the 24 aurora commits cannot be taken: they are the
+`aurora::input` migration plus `505b5eb`'s deletion of 22 public `PAD*` functions, which breaks
+dusklight's own sources (see the header comment in `vita/aurora/patches.py`). **DuskOnVita is on the
+exact same dusklight pin** (`77705f8`), so its aurora work is directly comparable rather than
+ahead of us.
+
+**Two correctness fixes taken from DuskOnVita / upstream aurora**, both verified against the source
+rather than trusted:
+
+1. **GX min-filter table had two entries swapped.** `kHwToGxFilter` in `overlay/gfx/texture.hpp` is the
+   inverse of `GX2HWFiltConv = {0x00,0x04,0x01,0x05,0x02,0x06}`, so hardware bits `0x2` must decode to
+   `GX_NEAR_MIP_LIN` (enum 4) and `0x5` to `GX_LIN_MIP_NEAR` (enum 3). Both entries were swapped, so a
+   texture set to linear minification with the nearest mip came back as point minification blending two
+   mips, and `gl_min_filter` sent it to `GL_NEAREST_MIPMAP_LINEAR` instead of
+   `GL_LINEAR_MIPMAP_NEAREST`. **Active in our build** — this is nearest sampling where the game asked
+   for linear, i.e. shimmering textures in motion. Fixed; same defect as upstream `26371ce` (#293).
+2. **Light directions were not normalised.** Our generated fragment shader uses the raw direction in the
+   diffuse terms (`vita_shader.cpp:780` `dot(mv_nrm, ldirL)`, `:771` `dot(ldir, ldirL)`) while the emboss
+   path in the same file *does* call `normalize`. Dusklight stores whatever the game passes to
+   `GXInitLightDir`, which is not guaranteed unit length, so light intensity was scaled by the vector's
+   magnitude. **Active in our build.** Fixed by normalising each light in `gx/shader_info.cpp` before the
+   bulk append (upstream's `0b39c95` cannot be taken verbatim: at our pin the whole light array is
+   appended in one call, so there is no per-light site to wrap).
+
+**One latent fix worth nothing yet:** negative LOD bias was cast float→`u8`, which ARM saturates to 0
+(upstream also fixed this). Patched in `patches.py`, but **`kUseTexLodBias = false` in
+`vita_shader.cpp`, so nothing consumes it and no pixels change.** Recorded as latent so nobody credits it
+with a rendering improvement later.
+
+**Verified:** clean build, `e2e` 87 scenes / 14,242 checks / 0 failed, `texture` 3,780 / 0 failures, and
+the texture suite's negative control still detects an expected mismatch. **Not verified:** no pixels were
+compared on a real scene, so neither fix has been shown to improve the picture — only that it cannot
+regress the host suites.
+
+**What DuskOnVita has that we should ask about, not re-derive.** Their console results are the thing our
+Vita3K-only workflow cannot produce: GX worker time down 6.6 ms in Ordon village, 8.0 in Kakariko,
+13.6 in Hyrule Field (18 → 28 FPS); `C_MTXConcat` and J3D envelope sums through NEON, verified bit-exact
+over **10.6 million** products, 1.5–2.3 ms off Castle Town's main thread. Every one of their fast paths
+ships with a `--vita-fast-*=verify` mode that compares against the original code path, which is the
+pattern §7.8 says we need and Vita3K cannot supply. Their `NathanKneT` offered a two-way exchange on
+issue #1: our synthetic GX scenes as a regression suite for their GXM backend, their hardware bench and
+start-up/save-safety code for us.
+
 ### 7.5 The DuskOnVita audit: what another port already answered (2026-11-02)
 
 [`NathanKneT/DuskOnVita`](https://github.com/NathanKneT/DuskOnVita) is an independent,
