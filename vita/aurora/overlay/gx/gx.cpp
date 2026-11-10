@@ -54,6 +54,13 @@ Vec2<uint32_t> logical_fb_size() noexcept {
   return gfx::is_offscreen() ? gfx::get_render_target_size() : vi::configured_fb_size();
 }
 
+// The EFB the game is drawing into, in pixels. NOT the same as logical_fb_size(): the Vita backend
+// renders the EFB at a fraction of the configured VI size to save fill rate
+// (gfx::vita::kEfbScalePercent, 75%). Using configured_fb_size() here made the scale below cancel to
+// exactly 1.0, so a 608x448 viewport was applied to a 456x336 FBO: the picture was magnified by
+// 1/0.75 and cropped, which cut the bottom off Twilight Princess's title screen (its "PRESS START"
+// and copyright sit below the logo) and left hard-edged gaps where scissored draws ran off the
+// 456x336 target. For an offscreen pass get_render_target_size() IS the real target.
 gfx::Viewport map_logical_viewport(const gfx::Viewport& logicalViewport) noexcept {
   if (g_gxState.viewportPolicy == AURORA_VIEWPORT_NATIVE) {
     return logicalViewport;

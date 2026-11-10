@@ -1,0 +1,125 @@
+# Frame-counted input that LEAVES the memory-card prompt and reaches gameplay.
+#
+# Why this is a sweep and not a single press
+# The frame numbers are exact -- the injector fires on the frame it says it does. The SCREEN at a given
+# frame is not exact: the card prompt is reached through a state machine (dFile_select_c::
+# MemCardCheckMain and its ~28-entry table), and each state runs an animation whose length depends on
+# how many frames the previous states took. Run 1 and run 3 reached "Would you like to create a save
+# file?" at different frames, and run 3's single STICKLEFT landed on a plain message screen that has
+# no cursor at all, so the press was simply lost. A single precisely-timed press is therefore the wrong
+# shape for this screen; a wide sweep is the right one.
+#
+# Why alternating STICKLEFT and A cannot get stuck
+# The prompt is a two-step Yes/No ("create a save file?" then possibly "continue without saving?"),
+# and every Yes/No starts on "No". So:
+#   - if a Yes/No is showing when STICKLEFT fires, the cursor moves No -> Yes;
+#   - if A fires while the cursor is on Yes, the game accepts and moves on;
+#   - if A fires on a plain message screen, it dismisses it and moves on;
+#   - if A fires while the cursor is still on No, the game takes the "No" branch, which leads to the
+#     NEXT Yes/No (or to "continue without saving"), and the sweep repeats there.
+# Every branch either advances or re-enters the sweep, and both terminal branches -- save created, or
+# continue without saving -- lead into the game. That is why the sweep is safe to leave running.
+#
+# STICKLEFT is the analog stick, not the D-pad. See vita/src/input_script.cpp for why that distinction
+# matters and why full deflection is used.
+
+# --- reach the title screen --------------------------------------------------
+60 .
+420 .
+60 A          # absorbed if nothing is listening
+90 .
+60 START      # title screen: PRESS START
+120 .
+
+# --- the card prompt sweep ---------------------------------------------------
+# 18 rounds x (20 stick + 15 gap + 20 A + 15 gap) = 18 x 70 = 1260 frames.
+# Generous on purpose: this only has to overlap the prompt, not land on a specific frame.
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+
+# --- through whatever follows ------------------------------------------------
+120 .
+60 START
+120 .
+60 A
+240 .
+60 START
+240 .
+
+# --- prove input still reaches the game in gameplay --------------------------
+90 STICKUP
+180 .
+90 STICKLEFT
+180 .
+90 A
+180 .

@@ -1,0 +1,33 @@
+# Harness waits for frame_card_sweep.txt.
+#
+# The sweep is ~2,400 frames of app time plus the trailing gameplay probes. Run 1 measured roughly
+# 7 frames per second on llvmpipe under the emulator, so ~2,400 frames is about 340 s; the waits below
+# total 540 s. Deliberately larger than the script: an app that finishes its script early keeps
+# rendering, so the extra screenshots cost nothing and the last ones show the final state.
+#
+# No key is pressed here. The only input the game sees is the frame-counted one.
+
+wait 25
+shot a_boot
+wait 25
+shot b_attract
+wait 25
+shot c_title
+wait 40
+shot d_after_start
+wait 50
+shot e_card_prompt
+wait 50
+shot f_sweep_early
+wait 55
+shot g_sweep_mid
+wait 55
+shot h_sweep_late
+wait 55
+shot i_after_sweep
+wait 55
+shot j_settling
+wait 55
+shot k_late
+wait 55
+shot l_end

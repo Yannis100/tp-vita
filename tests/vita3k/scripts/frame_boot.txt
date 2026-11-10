@@ -1,0 +1,26 @@
+# Frame-counted input for ux0:data/tpvita/input_script.txt (see vita/src/input_script.cpp).
+#
+# Run with:  tests/vita3k/run.sh script tests/vita3k/scripts/waits_only.txt
+# after copying this file into
+#   $TPV_V3K_WORK/home/.local/share/Vita3K/Vita3K/ux0/data/tpvita/input_script.txt
+#
+# Grammar:  <frames> <BUTTON>[,<BUTTON>...]   hold for N frames
+#           <frames> .                        hold nothing for N frames
+#
+# The counts are deliberately generous. They are frames of the app's main loop, which starts at
+# process start and includes the boot screens, so a press can land earlier in game time than the
+# frame number suggests. A run that fails to advance is a finding, not a pass: this driver cannot
+# tell "the game reached the screen I expected" from "the game was still loading".
+
+60 .          # settle; the first frames include PADInit and the boot images
+420 .         # logos and the attract intro
+60 A          # dismiss whatever is showing (no-op if nothing is)
+90 .
+60 START      # title screen: PRESS START
+120 .         # fade to the file-select / memory-card screen
+60 A          # confirm the first file slot
+180 .
+60 A          # any remaining dialog (e.g. "the memory card has no data")
+120 .
+30 UP         # last step: prove a directional press reaches the game too
+180 .

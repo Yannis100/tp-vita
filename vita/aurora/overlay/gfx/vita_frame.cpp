@@ -158,8 +158,12 @@ void end_offscreen() {
 bool has_normal_attachment() noexcept { return false; }
 RenderTargetLayout get_render_target_layout() noexcept { return {.key = sFrame.renderTargetKey}; }
 
+// The size, in pixels, of the surface the next draw lands on. This is the divisor gx's logical->EFB
+// mapping scales by, so the main target must report the EFB it is really rendered into (75%), not the
+// VI size the game thinks it has. Reporting the latter made the scale exactly 1.0 and every full-screen
+// 608x448 viewport was drawn into a 456x336 FBO (magnified and cropped).
 Vec2<uint32_t> get_render_target_size() noexcept {
-  return sOffscreen.active ? Vec2<uint32_t>{sOffscreen.width, sOffscreen.height} : vita::main_target_size();
+  return sOffscreen.active ? Vec2<uint32_t>{sOffscreen.width, sOffscreen.height} : vita::efb_target_size();
 }
 
 void set_viewport(const Viewport& viewport) noexcept {

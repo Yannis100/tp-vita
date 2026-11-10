@@ -22,12 +22,39 @@ script asks for.
 
 Its honest limit is written into its header: the **key sequence is fixed, the timing is not**. Presses
 are wall-clock, so the emulator's variable speed means a press can land on a different frame each run.
-That is a reproducible *sequence*, not a reproducible *run*. A frame-counted injector would need a hook
-inside the app, not an `xdotool` driver.
+That is a reproducible *sequence*, not a reproducible *run*.
 
-What it found the first time it was used: the port stops at a GameCube memory-card prompt ("No Memory
-Card found in Slot A") in a self-perpetuating loop, so the game cannot be played past file select. See
-`HANDOVER.md` §3d.
+## Frame-counted input (preferred, 2026-11-05)
+
+The limit above is now solved inside the app instead of by an `xdotool` driver: put a script at
+`ux0:data/tpvita/input_script.txt` and the game reads it one step per frame. See
+[`vita/src/input_script.cpp`](../../vita/src/input_script.cpp); the format is `<frames> <name>[,<name>...]`
+with `.` for "hold nothing". It is off when the file is absent and it deletes the file after reading it,
+so it can never leak into a manual run.
+
+```sh
+w="$HOME/vita3k-work/home/.local/share/Vita3K/Vita3K/ux0/data/tpvita"
+cp tests/vita3k/scripts/frame_card_sweep.txt "$w/input_script.txt"
+VITA3K_DIR=... TPV_VPK=build/tpv_vita-release.vpk \
+  tests/vita3k/run.sh script tests/vita3k/scripts/waits_sweep.txt sw_
+cat "$w/input_script.log"      # every step with the frame it fired on
+```
+
+Pair it with a `waits_*.txt` harness script, not a key-pressing one: when the app is driven by the
+injector, a host key press is noise that can change the result.
+
+Two things to know before writing a script:
+
+- **`STICKLEFT` is not `LEFT`.** Menus in this game read the analog stick
+  (`STControl::checkLeftTrigger()`), not the D-pad. Pressing the D-pad does nothing on them.
+- **A single press at an exact frame is the wrong shape for a menu.** The frame number is exact, the
+  SCREEN at that frame is not: the card prompt is a state machine whose states run variable-length
+  animations. The scripts here sweep (alternate a cursor move with `A`) so that every branch either
+  advances or re-enters the sweep.
+
+What driving it found: the port used to stop at a GameCube memory-card prompt in a self-perpetuating
+loop. With frame-counted input the prompt is answerable, "Yes" creates a real 32,832-byte GCI, and the
+game reaches the new-game naming screens. See `HANDOVER.md` §3d.2 and §3d.5.
 
 To test the disc diagnosis, put files in `<work>/home/.local/share/Vita3K/Vita3K/ux0/data/tpvita/` (the Vita's `ux0:data/tpvita/`) before `run`.
 Fixtures that are made of your own bytes work: a 1088-byte `GZ2E01.iso` (game ID, then the GameCube magic `C2 33 9F 3D` at offset 0x1C)

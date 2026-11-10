@@ -1,0 +1,294 @@
+# Frame-counted input: card prompt -> name entry -> intro -> GAMEPLAY.
+#
+# WHY THIS FILE WAS REWRITTEN (2026-11-05, HANDOVER §3d.6)
+# The previous version pressed plain `A` through the whole intro stretch. That was WRONG and it was
+# measured wrong: the screenshots from the 8,260-frame run showed the name-entry grid with
+# "L i n k J F" typed into it. A on d_name.cpp's PROC_MOJI_SELECT TYPES THE HIGHLIGHTED LETTER
+# (d_name.cpp:1211 -> menuAbtnSelect -> the letter arm), so a repeating A is a repeating typist, and
+# it never leaves the screen. 40 presses added 5 stray characters and then the alphabet ran out.
+#
+# THE REAL EXIT, from the source rather than from guessing:
+#   - d_name.cpp:395  START (getTrigStart) in PROC_MOJI_SELECT moves the MENU cursor -- the ABC/abc/END
+#                     row -- to END. That is what START is for on this screen.
+#   - d_name.cpp:1211 A (getTrigA) in PROC_MENU_SELECT with the cursor on END calls nameCheck() +
+#                     menuAbtnSelect(), which sets mIsInputEnd = 2 and ends the screen.
+# So the exit is STILL A TWO-PRESS PAIR: **START, then A**. A alone types; START alone only moves the
+# cursor. Only the pair leaves.
+#
+# There are TWO name screens, both through dName_c: the player name (d_file_select.cpp:1747) and then
+# the horse name (d_file_select.cpp:1845). The pair is therefore repeated many times, not fired once.
+#
+# Why repeating is safe everywhere else: on a text box or a cutscene START is inert and A advances, so
+# the pair advances rather than sticking. It cannot get stuck, and unlike a bare A it cannot type.
+#
+# Measured timings this builds on (input_script.log from the sw_/ig_ runs):
+#   frame 480  A absorbed         frame 630  START accepted (title -> card check)
+#   frame ~810 "create a save file?"     frame ~1050 "continue without saving?"
+#   the card sweep below is what answers "Yes" and creates the GCI
+#   the name entry screen was already up by ~frame 1500
+
+# --- boot to the title screen -------------------------------------------------
+60 .
+420 .
+60 A            # absorbed if nothing is listening
+90 .
+60 START        # title screen: PRESS START
+120 .
+
+# --- the card prompt sweep ----------------------------------------------------
+# 18 rounds x 70 frames = 1260. Alternates a cursor move with A so that every branch either advances
+# or re-enters the sweep; it cannot get stuck. See HANDOVER §3d.5. The cursor is the ANALOG STICK:
+# STICKLEFT is not LEFT, and that distinction is why this works.
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+
+# --- name entry and the intro: the START+A pair, repeated ----------------------
+# One round is 20 START + 40 gap + 20 A + 60 gap = 140 frames. The 40-frame gap lets the menu-cursor
+# animation finish, because A is ignored while mSelProc is still an ANM state; the 60-frame tail keeps
+# the beat slow enough that a cutscene still playing swallows a press harmlessly rather than eating the
+# next one. 40 rounds = 5,600 frames, which covers both name screens and the whole intro.
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+
+# --- prove the game is interactive: hold a direction, then confirm -----------
+# Only reached if the name screens were actually left. A frozen screen after this is the finding.
+90 STICKUP
+120 .
+90 STICKRIGHT
+120 .
+90 A
+120 .
+90 STICKDOWN
+120 .
+90 STICKLEFT
+120 .
+90 A
+180 .

@@ -1,0 +1,41 @@
+# Harness waits for frame_name_exit.txt (3,570 frames, 104 steps).
+#
+# Timing basis: the 8,990-frame run measured about 9.5 frames per second on llvmpipe, so 3,570 frames
+# is roughly 376 s of app time plus ~25 s to install and start. The waits below total 470 s.
+#
+# The shots are deliberately dense across the START+A stretch, because the question is WHICH screen is
+# showing: dense sampling is the only way to tell "the pair did not work" from "the pair worked and the
+# intro advanced past my sparse samples".
+#
+# Frame arithmetic, so each shot name can be checked against what it should show:
+#   frames   0- 720  boot, attract, title, START            -> a..d
+#   frames 720-1560  the card sweep                          -> e
+#   frames 1560-3240 the 12 START+A rounds                   -> f, g, h, i, j, k
+#   frames 3240-3570 the held STICKUP probe                  -> l
+#
+# Not a single key is pressed here. The only input the game sees is the frame-counted one.
+
+wait 25
+shot a_boot
+wait 25
+shot b_attract
+wait 30
+shot c_title
+wait 45
+shot d_after_start
+wait 50
+shot e_card_sweep_1
+wait 50
+shot f_card_sweep_2
+wait 45
+shot g_start_a_1
+wait 45
+shot h_start_a_2
+wait 45
+shot i_start_a_3
+wait 45
+shot j_start_a_4
+wait 45
+shot k_start_a_5
+wait 45
+shot l_stickup

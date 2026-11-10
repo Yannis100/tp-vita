@@ -450,9 +450,37 @@ void destroy_target(Target& t) {
   t = {};
 }
 
+// Diagnostic: every distinct (target size, viewport, scissor) is logged once, so a clipped frame can
+// be traced to the numbers that produced it instead of being guessed at from the picture.
+bool log_rects_once(uint32_t tw, uint32_t th, const Viewport& v, const ClipRect& r) {
+  static uint32_t lastTw = UINT32_MAX, lastTh = UINT32_MAX;
+  static float lv[4] = {0, 0, 0, 0}, lr[4] = {0, 0, 0, 0};
+  const float cv[4] = {v.left, v.top, v.width, v.height};
+  const float cr[4] = {static_cast<float>(r.x), static_cast<float>(r.y), static_cast<float>(r.width),
+                       static_cast<float>(r.height)};
+  bool same = tw == lastTw && th == lastTh;
+  for (int i = 0; i < 4 && same; ++i) {
+    same = cv[i] == lv[i] && cr[i] == lr[i];
+  }
+  if (same) {
+    return false;
+  }
+  lastTw = tw;
+  lastTh = th;
+  for (int i = 0; i < 4; ++i) {
+    lv[i] = cv[i];
+    lr[i] = cr[i];
+  }
+  return true;
+}
+
 void apply_viewport(const Target& t) {
   const Viewport& v = t.viewport;
   const auto round = [](float x) { return static_cast<GLint>(std::lround(x)); };
+  if (log_rects_once(t.width, t.height, v, t.scissor)) {
+    Log.warn("rect on {}x{}: viewport ({:.1f},{:.1f}) {:.1f}x{:.1f}  scissor ({},{}) {}x{}", t.width, t.height,
+             v.left, v.top, v.width, v.height, t.scissor.x, t.scissor.y, t.scissor.width, t.scissor.height);
+  }
   glViewport(round(v.left), round(v.top), std::max(round(v.width), 0), std::max(round(v.height), 0));
   glDepthRangef(std::clamp(v.znear, 0.f, 1.f), std::clamp(v.zfar, 0.f, 1.f));
 }
@@ -667,6 +695,10 @@ GLuint sFallbackTexture = 0;
 // target width. Re-uploaded only when the (base, width) pair changes.
 GLuint sFogRangeTexture = 0;
 std::vector<uint8_t> sFogRangeRgba; // contents of sFogRangeTexture, to skip identical uploads
+// Per-draw rebuild buffer for the fog-range LUT. bind_fog_range() runs for EVERY draw and used to
+// construct a fresh std::vector<uint8_t> each time, which is a heap allocation per draw (~440/frame).
+// Same pattern as sScratch: one buffer, cleared and reused, so the steady state does no allocation.
+std::vector<uint8_t> sFogRangeScratch;
 
 void finish_quad_program(QuadProgram& q) {
   if (q.program == 0) {
@@ -752,12 +784,29 @@ void init_gl() {
 // That is a 26% cut in wall time per frame for a 44% cut in fragments, so on this backend the frame cost
 // is not purely fill-bound: the draw-submit and resolve work (11 per frame) is unchanged and dominates
 // more as resolution falls. Emulator figure only; a console frame rate was never measured.
+// The host e2e suite asserts exact pixels: a 1-px line, an 8-px point, a scissor edge, a TEV colour.
+// Rendering those at 75 % and letting llvmpipe's filtering resolve them cannot reproduce the colour
+// the test asks for (a full-intensity line becomes 0.588 of it), so the suite would have to be told a
+// tolerance that also hides real regressions. On the host the scale buys nothing anyway -- it exists to
+// save fill rate on a Cortex-A9 -- so the ratio is 100 % there and 75 % only on the Vita. This is what
+// makes the suite a reference for the device rather than a second, differently-scaled renderer.
+#ifdef __vita__
 constexpr uint32_t kEfbScalePercent = 75;
+#else
+constexpr uint32_t kEfbScalePercent = 100;
+#endif
 
 void ensure_efb() {
   const auto size = main_target_size();
-  const uint32_t width = std::max<uint32_t>(size.x * kEfbScalePercent / 100, 1);
-  const uint32_t height = std::max<uint32_t>(size.y * kEfbScalePercent / 100, 1);
+  const auto scaled = efb_target_size();
+  const uint32_t width = scaled.x;
+  const uint32_t height = scaled.y;
+  // Measured once per target size: this is the number every viewport and scissor is scaled against,
+  // and a wrong value here is indistinguishable from a clipping bug in a screenshot.
+  if (sEfb.fbo == 0 || sEfb.width != width || sEfb.height != height) {
+    Log.warn("EFB target: logical {}x{} -> {}x{} ({}%), present {}x{}", size.x, size.y, width, height,
+             kEfbScalePercent, sPresentWidth, sPresentHeight);
+  }
   if (sEfb.fbo != 0 && sEfb.width == width && sEfb.height == height) {
     return;
   }
@@ -1057,11 +1106,14 @@ void bind_fog_range(const Frame& frame, const gx::DrawData& draw, const Program&
              frame.storage.size());
     return;
   }
-  std::vector<uint8_t> rgba(static_cast<size_t>(width) * 4);
+  // Reuse the buffer instead of constructing a vector per draw: this runs for every draw that has fog
+  // range adjustment enabled (~440 draws/frame), so a per-call allocation is pure waste. resize() does
+  // not shrink capacity, so after the first few draws this never allocates again.
+  sFogRangeScratch.resize(static_cast<size_t>(width) * 4);
   for (uint32_t x = 0; x < width; ++x) {
     float factor;
     std::memcpy(&factor, frame.storage.data() + byteBase + static_cast<size_t>(x) * sizeof(float), sizeof(float));
-    uint8_t* texel = &rgba[static_cast<size_t>(x) * 4];
+    uint8_t* texel = &sFogRangeScratch[static_cast<size_t>(x) * 4];
     gx::vita::fog_range_encode(factor, texel[0], texel[1]);
     texel[2] = 0;
     texel[3] = 255;
@@ -1075,11 +1127,11 @@ void bind_fog_range(const Frame& frame, const gx::DrawData& draw, const Program&
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   }
   // Storage offsets repeat from frame to frame, so (base, width) does not identify the contents: compare them.
-  if (sFogRangeRgba != rgba) {
+  if (sFogRangeRgba != sFogRangeScratch) {
     glBindTexture(GL_TEXTURE_2D, sFogRangeTexture);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(width), 1, 0, GL_RGBA, GL_UNSIGNED_BYTE,
-                 rgba.data());
-    sFogRangeRgba = std::move(rgba);
+                 sFogRangeScratch.data());
+    sFogRangeRgba = sFogRangeScratch;
   }
   bind_texture(kFogRangeUnit, sFogRangeTexture);
   if (p.locFogRangeSize >= 0) {
@@ -1175,6 +1227,18 @@ uint32_t sResolveDrawn = 0;         // copies that reached draw_quad
 uint32_t sResolveNoDest = 0;        // copy requested, destination texture absent
 uint32_t sResolveNoSource = 0;      // copy requested, source target had no size
 std::chrono::steady_clock::time_point sWindowStart = std::chrono::steady_clock::now();
+// Batching survey budget (HANDOVER 7.3c). Two gates were wrong before this one, and both produced a
+// confident answer to the wrong question:
+//   * `sFrameIndex == 2760` -- the driving script ends near frame 2400, so it never fired at all and the
+//     run produced no measurement (an empty log that reads like "nothing to report");
+//   * the first frame with >= 100 draws -- that fired at frame 240, a LOADING frame with 163 draws,
+//     while the scene that matters has 420-440. A threshold low enough to always fire is low enough to
+//     fire on the wrong frame.
+// So: sample up to a few times, only on frames that look like a full scene, and print a line per sample.
+// Draw counts are the load signal here, and they are the same numbers the `window @frame` lines report.
+constexpr size_t kSurveyMinDraws = 350;
+constexpr uint32_t kSurveyMaxSamples = 6;
+uint32_t sBatchingSurveys = 0;
 
 // NOTE (2026-11-02): a glReadPixels-based EFB-copy probe was tried here and REMOVED because it
 // measured nothing. In this context glReadPixels returned all zeros even for the default
@@ -1255,7 +1319,19 @@ void resolve_op(const ResolveOp& r) {
 
 // ---- public entry points ----------------------------------------------------------------------
 
+// The size the game *thinks* it is drawing into: the VI render mode (608x448 for Twilight Princess).
+// Every viewport and scissor the game sets is authored in these units, so this is the divisor that
+// turns them into EFB pixels.
 Vec2<uint32_t> main_target_size() noexcept { return aurora::vi::configured_fb_size(); }
+
+// The EFB actually allocated, in pixels: main_target_size() reduced by kEfbScalePercent. This is what
+// the GL replay binds and what gfx::get_render_target_size() must report for the main target, or the
+// logical->EFB mapping in gx::map_logical_viewport() silently computes a scale of 1.0.
+Vec2<uint32_t> efb_target_size() noexcept {
+  const auto size = aurora::vi::configured_fb_size();
+  return {std::max<uint32_t>(size.x * kEfbScalePercent / 100, 1),
+          std::max<uint32_t>(size.y * kEfbScalePercent / 100, 1)};
+}
 
 void set_shader_dump_dir(const char* dir) noexcept {
   sShaderDumpDir = dir != nullptr ? dir : "";
@@ -1285,6 +1361,14 @@ void replay(Frame& frame) {
   //  * `Log.warn` rather than `Log.info`, because a plain `info` into a pipe is block-buffered and the
   //    test harness SIGKILLs the process, which truncates lines mid-write and looks like a hang.
   const auto windowNow = std::chrono::steady_clock::now();
+  // BATCHING SURVEY (HANDOVER 7.3c). Kept as evidence, not as a plan: it measured that batching is NOT
+  // worth doing here. A 442-draw play-scene frame has 17 pipeline groups and 211 state-identical
+  // (program+texture) runs, which reads like 2x, but only 65 adjacent pairs also share identical uniform
+  // CONTENT, so a legal order-preserving batcher reaches 377 calls -- 1.17x, not 2.6x. Uniforms are per
+  // draw (`uniformRange` plus `immediateData`); `currentPnMtx` is NOT an obstacle because it is baked
+  // per-vertex in vita_vertex.cpp, but the uniform BYTES still differ nearly always. Compare content,
+  // never offsets: the frame arena reuses storage, so 0 of 441 pairs share an offset while 69 share a
+  // blob. Delete this block, do not extend it, unless the merge criterion changes.
   if (sFrameIndex % 120 == 0) {
     const double windowMs = std::chrono::duration<double, std::milli>(windowNow - sWindowStart).count();
     sWindowStart = windowNow;
@@ -1293,6 +1377,142 @@ void replay(Frame& frame) {
              sFrameIndex, windowMs, windowMs / 120.0, 120000.0 / (windowMs > 0 ? windowMs : 1),
              frame.draws.size(), sPrograms.size(), sResolveSeen);
     gx::vita::vertex_cache_report("window");
+    // ONE-SHOT BATCHING SURVEY (HANDOVER 7.3c). Before anyone spends a session on draw batching, answer
+    // the question that decides whether it is possible at all: how many of this frame's draws share a
+    // pipeline AND a blend setup, i.e. could legally be merged into one longer draw if their vertex data
+    // were contiguous? Latched, so it costs one line for the whole run, and triggered by a draw-count
+    // threshold rather than a fixed frame number -- a fixed frame number silently produced nothing when
+    // the driving script ended before it (see the latch comment near sWindowStart).
+    if (sBatchingSurveys < kSurveyMaxSamples && frame.draws.size() >= kSurveyMinDraws) {
+      ++sBatchingSurveys;
+      // The MERGE CRITERION is not "same pipeline". Two draws can only become one glDraw* if they share
+      // the program AND every sampler binding AND one contiguous vertex buffer, because the decoded
+      // vertices are uploaded through a single glVertexAttribPointer set. Reporting only the pipeline
+      // count would overstate what is possible: it dropped textures, which vary per draw.
+      //
+      // Three numbers, in increasing strictness:
+      //   pipelineGroups  - same PipelineConfig only (the optimistic ceiling, NOT achievable)
+      //   stateGroups     - same PipelineConfig AND same texture bind group (the real merge criterion)
+      //   runs            - adjacent-in-order groups: the only ones mergeable WITHOUT reordering draws,
+      //                     which is what an order-preserving batcher could actually do.
+      auto key_of = [](const gx::DrawData& d, const gx::PipelineConfig* c) {
+        uint64_t h = d.pipeline;
+        h = h * 1099511628211ull ^ d.bindGroups.textureBindGroup;
+        h = h * 1099511628211ull ^ static_cast<uint64_t>(std::hash<std::string_view>{}(
+            std::string_view(reinterpret_cast<const char*>(c), sizeof(*c))));
+        return h;
+      };
+      std::unordered_map<uint64_t, uint32_t> pipelineGroups;
+      std::unordered_map<uint64_t, uint32_t> stateGroups;
+      uint32_t runs = 0;
+      uint64_t prevKey = ~0ull;
+      // The strict criterion: identical uniform blob AND identical immediate data (currentPnMtx plus the
+      // per-attribute arrayStart values). Two adjacent draws that also match these are genuinely one draw.
+      uint32_t strictRuns = 0;
+      uint64_t prevStrict = ~0ull;
+      uint32_t uniformShared = 0; // adjacent pairs sharing the same uniformRange offset
+      for (const auto& d : frame.draws) {
+        const gx::PipelineConfig* c = find_pipeline(d.pipeline);
+        if (c == nullptr) {
+          continue;
+        }
+        ++pipelineGroups[static_cast<uint64_t>(d.pipeline)];
+        const uint64_t key = key_of(d, c);
+        ++stateGroups[key];
+        if (key != prevKey) {
+          ++runs; // first draw of a new adjacent group
+          prevKey = key;
+        }
+        uint64_t strict = key;
+        strict = strict * 1099511628211ull ^ d.uniformRange.offset;
+        strict = strict * 1099511628211ull ^ d.uniformRange.size;
+        strict = strict * 1099511628211ull ^
+                 static_cast<uint64_t>(std::hash<std::string_view>{}(std::string_view(
+                     reinterpret_cast<const char*>(&d.immediateData), sizeof(d.immediateData))));
+        if (strict != prevStrict) {
+          ++strictRuns;
+          prevStrict = strict;
+        }
+      }
+      // How much do adjacent draws actually share? Same OFFSET is the wrong test: the frame arena reuses
+      // storage, so two draws with different offsets can hold identical bytes. The question that decides
+      // batching is whether adjacent draws in the same state group carry the SAME UNIFORM CONTENT, because
+      // a merged draw can only have one uniform set. `currentPnMtx` is NOT an obstacle: it is baked into
+      // the decoded vertices (vita_vertex.cpp:427 sets `p.constant`), and the matrices it indexes live in
+      // the uniform array, so two draws differing only in PN index ARE mergeable.
+      auto blob_of = [&frame](const gx::DrawData& d) {
+        const size_t off = d.uniformRange.offset;
+        const size_t len = d.uniformRange.size;
+        if (off > frame.uniforms.size() || len > frame.uniforms.size() - off) {
+          return std::string_view{};
+        }
+        return std::string_view(reinterpret_cast<const char*>(frame.uniforms.data() + off), len);
+      };
+      uint32_t sameBytesAdjacent = 0;
+      uint32_t mergeablePairs = 0;
+      for (size_t i = 1; i < frame.draws.size(); ++i) {
+        const gx::DrawData& a = frame.draws[i - 1];
+        const gx::DrawData& b = frame.draws[i];
+        const gx::PipelineConfig* ca = find_pipeline(a.pipeline);
+        const gx::PipelineConfig* cb = find_pipeline(b.pipeline);
+        if (ca == nullptr || cb == nullptr) {
+          continue;
+        }
+        if (a.uniformRange.offset == b.uniformRange.offset) {
+          ++uniformShared;
+        }
+        const auto ba = blob_of(a);
+        const auto bb = blob_of(b);
+        if (!ba.empty() && ba == bb) {
+          ++sameBytesAdjacent;
+          // Mergeable = same state AND same uniform content AND same fp state.
+          if (key_of(a, ca) == key_of(b, cb)) {
+            ++mergeablePairs;
+          }
+        }
+      }
+      // The number that decides whether a batcher pays is not "how many groups" but "how many CALLS are
+      // saved": a run of 2 saves 1 call, a run of 40 saves 39. Compute the achievable call count by
+      // walking the draws again and merging a run only while state+bytes stay identical, then report the
+      // saving and the longest run, which is what a real batcher would be worth.
+      uint32_t callsIfBatched = 0;
+      uint32_t longestRun = 0;
+      uint32_t runLen = 0;
+      bool havePrev = false;
+      uint64_t prevMerge = ~0ull;
+      std::string_view prevBlob{};
+      for (const auto& d : frame.draws) {
+        const gx::PipelineConfig* c = find_pipeline(d.pipeline);
+        if (c == nullptr) {
+          continue;
+        }
+        const uint64_t k = key_of(d, c);
+        const auto blob = blob_of(d);
+        const bool same = havePrev && k == prevMerge && !blob.empty() && blob == prevBlob;
+        if (same) {
+          ++runLen;
+        } else {
+          ++callsIfBatched;
+          if (runLen > longestRun) {
+            longestRun = runLen;
+          }
+          runLen = 1;
+          havePrev = true;
+          prevMerge = k;
+          prevBlob = blob;
+        }
+      }
+      if (runLen > longestRun) {
+        longestRun = runLen;
+      }
+      const uint32_t pairs = frame.draws.size() > 1 ? static_cast<uint32_t>(frame.draws.size() - 1) : 0;
+      Log.warn("batching survey @frame {}: {} draws -> {} pipelineGroups, {} stateGroups, {} adjacent "
+               "runs (program+textures), {} STRICT runs (offset+immediate); of {} adjacent pairs: {} "
+               "share a uniform OFFSET, {} share uniform BYTES, {} are fully mergeable (same state+bytes); "
+               "batched call count {} (longest run {})",
+               sFrameIndex, frame.draws.size(), pipelineGroups.size(), stateGroups.size(), runs, strictRuns,
+               pairs, uniformShared, sameBytesAdjacent, mergeablePairs, callsIfBatched, longestRun);
+    }
   }
   if (sFrameIndex <= 5) {
     Log.info("frame {}: {} draws, {} programs compiled so far; resolve {} seen / {} drawn / {} no-destination",

@@ -1,0 +1,112 @@
+# Frame-counted input for the SAVE RELOAD path: the card already holds 01-GZ2P-gczelda2.gci.
+#
+# Run this with the GCI left in place. It must NOT delete EUR/, and the injector must not be asked to
+# create a save -- if a save exists, the game offers "Continue" instead, which is the branch that was
+# never exercised before.
+#
+# Same sweep shape as frame_card_sweep.txt, and for the same measured reason: the frame numbers are
+# exact but the SCREEN at a given frame is not, because the card check runs through a state machine
+# whose states run variable-length animations. A sweep that alternates a cursor move with A cannot get
+# stuck: every branch either advances or re-enters the sweep.
+
+60 .
+420 .
+60 A
+90 .
+60 START      # title screen: PRESS START -- with a save present this leads to the file select
+120 .
+
+# --- sweep: move the cursor and confirm, repeatedly, across the whole prompt ---------------
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+
+# --- continue through the file select and into the game -----------------------------------
+120 .
+60 A
+180 .
+60 A
+240 .
+60 START
+240 .
+
+# --- prove input still reaches the game once play starts -----------------------------------
+90 STICKUP
+180 .
+90 STICKLEFT
+180 .
+90 A
+180 .

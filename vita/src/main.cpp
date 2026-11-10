@@ -27,6 +27,7 @@
 #include "boot_screen.hpp"
 #include "crash_record.hpp"
 #include "disc_probe.hpp"
+#include "input_script.hpp"
 
 // dusk/settings.h (pulled in by iso_validate.hpp) expects the dolphin OS constants; the game gets them from its PCH.
 #include <dolphin/os/OSRtc.h>
@@ -274,6 +275,14 @@ extern "C" int main(int argc, char* argv[]) {
     log_environment(log, argc, argv);
     log_crash_symbols(log);
     maybe_selftest_abort(log);
+
+    // Automated input, if ux0:data/tpvita/input_script.txt was supplied. Logged loudly so a run can
+    // never be mistaken for a manual one: the frames are COUNTED, not timed, which is the whole point
+    // (see vita/src/input_script.cpp).
+    tpv::input_script_load();
+    if (tpv::input_script_active()) {
+        log.line("input script: ACTIVE -- this run is driven by ux0:data/tpvita/input_script.txt");
+    }
 
     // Inject --dvd <disc> if a disc image exists and the caller did not already pass one.
     std::string disc;

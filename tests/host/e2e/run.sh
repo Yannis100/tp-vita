@@ -21,7 +21,10 @@ if [ "${TPV_E2E_ASAN:-0}" = 1 ]; then
   export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0}"
 fi
 mkdir -p "$inc"
-for d in GLES2 KHR EGL fmt; do ln -sfn "$VITASDK/arm-vita-eabi/include/$d" "$inc/$d"; done
+# SDL3 belongs here for the same reason as in tests/host/build.sh: the merged tree reaches
+# <SDL3/SDL_events.h> through aurora/event.h (window.hpp -> gx.cpp, GXFrameBuffer.cpp, ...), and it was
+# missing, so the whole pixel suite failed to compile and looked like a missing host dependency.
+for d in GLES2 KHR EGL fmt SDL3; do ln -sfn "$VITASDK/arm-vita-eabi/include/$d" "$inc/$d"; done
 python3 "$root/tools/build_aurora_tree.py" "$aurora/lib" "$root/vita/aurora/overlay" \
   "$root/vita/aurora/patches.py" "$root/build/aurora_lib" >/dev/null
 make -s -f "$here/Makefile" -j"$(nproc)" AURORA_DIR="$aurora" GLINC="$inc" >/dev/null

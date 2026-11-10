@@ -164,3 +164,40 @@ PATCHES += [
      "  std::call_once(s_gameEpochOnce, initialize_game_epoch);\n  if (OSBaseAddress == 0) {",
      "  initialize_game_epoch();\n  if (OSBaseAddress == 0) {"),
 ]
+
+PATCHES += [
+    # create_directories() must create PARENTS. SDL_CreateDirectory is documented as doing so, but
+    # that is a property of each platform implementation, not of the API: the Vita backend is a bare
+    # mkdir(2) (SDL_SYS_CreateDirectory in SDL_sysfsops.c.obj, one sceIoMkdir call and no loop, unlike
+    # SDL_SYS_GetPrefPath in SDL_sysfilesystem.c.obj which does walk components). So on Vita
+    # "ux0:data/App/EUR/Card A" fails with ENOENT while "EUR" is missing.
+    #
+    # That single behaviour is why the GameCube memory card never came up on this port: CARDInit's
+    # "format the folder when it is absent" branch calls this with a two-level path whose parent (the
+    # region directory) has never been created, so no card folder ever appeared, CardGciFolder::open()
+    # left m_error = NOCARD, and every CARDCheck() reported NOCARD.
+    #
+    # The device root is skipped deliberately: "ux0:" is not a creatable directory and the Vita
+    # platform layer cannot even stat it ("Failed to translate path: ux0:"), so asking for it would
+    # turn the call into a failure on its first iteration.
+    ("io.cpp",
+     """    const auto pathString = fs_path_to_string(path);
+    return SDL_CreateDirectory(pathString.c_str());""",
+     """    // Create each prefix bottom-up instead of trusting SDL_CreateDirectory's documented parent
+    // creation: the Vita backend is a bare mkdir and does not implement it (see PATCHES note).
+    // Component-wise iteration (not string splitting) keeps "ux0:" and "."/".." handling correct.
+    std::filesystem::path prefix;
+    for (const auto& component : path) {
+      prefix /= component;
+      const auto prefixString = fs_path_to_string(prefix);
+      if (prefixString.empty() || prefixString.back() == ':') {
+        continue; // device root: not creatable, and not stat-able on Vita
+      }
+      // SDL_CreateDirectory succeeds when the leaf already exists as a directory, so no separate
+      // exists() probe (a TOCTOU race, and an extra device round-trip on hardware).
+      if (!SDL_CreateDirectory(prefixString.c_str())) {
+        return false;
+      }
+    }
+    return true;"""),
+]
