@@ -166,6 +166,74 @@ PATCHES += [
 ]
 
 PATCHES += [
+    # Normalize each light's direction before it reaches the shader. Dusklight stores whatever the game
+    # passes to GXInitLightDir, which is not guaranteed to be unit length, and our generated fragment
+    # shader uses it RAW in the directional-light terms:
+    #   vita_shader.cpp:780  attn = ... max(0.0, dot(mv_nrm, ldirL)) ...
+    #   vita_shader.cpp:771  float cosine = max(0.0, dot(ldir, ldirL));
+    # Note the contrast in the same file: the emboss path DOES normalize (line 982,
+    # "normalize(uVS[...].xyz - mv_pos)"). So a non-unit light dir scaled the diffuse term, i.e. the
+    # light was brighter or dimmer than the game asked for, with no crash and no log line.
+    #
+    # This is the same fix as upstream Aurora 0b39c95 ("Normalize light dir"), which cannot be taken
+    # verbatim: at our pin 3227d76 the whole light array is appended in one bulk call, so there is no
+    # per-light site to wrap. Normalizing a copy here is equivalent and keeps the bulk append.
+    ("gx/shader_info.cpp",
+     """    static_assert(sizeof(g_gxState.lights) == 80 * GX::MaxLights);
+    buf.append(g_gxState.lights);""",
+     """    static_assert(sizeof(g_gxState.lights) == 80 * GX::MaxLights);
+    // PORT: normalize each light direction (upstream Aurora 0b39c95). The shader uses the direction
+    // raw in its diffuse terms, so a non-unit vector scaled the lighting. Zero-length and non-finite
+    // directions collapse to zero rather than producing NaNs, matching upstream.
+    {
+      auto lights = g_gxState.lights;
+      for (auto& light : lights) {
+        const double x = light.dir[0];
+        const double y = light.dir[1];
+        const double z = light.dir[2];
+        const double len = std::sqrt(x * x + y * y + z * z);
+        if (!std::isfinite(len)) {
+          light.dir = {0.f, 0.f, 0.f};
+        } else if (len > 0.0) {
+          light.dir = {static_cast<float>(x / len), static_cast<float>(y / len), static_cast<float>(z / len)};
+        }
+      }
+      buf.append(lights.data(), sizeof(lights));
+    }"""),
+]
+
+PATCHES += [
+    # A negative LOD bias was cast from float straight to u8. ARM saturates that to 0, so every
+    # negative bias became "no bias" while the sign-correct value is what the game asked for. The
+    # write side lives in upstream GXTexture.cpp (we do not overlay that file), so it is patched
+    # here; the read side in overlay/gfx/texture.hpp already widens through int8_t.
+    #
+    # LATENT, NOT ACTIVE: overlay/gx/vita_shader.cpp has kUseTexLodBias = false, so nothing consumes
+    # lod_bias() today and this changes no pixels. It is fixed now because it is two tokens and the
+    # defect would appear the moment anyone enables that flag, with no clue why negative biases
+    # vanished. Same defect and same fix as upstream Aurora 26371ce (#293).
+    #
+    # Two call sites carry the identical broken line, and build_aurora_tree.py requires each patch
+    # text to match exactly once, so each is anchored by the line AFTER it, which differs:
+    # GXInitTexObjLOD continues with the mag-filter SET_REG_FIELD and then masks mode0, while
+    # GXInitTexObjLODBias ends at the closing brace.
+    ("dolphin/gx/GXTexture.cpp",
+     """  const auto lbias = static_cast<u8>(32.0f * clampedBias);
+  SET_REG_FIELD(0, obj->mode0, 8, 9, lbias);
+  SET_REG_FIELD(0, obj->mode0, 1, 4, magFilt == GX_LINEAR ? 1 : 0);""",
+     """  const auto lbias = static_cast<u8>(static_cast<int>(32.0f * clampedBias));
+  SET_REG_FIELD(0, obj->mode0, 8, 9, lbias);
+  SET_REG_FIELD(0, obj->mode0, 1, 4, magFilt == GX_LINEAR ? 1 : 0);"""),
+    ("dolphin/gx/GXTexture.cpp",
+     """  const auto lbias = static_cast<u8>(32.0f * clampedBias);
+  SET_REG_FIELD(0, obj->mode0, 8, 9, lbias);
+}""",
+     """  const auto lbias = static_cast<u8>(static_cast<int>(32.0f * clampedBias));
+  SET_REG_FIELD(0, obj->mode0, 8, 9, lbias);
+}"""),
+]
+
+PATCHES += [
     # create_directories() must create PARENTS. SDL_CreateDirectory is documented as doing so, but
     # that is a property of each platform implementation, not of the API: the Vita backend is a bare
     # mkdir(2) (SDL_SYS_CreateDirectory in SDL_sysfsops.c.obj, one sceIoMkdir call and no loop, unlike
