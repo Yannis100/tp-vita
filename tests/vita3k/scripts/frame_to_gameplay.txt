@@ -1,0 +1,45 @@
+# Frame-counted input that drives title -> card prompt -> GAMEPLAY.
+#
+# Copy to $TPV_V3K_WORK/home/.local/share/Vita3K/Vita3K/ux0/data/tpvita/input_script.txt
+# and run:  tests/vita3k/run.sh script tests/vita3k/scripts/waits_gameplay.txt <prefix>
+#
+# Frame numbers below are the ones the injector actually reported in run 1 (see input_script.log),
+# not guesses:
+#   0 title logos | 480 first A (absorbed) | 630 START accepted
+#   810 A -> "Would you like to create a save file ... in Slot A?"  [No highlighted]
+#  1050 A -> "There is no save file ..." then "Continue without saving?" [No highlighted]
+#
+# THE FINDING FROM RUN 1, WHICH COST TWO RUNS
+# Both prompts highlight "No", and pressing LEFT did nothing. The reason is not that the prompts
+# default to No and not that the D-pad is unmapped: Dusklight's menus never read the D-pad. They read
+# the ANALOG STICK through STControl::checkLeftTrigger(), which needs a nonzero stick value and derives
+# the direction from the stick angle. The injector originally set only PADStatus::button, so stick
+# value stayed 0 and no cursor could ever move. A confirmed "No" on both prompts, the game re-checked
+# the card, found nothing, and looped.
+#
+# Hence STICKLEFT here. It is a different input from LEFT, on purpose (see vita/src/input_script.cpp).
+# LEFT is still included alongside it: harmless for menus that do read the D-pad, and it makes the
+# intent obvious to a reader.
+
+60 .            # settle; PADInit and the boot images
+420 .           # logos and the attract intro
+60 A            # dismiss whatever is showing (absorbed if nothing is)
+90 .
+60 START        # title screen: PRESS START
+120 .           # fade to the card check
+60 A            # "Would you like to create a save file?" -- A answers NO, on purpose
+180 .           # game re-checks the card, reports no save file, offers "Continue without saving?"
+30 STICKLEFT    # move the cursor from No to Yes (the analog stick, the only thing menus read)
+30 .
+30 A            # CONFIRM "Yes" -- the press run 1 could never make
+240 .           # card format + file creation
+60 A            # any confirmation after the file is made
+180 .
+60 START        # skip any remaining intro / preference screens
+180 .
+60 A            # confirm a menu entry
+300 .           # loading
+90 STICKUP      # prove a directional press reaches gameplay (stick, as the game reads it)
+240 .
+90 STICKLEFT
+240 .

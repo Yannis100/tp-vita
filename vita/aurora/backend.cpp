@@ -29,6 +29,10 @@
 
 #include "imgui_vita.hpp"
 
+// Frame-counted input injection for automated runs (off unless ux0:data/tpvita/input_script.txt
+// exists). Deliberately a port-owned file: it must not touch dusklight, so it lives in vita/src.
+#include "../src/input_script.hpp"
+
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -57,6 +61,33 @@ constexpr int VitaRamThreshold = 24 * 1024 * 1024;
 
 const char* VitaUserPath = "ux0:data/tpvita/";
 
+// The strings in AuroraConfig are owned by the *caller* only until aurora_initialize returns.
+// Upstream (extern/aurora/lib/aurora.cpp) copies all four with strdup(); this backend did not, and
+// that was the memory-card blocker (HANDOVER §3d): dusklight builds them from std::string
+// temporaries in game_main(), the block that owns them ends, and the freed buffers are reused.
+// Measured consequence: g_config.userPath ended up holding "ux0:data/tpvita/GZ2P01.iso" (the DISC
+// image path, 28 bytes -- exactly the size of the freed ConfigPath buffer it was allocated into),
+// so CARDInit resolved the card folder as "ux0:data/tpvita/GZ2P01.iso/EUR/Card A". Creating a
+// directory under a regular file fails with ENOENT, CardGciFolder::open() left m_error = NOCARD,
+// CARDCheck() reported NOCARD, and dFile_select_c::MemCardStatCheck looped on the "No Memory Card
+// found in Slot A" prompt forever. Copy the strings so the lifetime matches upstream.
+constexpr size_t kPathCopyMax = 512;
+
+char* copy_string(const char* source, char* storage) {
+  if (source == nullptr) {
+    return nullptr;
+  }
+  const size_t length = std::strlen(source);
+  if (length + 1 > kPathCopyMax) {
+    // Truncating a path silently would produce a *different* directory (and a card that appears
+    // to vanish). Refuse instead, and say so: every path here is short.
+    Log.warn("path is {} bytes, over the {} byte copy limit: refusing", length, kPathCopyMax);
+    return nullptr;
+  }
+  std::memcpy(storage, source, length + 1);
+  return storage;
+}
+
 AuroraInfo sInfo;
 AuroraStats sStats;
 float sFps = 0.f;
@@ -79,6 +110,16 @@ AuroraWindowSize screen_size() {
 
 AuroraInfo initialize(int, char**, const AuroraConfig& config) {
   g_config = config;
+  // Own copies, so the caller's temporaries may die (see copy_string above). Static storage: these
+  // live for the life of the process, which is what upstream's strdup achieves with a leak.
+  static char sUserPath[kPathCopyMax];
+  static char sCachePath[kPathCopyMax];
+  static char sResourcesPath[kPathCopyMax];
+  static char sAppName[kPathCopyMax];
+  g_config.userPath = copy_string(g_config.userPath, sUserPath);
+  g_config.cachePath = copy_string(g_config.cachePath, sCachePath);
+  g_config.resourcesPath = copy_string(g_config.resourcesPath, sResourcesPath);
+  g_config.appName = copy_string(g_config.appName, sAppName);
   if (g_config.userPath == nullptr) {
     g_config.userPath = VitaUserPath;
   }
@@ -91,6 +132,11 @@ AuroraInfo initialize(int, char**, const AuroraConfig& config) {
   if (g_config.appName == nullptr) {
     g_config.appName = "tpvita";
   }
+  // Logged because this value decides where the memory card, the shader cache and the config live.
+  // When it is wrong the symptom is nowhere near the cause (the card prompt loop of HANDOVER §3d),
+  // so make the resolved value visible on every boot.
+  Log.info("paths: user '{}', cache '{}', resources '{}', app '{}'", g_config.userPath,
+           g_config.cachePath, g_config.resourcesPath, g_config.appName);
   g_config.msaa = 1;
   if (g_config.mem1Size > VitaMem1Size) {
     Log.info("clamping MEM1 {} MiB -> {} MiB", g_config.mem1Size >> 20, VitaMem1Size >> 20);
@@ -229,6 +275,11 @@ const AuroraEvent* aurora_update() {
   static AuroraEvent sNone;
   std::memset(&sNone, 0, sizeof(sNone));
   sNone.type = AURORA_NONE;
+  // Advance the frame-counted input script, if one was supplied. This is the right hook because
+  // aurora_update() runs once per main-loop iteration and BEFORE the game reads the pad, so the
+  // injected state is already visible to this frame's PADRead. Doing it here also means dusklight
+  // needs no edits at all: the script drives the real game through its real input path.
+  tpv::input_script_frame();
   aurora::gx::update();
   return &sNone;
 }

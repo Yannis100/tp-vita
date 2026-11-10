@@ -277,6 +277,8 @@ set(TPV_VITA_SOURCES
   # Crash reporting: --wrap reaches every abort(); crash_symbols.cpp resolves the address.
   ${TPV_DIR}/vita/src/crash_record.cpp
   ${TPV_DIR}/vita/src/crash_symbols.cpp
+  # Frame-counted input injection for automated runs (inert without ux0:data/tpvita/input_script.txt).
+  ${TPV_DIR}/vita/src/input_script.cpp
   ${TPV_DIR}/vita/aurora/backend.cpp
   ${TPV_DIR}/vita/aurora/aurora_stubs.cpp
   ${TPV_DIR}/vita/aurora/imgui_vita.cpp

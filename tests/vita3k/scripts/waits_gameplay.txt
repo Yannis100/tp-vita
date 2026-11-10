@@ -1,0 +1,28 @@
+# Harness waits for frame_to_gameplay.txt (2,880 frame-counted steps).
+#
+# Timing basis, measured not guessed: run 1 completed 1,440 frames in about 200 s on llvmpipe under
+# the emulator, i.e. roughly 7 frames per second. 2,880 frames is therefore about 410 s of app time,
+# plus the ~20 s the harness spends installing and starting the VPK. The waits below total 460 s.
+#
+# Not a single key is pressed here on purpose: the only input the game sees is the frame-counted one.
+
+wait 25
+shot a_boot
+wait 25
+shot b_attract
+wait 25
+shot c_title
+wait 40
+shot d_after_start
+wait 55
+shot e_memcard_prompt
+wait 40
+shot f_after_yes
+wait 60
+shot g_after_confirm
+wait 60
+shot h_mid
+wait 70
+shot i_late
+wait 60
+shot j_end

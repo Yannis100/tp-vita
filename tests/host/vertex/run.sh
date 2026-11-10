@@ -8,11 +8,16 @@ aurora=${AURORA_DIR:-$root/../dusklight/extern/aurora}
 python3 "$root/tools/build_aurora_tree.py" "$aurora/lib" \
   "$root/vita/aurora/overlay" "$root/vita/aurora/patches.py" "$root/build/aurora_lib" >/dev/null
 out=${TPV_TEST_OUT:-/tmp/tpv/hostgl/test_vertex}
+# logging.cpp is REQUIRED, not optional: vita_vertex.cpp reports through aurora::Module, which is a
+# thin wrapper over aurora::log_internal(). Without it the link fails with
+#   undefined reference to `aurora::log_internal(AuroraLogLevel, char const*, char const*, unsigned int)'
+# and the suite silently stops being runnable, which is how it was found (2026-11-05).
+common="$here/test_vertex.cpp $here/stubs.cpp $root/build/aurora_lib/gx/vita_vertex.cpp $root/build/aurora_lib/logging.cpp"
 if [ "$1" = bench ]; then
-  CXXFLAGS="-O2 -Wall -Wno-unused-function" "$here/../build.sh" "$out" "$here/test_vertex.cpp" "$root/build/aurora_lib/gx/vita_vertex.cpp"
+  CXXFLAGS="-O2 -Wall -Wno-unused-function" "$here/../build.sh" "$out" $common
   exec "$out" bench
 fi
 CXXFLAGS="-O1 -Wall -Wno-unused-function -fsanitize=address,undefined -fno-sanitize-recover=undefined" \
   LDFLAGS="-fsanitize=address,undefined" \
-  "$here/../build.sh" "$out" "$here/test_vertex.cpp" "$root/build/aurora_lib/gx/vita_vertex.cpp"
+  "$here/../build.sh" "$out" $common
 exec "$out"

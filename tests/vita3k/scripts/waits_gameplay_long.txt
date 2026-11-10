@@ -1,0 +1,58 @@
+# Harness waits for frame_into_gameplay.txt (8,990 frames, 250 steps).
+#
+# Timing basis: the sw_ run rendered 3,780 frames in roughly 400 s on llvmpipe under the emulator,
+# i.e. about 9.5 frames per second. 8,990 frames is therefore roughly 946 s of app time, plus the
+# ~25 s the harness spends installing and starting the VPK. The waits below total 1,175 s, so the last
+# shot lands after the script has finished and released the pad.
+#
+# Note that game time is NOT frame-locked: dusk::game_clock samples the native clock, so the game
+# advances at wall-clock rate while only ~9.5 frames/s are drawn. That is why the frame budget is
+# generous -- the intro is minutes of real time regardless of how fast the emulator draws.
+#
+# The shot names say what each window is EXPECTED to contain, from the frame arithmetic, not from hope:
+#   a_boot        blank (a short run's first frames always are; see HANDOVER §8 trap 4)
+#   b_attract     the attract loop
+#   c_title       the title screen
+#   d_after_start after START, the card check
+#   e_card_prompt the "no memory card" / "create a save file?" prompt
+#   f_card_sweep  mid-sweep, i.e. the sweep answering it
+#   g_name_1      the FIRST name screen (player name)
+#   h_name_2      the SECOND name screen (horse name)
+#   i..n_intro    the new-game intro
+#   o_gameplay    the STICKUP/STICKRIGHT probes: only reached if both name screens were left
+#   p_end         the final state
+#
+# Not a single key is pressed here. The only input the game sees is the frame-counted one.
+
+wait 25
+shot a_boot
+wait 25
+shot b_attract
+wait 30
+shot c_title
+wait 45
+shot d_after_start
+wait 55
+shot e_card_prompt
+wait 60
+shot f_card_sweep
+wait 75
+shot g_name_1
+wait 85
+shot h_name_2
+wait 90
+shot i_intro_1
+wait 100
+shot j_intro_2
+wait 110
+shot k_intro_3
+wait 110
+shot l_intro_4
+wait 110
+shot m_gameplay_1
+wait 110
+shot n_gameplay_2
+wait 110
+shot o_gameplay_3
+wait 90
+shot p_end

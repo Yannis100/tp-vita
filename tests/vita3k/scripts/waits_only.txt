@@ -1,0 +1,22 @@
+# Harness script for a frame-counted run: no key presses at all, only waits and screenshots.
+#
+# Why: tests/vita3k/run.sh script normally focuses the window and types with xdotool, whose timing is
+# wall-clock. When the app is driven by ux0:data/tpvita/input_script.txt instead, any host key press
+# is noise that can change the result. This script produces the same screenshots without touching
+# the keyboard, so the only input the game sees is the frame-counted one.
+#
+# Screenshots land in $TPV_V3K_WORK/out/<prefix>N_<name>.png in the order below.
+wait 25
+shot a_boot
+wait 25
+shot b_attract
+wait 25
+shot c_title
+wait 25
+shot d_after_start
+wait 30
+shot e_file_select
+wait 30
+shot f_after_confirm
+wait 30
+shot g_late

@@ -59,8 +59,9 @@ Consequences:
 
 ## 2. Current status: honestly
 
-**The game boots, reaches its main loop, and renders.** That is a large milestone and it is
-verified from emulator artefacts, not assumed.
+**The game boots, reaches its main loop, renders, and on a driven run reaches real gameplay.**
+That last part is new (2026-11-09) and is the strongest result in this document: see the bullet below and
+§3d.6.
 
 Verified as of this handover:
 
@@ -71,6 +72,12 @@ Verified as of this handover:
 - Vita3K renders real frames: after the §7.3 texture fix, screenshots carry 78,360–87,870 distinct
   colours each (before it: 1,614–3,979, i.e. untextured), with content
   bounding box `(271,128)–(1008,671)` on a 1280×800 canvas.
+- **A driven run reaches actual gameplay and the picture was validated by eye** (2026-11-09, PAL disc
+  `GZ2P01.iso`). Run `pr_`, frames 2,150–4,800, 16 valid screenshots: Link's lit, textured face with a
+  working dialogue box; two characters with the HUD; and an outdoor scene with distance fog, terrain, a
+  riverbank, foliage and a mounted rider. Consecutive frames differ by 34–39% of pixels, so it is a live
+  scene, and draw counts hold at 215–376/frame. This is the artefact §11 previously wanted a desktop
+  reference render for; the user judged it from the screenshots instead.
 - Zero failing allocations, zero crash markers, zero `GL error uploading` warnings during a clean
   run, and `JKRExpHeap::create` succeeds repeatedly with ~21.9 MiB free in `gameHeap`.
 - The guest arena is now **64 MiB** (`67092240` bytes). Until this revision the retail GameCube
@@ -87,10 +94,17 @@ Verified as of this handover:
   which recorded `abort_caller=0x81009bab main`, verified against `nm` to be inside `main`.
 
 **What that does not prove.** Vita3K is an emulator; nothing here has run on real hardware.
-The screenshots show a rendered 3D scene, but nobody has confirmed it is the *correct* scene
-(no reference comparison against a real GameCube or the desktop build has been done). Audio is
-disabled (`DUSK_AUDIO_DISABLED`). Card saves, pause menu, and most of the game's content have
+Audio is disabled (`DUSK_AUDIO_DISABLED`). Card saves, pause menu, and most of the game's content have
 never been exercised. Treat "boots and renders" as the accurate claim, not "playable".
+
+**Scene correctness now has two independent checks.** (1) 2026-11-05: against a reference frame of the
+retail title screen supplied by the user, after the §3d.3 render-scale fix the captured title screen
+matches — logo at the correct size and position, the wolf on the ridge, the full composition — where
+before it was magnified and cut off below the logo. That is a real check of the 2D/EFB path (scale,
+aspect, letterbox). (2) 2026-11-09: the **in-game** screenshots above were judged correct by the user by
+eye, which is what §7.4's desktop reference render was for. Neither comparison is a per-pixel diff, so
+treat them as "the picture looks right", not "every 3D effect is proven" — most of the game's content is
+still unseen.
 
 ---
 
@@ -298,13 +312,416 @@ What is established, and what is not:
   directory by hand does not help; `CARDMount` always returns `CARD_RESULT_READY`
   ([`card.cpp:664`](../dusklight/extern/aurora/lib/dolphin/card.cpp:664)), so "no card" is decided by
   `CARDCheck` → `card->getError()`, not by the mount.
-- **Not established:** *why* the GCI-folder channel reports `NOCARD` on this port. The next step is to
-  print `mCardState`/`getError()` on the card thread and read `CardGciFolder::open`/`probeCardFile`,
-  which should take minutes now that the question is narrow.
+- **Not established:** *why* the GCI-folder channel reports `NOCARD` on this port — **answered in
+  §3d.1 below.**
 
-This also outranks the intermittent `write_fatal`: **the port cannot currently be played at all past
-file select**, which is a hard blocker for every other test. It was invisible for the whole project
-because nothing had ever driven the game with input.
+### 3d.1 The cause was a dangling path, not card logic (2026-11-05)
+
+The plan above ("print `mCardState`") was right about the location and wrong about the mechanism. The
+card code is fine; it was being handed a corrupted base path.
+
+**Root cause.** `AuroraConfig`'s path strings are borrowed pointers that upstream copies with `strdup()`
+([`extern/aurora/lib/aurora.cpp`](../dusklight/extern/aurora/lib/aurora.cpp)). The Vita backend
+([`vita/aurora/backend.cpp`](vita/aurora/backend.cpp)) stored them raw. Dusklight builds them from
+`std::string` temporaries inside a block of `game_main()`
+([`m_Do_main.cpp`](../dusklight/src/m_Do/m_Do_main.cpp)); the block ends and the buffers are freed and
+reused. `g_config.userPath` was read later, by `CARDInit()`, and had by then become the **disc image
+path** (`ux0:data/tpvita/GZ2P01.iso`), so the card folder resolved to
+`ux0:data/tpvita/GZ2P01.iso/EUR/Card A`. Creating a directory under a *regular file* fails with ENOENT,
+`CardGciFolder::open()` left `m_error = NOCARD`, `CARDCheck()` reported `NOCARD`, and
+`dFile_select_c::MemCardStatCheck` looped forever — the §3d symptom, arriving from a place nowhere near
+the card code.
+
+The evidence is the emulator log, not an inference: before the fix it read
+`Missing file at .../tpvita/GZ2P01.iso/EUR/Card A`; after it, `.../TwilitRealm/Dusklight/EUR/Card A`.
+
+**Fix.** `copy_string()` in [`vita/aurora/backend.cpp`](vita/aurora/backend.cpp) takes owned copies into
+static storage (upstream's lifetime, without leaking), refuses a path over 512 bytes rather than
+truncating it silently into a *different* directory, and logs the resolved paths on every boot:
+
+```
+paths: user 'ux0:/data/TwilitRealm/Dusklight/', cache '...', resources 'app0:/', app 'Dusklight'
+```
+
+**A second, independent cause, also found by measurement.** Even with the path fixed, the card directory
+was still never created: `_sceIoMkdir` on `.../Dusklight/EUR/Card A` returned `0x80010002` (ENOENT)
+because the parent `EUR` did not exist, and creating `EUR` from the host made the path valid.
+`aurora::io::create_directories()` calls `SDL_CreateDirectory()`, which is *documented* as creating
+missing parents — but that is a property of each platform implementation. Disassembling the shipped
+library settles it: `SDL_SYS_CreateDirectory` in `SDL_sysfsops.c.obj` is a bare `mkdir` (compare
+`SDL_SYS_GetPrefPath` in `SDL_sysfilesystem.c.obj`, which does walk and create each component). On the
+Vita the header's promise is simply not kept.
+
+`create_directories()` now builds the path component by component itself, and **skips a component ending
+in `:`** — `SDL_CreateDirectory("ux0:")` fails, and on a Vita it cannot even be stat'd (`Failed to
+translate path: ux0:` in the emulator log), which turned the whole call into a failure on its first
+iteration. That device-root skip is required, not an optimisation.
+
+**Verified in Vita3K (2026-11-05).** With `ux0:data/TwilitRealm/Dusklight/EUR` deleted first, a
+completed run leaves:
+
+```
+TwilitRealm/Dusklight/EUR/Card A     (directory, created by the game)
+```
+
+so `CARDInit` now formats the GCI folder and the card channel comes up. This is the first time the port
+has had a live memory card. **Saves are still untested** — a written save, a re-read and a reload have
+not been exercised, and nothing here is verified on hardware.
+
+**How this was nearly shipped broken, and the rule it restates.** The first attempt edited
+`dusklight/extern/aurora/lib/io.cpp` directly. That file is upstream source: the build compiles
+`tp-vita/build/aurora_lib`, which `tools/build_aurora_tree.py` assembles from upstream + overlay +
+`patches.py` on every configure. The edit therefore compiled cleanly, produced a VPK, and changed
+nothing — two emulator runs were spent concluding "the fix did not work" when it had never been
+included. The change now lives in `vita/aurora/patches.py` as an exact-once anchor against upstream
+`io.cpp`, and the upstream file is restored. This is the rule already written down in §8 ("never edit
+`build/aurora_lib`"); the missing half is that editing *upstream* `extern/aurora/lib` is equally
+ineffective, and only `overlay/` or `patches.py` reach the build.
+
+### 3d.4 What the 2026-11-05 changes were tested against, and what was not
+
+Run (`./tests/host/<suite>/run.sh`):
+
+| Suite | Result |
+|---|---|
+| `crash` | PASS (7 checks) |
+| `texture` | 3,780 checks, 0 failures (the one MISMATCH printed is the deliberate negative control) |
+| `disc` | `test_probe` 14/0, `test_diag` 10,686/0 |
+| `vertex` | **71,063 checks, 0 failures** (after the fix below) |
+| `e2e` | **87 scenes, 14,242 pixel checks, 0 scenes failed** (after the fix below) |
+
+Both suites were **broken before this session and are fixed now**, and both breaks were the kind that
+silently removes a test rather than failing loudly:
+
+- `vertex` could not link: `undefined reference to aurora::log_internal`, and then
+  `aurora::g_config`. The decoder reports through `aurora::Module`, which needs `logging.cpp` plus a
+  `g_config` definition; neither was on the link line. Fixed by adding `logging.cpp` and
+  [`tests/host/vertex/stubs.cpp`](tests/host/vertex/stubs.cpp) to `run.sh`.
+- `e2e` could not compile: `SDL3/SDL_events.h: No such file or directory`. The header **was** available
+  the whole time — in `$VITASDK/arm-vita-eabi/include/SDL3` — but the header-symlink list in
+  `tests/host/build.sh` and `tests/host/e2e/run.sh` named only `GLES2 KHR EGL fmt`, and the merged tree
+  reaches `SDL3/SDL_events.h` through `aurora/event.h` (`window.hpp` → `gx.cpp`, `GXFrameBuffer.cpp`).
+  Adding `SDL3` to both lists fixed it. The earlier reading of this, "this machine has no SDL3", was
+  wrong and is recorded here because it was written down as fact.
+
+**The e2e suite had in fact been red since the 75 % render scale was introduced (§7.7).** Measured, not
+assumed: with this session's four viewport/scale files stashed, `e2e` reports **84 of 87 scenes
+failed**; with them applied, 30; after the scale fix below, **0**. Nothing had been run in between, so
+the suite which exists to catch exactly this class of error was not consulted when the error was added.
+
+The remaining 30 were one cause: the suite asserts exact pixels (a 1-px line, an 8-px point, a scissor
+edge, a TEV colour), and at 75 % those are resolved by filtering — a full-intensity line came back as
+`(15,210,15)` instead of `(0,255,0)`, i.e. ~0.588 of it. Rendering the host suite at 100 % and keeping
+75 % on the Vita removes the mismatch at its source instead of loosening the tolerance, which would have
+hidden real regressions too. `kEfbScalePercent` is therefore `75` on `__vita__` and `100` elsewhere;
+the device log still reads `EFB target: logical 608x448 -> 456x336 (75%)` with viewport `456.0x336.0`,
+so the scaled path is the one hardware runs and the unscaled one is the reference it is checked against.
+
+Not verified at all, on any target: a save actually written and reloaded; audio; performance; anything
+on real hardware.
+
+### 3d.2 The memory-card prompt no longer blocks play (2026-11-05)
+
+`shot_5` of the scripted run is an in-game scene (a lit stone bridge over a dark cavern): the game got
+past file select and into gameplay while the card channel still reported `NOCARD`. So the earlier
+ranking — "the port cannot be played past file select at all" — was a consequence of the scale bug in
+§3d.3, which drew the dialog far off-screen, not of the card state.
+
+**Correction (2026-11-05, §3d.6): the sentence above overstates what that shot showed.** "A lit stone
+bridge over a dark cavern" was a reading of a picture nobody had compared to anything, on a port whose
+own §7.4 says no reference render exists. What is defensible from the artefacts is narrower: the card
+prompt was answered, a GCI was written, and the game advanced **into the save-creation sequence** —
+which is where it then stayed, on the name-entry grid, for eleven consecutive screenshots (§3d.6).
+Gameplay proper has still never been observed. The lesson is §3d.6's: a filename and a remembered
+description are expectations, and only the pixels count.
+
+**Saves work (write path, 2026-11-05, later the same day).** A frame-counted run (§3d.5) answered "Yes"
+to "Would you like to create a save file ... in Slot A?" and the game wrote a real GCI:
+
+```
+TwilitRealm/Dusklight/EUR/Card A/01-GZ2P-gczelda2.gci   32,832 bytes
+header: 47 5a 32 50 30 31 00 05 "gczelda2"      (GZ2P01, 5 blocks, filename field)
+10,497 non-zero bytes -- real data, not a zero-filled stub
+```
+
+The run then continued into the new-game intro ("Enter horse name", "Epona") and later "Enter name",
+"Link", which is further than this port has ever reached. What that still does **not** establish: that
+the save RELOADS. A second run with the GCI in place was driven the same way and reached the naming
+screens again, i.e. it began a new game rather than continuing the saved one. Whether that is the
+intended behaviour for a card that exists but was never *loaded* in this session, or a defect in the
+load path, is NOT determined — the run did not capture the file-select screen itself. Treat save
+RELOAD as untested.
+
+### 3d.3 Why the title screen was cut, and the rects to measure next time (2026-11-05)
+
+The user reported the title screen was cropped: the logo filled the frame and "PRESS START" plus the
+copyright line were missing. That is a **render-scale bug**, not a scene bug, and the frames recorded
+the exact numbers.
+
+`ensure_efb()` allocates the EFB at 75% of the logical size (608x448 -> 456x336). But
+`gfx::vita::main_target_size()` returned the **logical** size and `get_render_target_size()` returned
+`main_target_size()` for the main target, so `gx::map_logical_viewport()` computed
+`target / logical` = `608/608` = **1.0**. The 75% was never applied to anything. Every full-screen
+608x448 viewport was therefore issued against a 456x336 FBO: the picture was magnified by 1/0.75 and
+cropped, which is exactly a title screen losing everything below the logo.
+
+Measured before the fix, from the log:
+
+```
+EFB target: logical 608x448 -> 456x336 (75%), present 960x544
+rect on 456x336: viewport (0.0,0.0) 608.0x448.0  scissor (0,0) 608x448
+```
+
+i.e. a viewport 1.33x the target, and a scissor clamped to 456x336 while the geometry ran to 608x448.
+
+**Fix.** `efb_target_size()` (declared in [`vita_frame.hpp`](vita/aurora/overlay/gfx/vita_frame.hpp),
+defined in [`vita_gl_replay.cpp`](vita/aurora/overlay/gfx/vita_gl_replay.cpp)) returns the scaled size,
+`get_render_target_size()` reports it for the main target, and `ensure_efb()` allocates from the same
+function so the two cannot drift apart. After the fix the log reads:
+
+```
+rect on 456x336: viewport (0.0,0.0) 456.0x336.0  scissor (0,0) 456x336
+```
+
+and [`shot_3`] now matches the real title screen: logo at the correct size, the wolf on the ridge, and
+the layout the reference frame shows.
+
+**Keep the instrumentation.** `apply_viewport()` logs each distinct (target size, viewport, scissor)
+once per process, and `ensure_efb()` logs the logical -> EFB conversion. Two lines of log settled in
+minutes what several paragraphs of reasoning had guessed wrong, so do not delete them to tidy up.
+
+This also outranked the intermittent `write_fatal`: at the time the port could not be played at all
+past file select, which was a hard blocker for every other test. It was invisible for the whole project
+because nothing had ever driven the game with input. **That is now solved** — see §3d.5, which drives
+the game with frame-counted input and gets as far as the new-game naming screens.
+
+---
+
+### 3d.5 Frame-counted input: `vita/src/input_script.cpp` (2026-11-05)
+
+`tests/vita3k/script` replays keys with `xdotool`, and its own header says the honest limit out loud:
+the key SEQUENCE is fixed, the TIMING is wall-clock. The emulator's speed varies run to run, so a press
+lands on a different frame each time. That is a reproducible key sequence, not a reproducible RUN.
+
+The injector fixes that by counting frames. It is one new file plus three lines of wiring, and it
+needed **no change to dusklight**:
+
+| Piece | Where |
+|---|---|
+| the script parser and the pad push | [`vita/src/input_script.cpp`](vita/src/input_script.cpp) |
+| hooked into the loop, once per frame, before the game reads the pad | [`vita/aurora/backend.cpp`](vita/aurora/backend.cpp) `aurora_update()` |
+| loaded at boot, logged loudly | [`vita/src/main.cpp`](vita/src/main.cpp) `main()` |
+| image content | `TPV_VITA_SOURCES` in [`CMakeLists.txt`](CMakeLists.txt) |
+
+The hook point matters. `aurora_update()` runs once per main-loop iteration and BEFORE the game's
+`JUTGamePad::read()` -> `PADRead()`, so a push made there is what the game sees on that same frame.
+Nothing in the game's code had to be touched, which is why this stays mergeable with upstream.
+
+**Format** (`ux0:data/tpvita/input_script.txt`; absent = off, zero cost):
+
+```
+# comment
+<frames> <name>[,<name>...]     hold for N frames
+<frames> .                      hold nothing for N frames
+```
+
+Two name sets, and the distinction is the whole lesson of this section:
+
+* **Buttons** (`PADStatus::button`): `A B X Y START LEFT RIGHT UP DOWN L R Z`
+* **Stick** (`PADStatus::stickX/stickY`): `STICKLEFT STICKRIGHT STICKUP STICKDOWN`
+
+`LEFT` and `STICKLEFT` are NOT the same input, and Dusklight's menus read the stick, not the D-pad.
+[`d_file_select.cpp`](dusklight/src/d/d_file_select.cpp) calls `STControl::checkLeftTrigger()`, which
+needs a nonzero `stickValue` and derives direction from `stickAngle`. A script that pressed `LEFT` set
+`PAD_BUTTON_LEFT`; nothing on that screen looks at that bit, so the cursor never moved, `A` confirmed
+"No" again, and the game looped between "create a save file?" and "continue without saving?". That
+loop was reproduced twice before the cause was found.
+
+**Full deflection, and why a smaller push is a trap.** The chain is
+`PADClamp()` -> `JUTGamePad::CStick::update()` -> `STControl::checkTrigger()`:
+
+* `PADClamp`'s `ClampStick` subtracts a dead zone of 15 and rescales by `72/(127-15)` for the main
+  stick; a raw 100 on one axis comes out as 54, not 100.
+* `CStick::update` divides by 54 (`EClampStick`, main stick), so 54 -> `mValue` 1.0 — just over the
+  0.9 threshold `dFile_select.cpp` constructs its `STControl` with. A raw 90 becomes 45, 45/54 = 0.83,
+  and the cursor never moves while the log looks perfect.
+* The divisor is not even fixed: under `EClampCircle` it is 56/38. Full deflection (127) saturates to
+  1.0 under every clamp, which is why it is the only value worth using.
+
+**Three defects the first version had, each found by measurement rather than review:**
+
+1. Trailing `#` comments were not stripped, so `60 .   # settle` was rejected as an unknown name and
+   the WHOLE script was discarded (correct behaviour for a typo, wrong for a comment).
+2. newlib's `vsnprintf` does not support `%zu`. The summary printed a literal `zu` and consumed no
+   argument, shifting every later value in the line by one.
+3. No stick output at all — the bug described above.
+
+**The one honest limit.** Frame numbers are exact; the SCREEN at a given frame is not. The card prompt
+is a ~28-state machine (`MemCardCheckMain`) whose states run variable-length animations, so the same
+script can reach the prompt at a different frame. A single precisely-timed press is therefore the
+WRONG shape for such a screen — one press landed on a plain message with no cursor and was simply
+lost. The scripts in [`tests/vita3k/scripts/`](tests/vita3k/scripts/) therefore use a sweep that
+alternates a cursor move with `A`: every branch either advances or re-enters the sweep, so it cannot
+get stuck. That is a deliberate design, not sloppiness.
+
+**Where the output goes, and why it is a file.** `[input script]` lines are written to
+`ux0:data/tpvita/input_script.log` and to stderr. The file is the part that can be read back: Vita3K
+does not forward the guest's stderr into `vita3k.log` — measured, not assumed — and on a real Vita
+there is no log to read at all. Every step is logged with the frame it fired on, so a run can be
+CHECKED against its script instead of being believed:
+
+```
+[input script] frame 1050 -> buttons 0x0000 stick -127,0 for 30 frames (30 STICKLEFT)
+```
+
+**Run it:**
+
+```sh
+w="$HOME/vita3k-work/home/.local/share/Vita3K/Vita3K/ux0/data/tpvita"
+cp tests/vita3k/scripts/frame_card_sweep.txt "$w/input_script.txt"
+VITA3K_DIR=... TPV_VPK=build/tpv_vita-release.vpk \
+  tests/vita3k/run.sh script tests/vita3k/scripts/waits_sweep.txt sw_
+# then read $w/input_script.log
+```
+
+Use the `waits_*.txt` harness scripts, not the key-pressing ones: when the app is driven by the
+injector, a host key press is noise that can change the result.
+
+**What this proved, in Vita3K only:** the title screen renders correctly and uncropped (§3d.3 fixed);
+`START` advances it; the card prompt appears and is answerable; "Yes" creates a real 32,832-byte GCI;
+and the game reaches the new-game naming screens. **Not proved:** save reload, audio, performance, or
+anything on real hardware.
+
+### 3d.6 The name screen exits correctly; the picture reaches real gameplay (2026-11-05, corrected 2026-11-09)
+
+**Headline, and it is the strongest result in this document: the port renders actual Twilight Princess
+gameplay.** Driven run `pr_`, frames 2,150–4,800 of a PAL disc (`GZ2P01.iso`), 16 valid screenshots:
+Link's face lit and textured with a dialogue box (`pr_13`), Link and another character with the HUD
+(`pr_15`), and an outdoor scene with distance fog, terrain, a riverbank, foliage, a rock outcrop and a
+mounted rider with the horse (`pr_16`). Frames change 34–39% pixel-wise between shots, so it is a live
+scene, not a still. Draw counts settle at 215–376/frame.
+
+That is a **picture the user validated by eye from the screenshots** (§11: the desktop reference render
+is de-scoped and this replaces it). It is not a claim that the rendering is complete or correct in
+detail — see the caveats at the end.
+
+#### The name screen was never stuck. My "dead end" diagnosis was wrong, twice.
+
+The screen is `dName_c` with a nine-entry `mSelProc` state machine (`include/d/d_name.h`):
+
+```
+proc: 0=MOJI_SELECT 1=MOJI_SEL_ANM 2=MOJI_SEL_ANM2 3=MOJI_SEL_ANM3
+      4=MENU_SELECT 5=MENU_SEL_ANM 6=MENU_SEL_ANM2 7=MENU_SEL_ANM3 8=WAIT
+menu: 0=HIRA 1=KATA 2=EIGO 3=END
+```
+
+A `[name-proc]` probe in `dName_c::_move()` logging every distinct `(proc, menu, row, col)` tuple, plus a
+`[name-press]` probe logging whether START/A/B were *delivered*, gave this sequence on a clean run:
+
+```
+proc=0 menu=0 ... cursor walking 12->11->...->0, wrapping to 12 ...
+proc=0 menu=0 charCol=10
+[name-press] START delivered in proc=0 menu=0
+proc=2 menu=2      <- START worked: MOJI_SEL_ANM2, mSelMenu set to EIGO (2)
+proc=4 menu=2      <- MENU_SELECT, cursor on EIGO ("ABC")
+[name-press] A delivered in proc=8 menu=2   <- proc 8 = PROC_WAIT
+```
+
+**`proc=8` after A is the proof of success.** The A branch in `MenuSelect()` calls `menuAbtnSelect()`,
+which on a PAL disc jumps to `pal_eigo:`, calls `nameCheck()`, and on a non-empty name sets
+`mSelProc = PROC_WAIT` and `mIsInputEnd = 2`. `dFile_select_c::nameInput()` then switches on
+`isInputEnd()` case 2 and calls `dComIfGs_setPlayerName()` and moves to `DATASELPROC_NAME_INPUT_FADE`.
+There is a second, identical screen for the horse name (`nameInput2()`).
+
+So on this PAL disc, `EIGO_OR_END` resolves to `MENU_EIGO` (2), **not** `MENU_END` (3), because
+`DUSK_IF_ELSE((isRegionPal() ? MENU_EIGO : MENU_END), MENU_END)`. That means the menu cursor shows `ABC`
+already selected and A confirms from there — the highlighted `ABC` in the screenshot was correct all
+along, not a bug.
+
+#### The two wrong diagnoses, recorded so they are not repeated
+
+1. **"A types letters, so the screen is a dead end"** (2026-11-05). True that A types in
+   `PROC_MOJI_SELECT`, but the screen also moves on: START at `proc=0` switches to `proc=2` and then
+   `proc=4`, and A there confirms. The `LinkJF` text in the frozen screenshots was typed by the *sweep*,
+   not evidence of a trap.
+2. **"START then A is ignored, the screen is stuck at `proc=4`"** (2026-11-09, earlier the same day).
+   Wrong: A *was* delivered and did exit, to `proc=8`. The reason the frames looked identical was
+   **sampling time, not game state** — `zz_7`–`zz_9` were captured at 6–9 minutes, but the exit happens
+   at frame ~2,150–2,430, about 10 minutes in. Three "frozen" screenshots were three shots of the same
+   screen taken before it had any reason to change.
+
+**The transferable lesson:** two screenshots taken seconds apart showing the same pixels is evidence
+about *when the screenshots were taken*, not about what the game can do. The instrument that settled this
+was a state probe, not another look at the picture.
+
+#### The wrong diagnosis, and what the pixels actually showed
+
+§3d.5 said the game "reaches the new-game naming screens", implying progress. It does not get past
+them, and the 8,260-frame run recorded exactly why. Its 16 screenshots were named
+`g_naming_1 ... o_gameplay_3`, but the names were **hopes, not observations**. Decoded numerically:
+
+| Shot | Pixels changed vs previous | What it was |
+|---|---|---|
+| `ig_5` → `ig_16` | **0.09–0.28%** | the same screen, eleven times |
+
+A 0.1% delta across eleven shots 20 s apart is a frozen screen. Rendered on screen was the name-entry
+alphabet grid with **`L i n k J F`** in the field — and `F` was highlighted. The letters are the
+script's `A` presses. `A` on this screen **types the highlighted character**; it does not confirm.
+
+#### The real exit, read from the source
+
+`dName_c` has two states and the script only ever used one:
+
+| Input | State | Effect | Where |
+|---|---|---|---|
+| `A` | `PROC_MOJI_SELECT` | **types** the highlighted letter | [`d_name.cpp:1211`](../dusklight/src/d/d_name.cpp:1211) → `menuAbtnSelect()` |
+| `START` | `PROC_MOJI_SELECT` | moves the **menu cursor** (ABC/abc/END) to END | [`d_name.cpp:395`](../dusklight/src/d/d_name.cpp:395) |
+| `A` | `PROC_MENU_SELECT` + END | `nameCheck()` + `menuAbtnSelect()` → `mIsInputEnd = 2`, screen ends | [`d_name.cpp:1211`](../dusklight/src/d/d_name.cpp:1211) |
+
+So the exit is a **two-press pair, START then A**, and neither alone leaves. There are also **two**
+name screens (`d_file_select.cpp:1747` player, `:1845` horse), so the pair has to be repeated.
+A repeating `A` cadence is a repeating typist: it added five stray characters and then the field was
+full, which is precisely the observed `LinkJF` and then a frozen screen.
+
+#### The PLAY-scene phase chain, and why the probe is kept
+
+[`d_d_s_play.cpp`](../dusklight/src/d/d_s_play.cpp:1660) logs one line per distinct
+`(phase index, returned cPhs state)` pair from `dScnPly_Create`, reading `field_0x1c4.id` **before** the
+handler runs, so a phase that is never entered cannot be confused with one that succeeds. On a good run
+the whole chain is five transitions, all resolved:
+
+```
+index=0 -> state=0   INIT/retry   phase_00  (resetGame)
+index=2 -> state=0   INIT/retry   phase_1_0 (syncStageRes "Stg_00")
+index=5 -> state=0   INIT/retry   phase_2   (object res)
+index=6 -> state=0   INIT/retry   phase_3
+index=6 -> state=4   COMPLEATE    phase_3 finished
+```
+
+Every retry resolved; nothing sat in `cPhs_INIT_e`. That is the same trace seen in the run that produced
+the gameplay screenshots above, so **the play scene does run**, and §11's picture claim rests on it.
+
+**Keep the probe.** It is ~15 lines, caps itself at one line per `(phase, state)` pair, and it is the
+only thing in the tree that answers "which create phase is the play scene in" without a debugger.
+
+#### What is still not established, and one earlier claim that was wrong
+
+One earlier run *did* show a collapse that this document previously described as the play scene never
+starting: draws `443 -> 1` at window 1920, `sResolveSeen` frozen at 19,870, and a wall time pinned to
+33.33 ms/frame (the §7.8-trap-3 signature of a game clock pacing a loop with no work). **That blank has
+not reproduced** in any run since, and no change was made to fix it. Do not write "the play-scene stall
+is fixed" — nothing was fixed, and the honest status is **not reproducible**, the same shape as §7.1's
+intermittent that vanished without being understood.
+
+Two real things that collapse did establish, both still true and both worth having:
+
+- **Not a crash.** The main loop ran to frame 8,990 at a steady 30 Hz, `boot.log` was complete, and the
+  injector logged a clean finish.
+- **Not `ret=4`.** `4` is `cPhs_COMPLEATE_e` — success. On `TARGET_PC`
+  [`cDyl_LinkASync`](../dusklight/src/c/c_dylink.cpp:920) returns it unconditionally anyway, so that
+  `[DIAG]` line is noise on this build.
+
+If the blank appears again, the `[name-proc]`/`[play-phase]` lines name the last state on the first run.
 
 ---
 
@@ -762,14 +1179,130 @@ scene is right".
 `read_efb_rgba` has **no callers** — it is dead code. It becomes a bug the moment anything calls it,
 and the `1` was the wrong pack alignment for RGBA anyway.
 
+### 7.3c Draw batching: measured, and NOT worth doing — 442 draws only reach 377 (2026-11-05)
+
+Draw-call reduction is the next optimisation this emulator *can* actually resolve, because it cuts GPU-side
+work rather than guest CPU work (§7.8 explains why timing numbers here are unreliable and draw counts are
+not). It was measured rather than assumed. **The answer is no**, and this section exists mostly to stop a
+future session from re-deriving the optimistic number and acting on it.
+
+#### The final measurement
+
+Six samples on real play-scene frames (442 draws, the scene, not a loading frame), identical every time
+except for the 422-draw frame:
+
+```
+batching survey @frame 960: 442 draws -> 17 pipelineGroups, 63 stateGroups, 211 adjacent runs
+  (program+textures), 442 STRICT runs (offset+immediate); of 441 adjacent pairs: 0 share a uniform
+  OFFSET, 69 share uniform BYTES, 65 are fully mergeable (same state+bytes);
+  batched call count 377 (longest run 7)
+```
+
+| measure | count | meaning |
+|---|---:|---|
+| draws in the frame | 442 | |
+| `pipelineGroups` | 17 | same `PipelineConfig` only. Optimistic ceiling, **not achievable** |
+| `stateGroups` | 63 | same program **and** same texture bind group |
+| adjacent `runs` (program+textures) | 211 | state-identical runs in submission order |
+| `STRICT runs` (+ uniform offset + `immediateData`) | **442** | every draw is unique |
+| adjacent pairs sharing a uniform **offset** | **0** of 441 | nothing is reused by address |
+| adjacent pairs sharing uniform **bytes** | 69 of 441 | the only sound test |
+| **fully mergeable pairs** (same state **and** bytes) | **65** | |
+| **batched call count** | **377** | **longest run 7** |
+
+**442 → 377 calls is 1.17x, not 2.6x.** A 15% reduction in draw calls, bought by rewriting the decode
+stage to append into one contiguous buffer with per-source index offsets — a change to the hot path that
+Vita3K cannot show a win for (§7.8: 171–504 ms for the same config). The cost/benefit is not close, so
+this is **closed**, not deferred.
+
+#### What I got wrong twice, in the same direction
+
+The first survey said `57 pipelineGroups` and I recorded "5.6x". That counted only the pipeline, so it
+counted draws with *different textures* as mergeable — they are not. The second survey folded in
+`bindGroups.textureBindGroup` and reported `123 adjacent runs` at 320 draws, which reads as **2.6x**, and
+that is the number that stood in this document for a while. It was still wrong, and by a wider margin than
+the first error: it counted **state-identical** runs, but a `glDraw*` also carries **one uniform set**, and
+`gx::DrawData` has per-draw `uniformRange` plus `immediateData`. 211 draws are state-identical and only 65
+pairs are actually mergeable.
+
+Both errors are the same mistake: **I stopped at the criterion I had instrumented instead of writing down
+the full legality condition first and measuring that.** The lesson is cheap to apply — state the complete
+condition in the instrument (pipeline, samplers, uniform content, contiguity) before believing any
+aggregate of it.
+
+One sub-finding is worth keeping because it looks like an obstacle and is not: **`currentPnMtx` does not
+block a merge.** It is baked into each decoded vertex (`vita_vertex.cpp:427` sets `p.constant`), and the
+matrices it indexes live in the shared uniform array, so two draws differing only in PN index can still
+merge. Conversely, uniform **offset** is the wrong test — the frame arena reuses storage, so different
+offsets routinely hold identical bytes (0 shared offsets, 69 shared blobs). Any future survey must compare
+content, not addresses.
+
+#### Two instrument bugs that produced empty or misleading logs
+
+1. The survey was gated on `sFrameIndex == 2760`, but the driving script ends near frame 2400. It never
+   fired. Worse, a careless edit had nested the whole 120-frame timing window **inside** that gate, which
+   silenced every `window @frame` line too — that is how the empty log was noticed at all. An instrument
+   that can silently not run is worse than none: an empty log reads exactly like "nothing to report".
+2. The next gate was `frame.draws.size() >= 100`, which fired at frame 240 — a **loading** frame with 163
+   draws, not the 442-draw scene. A threshold low enough to always fire is low enough to fire on the wrong
+   frame.
+
+Final form: sample up to 6 frames that have `>= 350` draws, print one line per sample, and latch on a
+count rather than on a frame number, because a frame number is a hidden dependency on how far the script
+happens to get. `kSurveyMinDraws = 350`, `kSurveyMaxSamples = 6`.
+
+#### Status of the code
+
+The survey is **left enabled** in `vita_gl_replay.cpp` for now: it costs six log lines per run and it is
+the evidence for this section. It should be deleted, not left to rot, once this record is trusted — the
+GX replay path is the hot path and instrumentation there is not free.
+
+### 7.3b Per-draw allocation in `bind_fog_range`, removed (2026-11-05)
+
+A per-draw waste, found by reading the replay path rather than by profiling.
+
+`bind_fog_range()` runs for **every draw that has fog-range adjustment enabled** (~440 draws/frame in
+the play scene) and constructed a fresh `std::vector<uint8_t> rgba(width * 4)` on each call to build the
+LUT — one heap allocation plus a fill per draw, thrown away immediately. It now rebuilds into a reused
+`sFogRangeScratch` member, the same pattern `sScratch` already used for `decoded` / `chunks` /
+`uniforms`. `resize()` does not shrink capacity, so after the first few draws the steady state allocates
+nothing. The `sFogRangeRgba` comparison that skips an identical upload is unchanged, and that member
+still stores contents rather than a reference.
+
+**There was no state-cache win available.** `apply_pass_state`, `use_program`, `bind_texture` and
+`enable_attribs` were all already gated on `sCache`. Worth recording because the one call that *looks*
+wrong — `set_enabled(GL_DEPTH_TEST, sCache.depthTest, true)` — is correct: the signature is
+`set_enabled(cap, int8_t& shadow, bool enable)`, so the cache entry is the by-reference shadow and `true`
+is the desired value. I read it backwards first and nearly "fixed" working code. Check the signature.
+
+**Verified:** host `e2e` **87 scenes, 14,242 checks, 0 failed**; host `texture` **3,780 checks, 0
+failures** with its negative control still detected; Vita3K run yields **0** `fog range LUT out of range`
+warnings, **0** invalid accesses, and frame content structurally identical to the previous run — same
+39.21 % deltas across boot/attract/title, same ~0.2 % on the static card screens, then 36.2–36.3 %
+advancing through the name screens into a moving scene.
+
+**The timing result is NOT a proven win, and is recorded as unproven deliberately.**
+
+| window | before | after |
+|---|---:|---:|
+| frames 1200–1800 | 212.7 ms | 200.1 ms |
+| frames 2400–2760 | 218.6 ms | 162.0 ms |
+
+That looks like a large gain, but §7.9 already recorded **171–504 ms for the same configuration**, so one
+before/after pair cannot separate this from the emulator's own noise. The mechanism is real and free (one
+fewer allocation per draw) and it is the kind of change that matters on a Cortex-A9, where the allocator
+is not a fast host libc — but **do not quote a percentage from this**. Settling it needs repeated runs or,
+better, hardware.
+
 ### 7.4 Not started
 
 - Real hardware testing (nothing has run outside Vita3K).
 - Audio (currently `DUSK_AUDIO_DISABLED`; the audio engine is told it initialised, which is a lie
   to get past boot).
-- **A reference render.** This is now the highest-value item: build dusklight for desktop
-  (WebGPU/Dawn), boot the same `GZ2P01.iso`, and capture the same first scene. Without ground truth
-  every visual judgement here — including the missing cool tones above — is a guess.
+- ~~**A reference render.**~~ **De-scoped 2026-11-09**: the user validates the picture from the run's
+  screenshots by eye, which is what §3d.6's gameplay frames are for. The old text called this "the
+  highest-value item" because every visual judgement here would otherwise be a guess; that is now
+  answered by eye, not by a desktop build.
 - Card saves, pause menu, gameplay content.
 
 ### 7.5 The DuskOnVita audit: what another port already answered (2026-11-02)
@@ -962,21 +1495,30 @@ The interesting Vita-specific rendering work lives in
 
 ## 11. If you have to choose one thing to do next
 
-**Do the reference desktop render (§7.4).** It is the only item that converts the rest of this
-document from "the geometry is right" into "the picture is right", and it is the one artefact that
-two independent ports are both blocked on: DuskOnVita's open bug is texture flicker and its own ask
-is a matched Dolphin capture of the same scene (§7.5). Build dusklight for desktop (WebGPU/Dawn),
-boot the same `GZ2P01.iso`, capture the same first scene, and compare against the Vita3K frame. That
-single comparison settles the open questions about the missing cool tones (§7.3) and gives a target
-for every later rendering fix.
+**Get the picture validated by eye, and stop optimising blind. (2026-11-05 decision.)** §7.4 used to say
+"build the desktop reference render in WebGPU/Dawn and diff it". That is now **de-scoped**: the user
+validates the picture themselves from the run's screenshots. The consequence for a new session is that
+the deliverable changed shape — it is no longer "produce a reference image", it is **produce runs whose
+screenshots can be judged**, which means:
 
-**Do not spend more time on frame-rate micro-optimisations in Vita3K.** §7.8 and §7.9 both ended with
-the same answer: this emulator cannot resolve a change worth 1-2 ms because its own noise is ±100 ms,
-and it runs guest ARM on a host roughly an order of magnitude faster than a Cortex-A9, so CPU gains
-measured here do not transfer. The vertex cache in §7.9 is the worked example: correct, 74% hit rate,
-halves the decode work, and still not a measurable win on the emulator. Anything in this list that is
-pure CPU (vertex cache, static geometry by reference, the GX worker thread) belongs on hardware.
-Something that reduces **GPU** work or **draw count** is more likely to show up even here.
+- drive far enough that the screenshots show gameplay, not the title or the name grid;
+- save them somewhere durable, with the frame the game was on, because §3d.6's whole lesson is that a
+  picture without its provenance gets described wrongly later;
+- do not describe a screenshot as "the scene looks right" unless it was compared to something. The
+  §3d.2 correction exists because I did exactly that.
+
+**Do not spend more time on frame-rate micro-optimisations in Vita3K, and draw batching is now closed.**
+§7.8 and §7.9 both ended with the same answer: this emulator cannot resolve a change worth 1-2 ms
+because its own noise is ±100 ms, and it runs guest ARM on a host roughly an order of magnitude faster
+than a Cortex-A9, so CPU gains measured here do not transfer. The vertex cache in §7.9 is the worked
+example: correct, 74% hit rate, halves the decode work, and still not a measurable win on the emulator.
+
+Draw batching was the last candidate that could have shown up even here, because it cuts GPU-side work
+rather than guest CPU work. It was measured properly and it is **not worth doing**: 442 draws reach 377
+calls, 1.17x, for a rewrite of the decode hot path (§7.3c). It is closed on evidence, not deferred. If a
+future session wants a rendering win on the emulator, the honest position is that there is not one left
+that this tool can prove — the remaining levers (EFB copies, vertex decode, static geometry by
+reference, the GX worker thread) are all §7.8-shaped.
 
 Second, if a run dies: §7.1's size arithmetic is now sane (the arena is 24 MiB larger, §7.1), so
 watch whether the `0xBF18265F` failure rate changes at all before doing anything else with it. The

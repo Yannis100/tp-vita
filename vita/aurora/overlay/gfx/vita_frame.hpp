@@ -57,8 +57,12 @@ const gx::PipelineConfig* find_pipeline(PipelineRef ref);
 const TextureBindSet* find_bind_group(BindGroupRef ref);
 
 // ---- implemented by the GL renderer (vita_gl_replay.cpp) -------------------------------
-// Size of the main render target (the EFB), in pixels.
+// Size of the main render target as the GAME defines it: the VI render mode (608x448 for Twilight
+// Princess). Viewports and scissors the game sets are in these units.
 Vec2<uint32_t> main_target_size() noexcept;
+// The EFB actually allocated, in pixels: main_target_size() reduced by the render scale. This is what
+// the GL replay binds, and what gfx::get_render_target_size() reports for the main target.
+Vec2<uint32_t> efb_target_size() noexcept;
 // Execute a recorded frame into the EFB. Called on the thread that owns the GL context.
 void replay(Frame& frame);
 // Blit the EFB to the default framebuffer, aspect-fit and letterboxed. The caller swaps buffers.

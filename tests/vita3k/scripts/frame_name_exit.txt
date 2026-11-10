@@ -1,0 +1,124 @@
+# FOCUSED TEST: does START+A leave the name-entry screen?
+#
+# Replaces the 8,990-frame run for the specific question "is the name screen exited", which is
+# answered within ~200 frames of the first pair. Everything after the card sweep is START+A pairs with
+# no long A cadence, so a screen that is still the name grid after all of them is a definite finding.
+#
+# The previous full run PROVED the injector ran to completion (250/250 steps, finished at frame 8990),
+# so frame counting and input delivery are not in question here -- only the screen transition is.
+# Its screenshots were lost before they could be read, which is what this shorter run avoids.
+
+# boot -> title
+60 .
+420 .
+60 A
+90 .
+60 START
+120 .
+
+# card sweep: 12 rounds x 70 = 840
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+20 STICKLEFT
+15 .
+20 A
+15 .
+
+# THE QUESTION: 12 x (20 START + 40 . + 20 A + 60 .) = 1,680 frames
+# START moves the menu cursor to END (d_name.cpp:395); A then confirms it (d_name.cpp:1211).
+# If the screen is the name grid, each round is visible in the screenshots. If it is not, START is
+# inert and A just advances, which is harmless.
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+20 START
+40 .
+20 A
+60 .
+
+# held direction, to show the screen is live rather than frozen
+90 STICKUP
+150 .
