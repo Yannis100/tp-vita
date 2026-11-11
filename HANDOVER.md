@@ -31,7 +31,7 @@ It is **not** a from-scratch reimplementation. The stack is:
 | Game code | `dusklight` (a decompilation of the GC game) | submodule-style checkout in `dusklight/`, at `77705f8bb95ef7b7dca4675b149c4bcb6a48da34` |
 | Renderer frontend | `aurora` (Dusklight's GX→WebGPU backend) | nested at `dusklight/extern/aurora`, pinned by dusklight to tag `pre-upgrade-3227d76` |
 | GLES2 translation | `vitaGL` | supplied by VitaSDK |
-| Platform | Sony Vita SDK (`arm-vita-eabi`, GCC 15.2.0), SDL3 3.4 | `VITASDK=/home/yanserm1/vitasdk` |
+| Platform | Sony Vita SDK (`arm-vita-eabi`, GCC 15.2.0), SDL3 3.4, vitaGL r1488.g2bdbe89 (§7.4c) | `VITASDK=/home/yanserm1/vitasdk` (a symlink; the tree lives in `/home/yanserm1/psvita/tooling/vitasdk`) |
 | Vita glue | `tp-vita/` | **this is the only code the port actually owns** |
 
 `tp-vita/` is **not a git repository**. There is no local version control for the port's own
@@ -1566,7 +1566,7 @@ Where the two ports differ, and what each choice bought:
 | Local delta | 14 dusklight edits, 1 aurora overlay | **34** dusklight, 11 aurora, 2 borealis, 5 vitaGL patches |
 | Renderer | vitaGL only | vitaGL **and** a hand-written SceGxm backend (`gfx_gxm/`), GXM the default |
 | Deps | `tools/fetch_deps.sh`, no hashes | `deps.lock` with **SHA-256 per archive**, digest-pinned VitaSDK container, network off |
-| vitaGL | SDK prebuilt `libvitaGL.a` | built from pinned source `7635e3c` |
+| vitaGL | SDK prebuilt `libvitaGL.a`, now `r1488.g2bdbe89` (§7.4c) | built from pinned source `7635e3c` |
 | Tests | host suites, no goldens | ~100 host tests plus `tests/fixtures/baseline/<sha>/` frozen goldens |
 | Base | dusklight `77705f8` | dusklight `34a144a` (3 commits older) |
 
@@ -1600,6 +1600,78 @@ assumes behaviour may be rewritten per system, which contradicts the "behaviour 
 decompilation" posture this port has held throughout. We cannot validate them, and pulling them in
 would make every future upstream diff unreadable. Read its `docs/` as a specification for what to
 optimise, not as code to import.
+
+### 7.4c vitaGL: the pin moved from r1448 to r1488 (2026-11-11)
+
+The upgrade question — *"update vitaGL from upstream?"* — is answered by the packaging, not by the
+upstream repo tip. This port consumes a **prebuilt** `libvitaGL.a` from VitaSDK, so the only revision
+we can take without switching to a source build is the one the followed release channel ships.
+
+| | value |
+|---|---|
+| channel | `2026.08` (**stable**, not nightly) |
+| before | `vitaGL 0.0.0.r1448.gcd3791e-1`, commit `cd3791e` (2026-08-30) |
+| after | `vitaGL 0.0.0.r1488.g2bdbe89-1`, commit `2bdbe89` (2026-09-22) |
+| channel sequence | `2026091245` → `2026111076` (`packages-2026.08-snapshot-20261110.63.1`) |
+| also moved | `SceShaccCgExt` 1.0.1-1 → 1.0.1-2, plus 24 unrelated packages |
+
+Upstream tip is 78 commits ahead (`e1473ffa`, 2026-11-08), so the channel is deliberately behind; the
+remaining ~38 commits need a source build, which is a separate decision nobody has taken. Commit ranges
+were read with the GitHub compare API, not inferred from dates.
+
+**API compatibility was checked before rebuilding, not after.** `diff` of the old and new `vitaGL.h` is
+**two added lines** (`GL_DOT3_RGB`, `GL_DOT3_RGBA`) and **no removals**, so no call site could break.
+
+**What the 40 commits actually cover.** They are concentrated on the fixed-function pipeline
+(`GL_LIGHTING`, `glPopAttrib`, display-list enqueueing, `GL_COLOR_MATERIAL`), plus safety fixes and the
+GLSL translator. `grep` over `vita/aurora/overlay/gfx/` shows our replay backend calls **none** of the
+fixed-function surface (`glBegin`, `glMatrixMode`, `glLight*`, `glGenLists`, `GL_QUADS`: zero hits),
+so that whole block is neutral for us. The parts that do touch paths we use:
+
+- `266f8a23` raise the `glShaderSource` limit to 512 and stop scanning the strings twice — we call `glShaderSource` for every generated program;
+- `cadd4600` replace the `MEM_ENLARGER` approach with a growable buffer in the GLSL translator;
+- `f2959c1d` fix an incorrect wraparound in `reserve_attrib_pool`;
+- `f7e1b73d` / `21abeda5` safety guards on no-op calls and `glFramebufferTexture2D` texture IDs;
+- `7c9236bd` sanity check on circular pool allocation under `CIRCULAR_POOL_SPEEDHACK`.
+
+**Verified after the upgrade** (all re-run, nothing assumed):
+
+- VPK builds and links against r1488; `check_vpk.py` reports `0 error(s), 0 warning(s)`.
+- Host suites: **91 scenes, 14 266 pixel checks, 0 failures** — the full set, not a subset.
+- Vita3K, same scripted run as before: the split-screen intro narration, then **in-game gameplay**
+  in Ordon village (Link, Ilia, Epona, the bridge). Frames are 347–596 KB, i.e. real content. Kept as
+  `tests/vita3k/screenshots/r1488_intro_narration.png` and `r1488_gameplay_ordon.png`.
+
+**One result I could not explain, recorded rather than buried.** A first run after the upgrade
+produced **16 frames of 263 bytes — uniform black — including the gameplay frames**, while the guest
+was demonstrably alive (`input_script.log` ran to frame 8990). Before blaming vitaGL I established
+that the *installed app was byte-identical to the new VPK* (`cmp`), so it was the r1488 build; the
+`boot.log` timestamp is a red herring, because the in-app build stamp is compiled from `__DATE__` and
+does not change per rebuild. Two things then ruled out a regression:
+
+1. `fatal.txt` and `crash.log` in `ux0:data/tpvita/` are dated **2026-11-05**, i.e. stale files from an
+old session, not output of that run.
+2. Re-running the **same** script on the **same** binary rendered gameplay correctly.
+
+So the blank run is **not** reproduced and its cause is **not established**. The two named suspects,
+neither confirmed: a stale `Xvfb :99`/window state in the container, and the very first screenshot
+being taken while the screen was still the 263-byte blank boot frame (`r2_1_a_boot.png` is 263 bytes in
+the good run too — a blank first frame is normal, a blank *sixteenth* frame is not). Until it
+reproduces, treat "Vita3K renders" as a property that must be **re-checked per run**, not assumed from
+the last session.
+
+**Two operational notes that cost time here:**
+
+- `vdpm` is a subcommand wrapper, not raw pacman: `vdpm refresh <channel>` then `vdpm upgrade`. The
+`--help`-style flags silently fail with `only one operation may be used at a time`.
+- A pre-existing, unrelated busy-spin can fill the log until the disk is gone: `dusk/mods/loader/loader.cpp:363`
+calls `fs::remove_all()` on `mods/.cache/dev.twilitrealm.luau`, and because that path is a
+**directory**, the POSIX `remove` behind it fails with `0x80010002` on every retry. One run wrote
+**6.2 GB** of `vita3k.log` (42.9 M lines). This predates the upgrade — an earlier, pre-upgrade run
+had already written 919 MB. `rm -rf mods/.cache` neutralises it; it is upstream behaviour, not ours.
+
+**How to undo.** The old `libvitaGL.a` and `vitaGL.h` are saved with SHA-256 digests in
+`psvita/tooling/backups/tpv-sdk-backup-vitagl-cd3791e/`; copy them back to restore `cd3791e`.
 
 ---
 
