@@ -1,6 +1,6 @@
 # Running the VPK in Vita3K (headless)
 
-`run.sh` installs and starts `build/tpv_vita.vpk` in the official Linux build of [Vita3K](https://vita3k.org/), inside a podman
+`run.sh` installs and starts a VPK (by default the dev build, else `build/tpv_vita-release.vpk`; override with `TPV_VPK=`) in the official Linux build of [Vita3K](https://vita3k.org/), inside a podman
 container with a virtual display (Xvfb) and software OpenGL (Mesa llvmpipe), and takes screenshots. Nothing is installed on the host.
 The container exists because the official Vita3K Linux builds need a very recent glibc and Qt6.
 
@@ -73,10 +73,19 @@ produces the "disc image cannot be used / copy was cut short" screen; a `GALE01.
   (`%ll` works). Fixed; `tests/host/check_printf_formats.sh` guards it.
 - The firmware is not needed to reach these screens (without it Vita3K only logs the missing kernel modules).
 
+## Later state (2026-11-09 onward)
+
+The paragraph below was written when the port still stopped at the diagnosis screen. It no longer does: with a
+real disc image the app boots the game, `libshacccg.suprx` is found at `ur0:data/libshacccg.suprx`, GX frames
+render, and a frame-counted scripted run reaches in-game gameplay. Saved evidence:
+`screenshots/r1488_gameplay_ordon.png`, `screenshots/r1488_intro_narration.png`. Audio is still disabled and
+save *reload* is still untested. See `HANDOVER.md` §3d.6 and §7.4c.
+
 ## What it does not prove
 
-- **Vita3K is an emulator, not a Vita.** The run stops at the diagnosis screen: with no real disc the app never starts the game, so no GX
-  frame, no vitaGL, no shader compile (`libshacccg.suprx`), no audio and no controller beyond one key were exercised.
+- **Vita3K is an emulator, not a Vita.** With no real disc the app never starts the game, so no GX frame, no
+  vitaGL, no shader compile, no audio and no controller beyond one key are exercised. Even with a disc, memory
+  budget, timing, permissions and the SGX543 are not modelled.
 - Memory budget, timing, file-system permissions and the SGX543 are not modelled. The boot log's "firmware" and "argv[0]" lines are empty here
   because Vita3K does not implement `sceKernelGetSystemSwVersion` and passes no argv; they are filled on hardware (unchecked).
 - Vita3K's `config.yml` keys are version-specific; `config.yml` here matches the version above.

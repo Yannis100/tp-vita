@@ -22,7 +22,7 @@ Needs: `g++`, Mesa with EGL + GLES2 (`libEGL.so.1`, `libGLESv2.so.2`), `zlib`, p
 the GL/fmt headers), the fetched deps (`tools/fetch_deps.sh`) and the Dusklight checkout (`AURORA_DIR`, default
 `../dusklight/extern/aurora`). No X11 headers are needed (the build defines `EGL_NO_X11`; `libx11-dev` is not a dependency). Build output goes to `/tmp/tpv/e2e` (`OBJ`, `OUT`; `TPV_E2E_OUT` for the binary run by `run.sh`).
 
-## Scenes: 87, plus a teardown check
+## Scenes: 91, plus a teardown check
 
 | Group (file) | Scenes | What they pin |
 |---|---|---|
