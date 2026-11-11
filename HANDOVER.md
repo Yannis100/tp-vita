@@ -1417,10 +1417,40 @@ fast paths, static display lists, a GX worker thread, frame overlap. Specificall
   finds no caller, and TP has its own GX lib underneath. The rest are `aurora::input`, WPAD/KPAD, SDL,
   `OSUtf`, `AURORA_RVL` and the presentation API -- all behind the `505b5eb` migration wall.
 
-**A THIRD port exists, and it is closed source but leaves useful evidence (2026-11-11).** `capitanbarbacoa`
-publishes "Dusklight PSVita" at <https://capitanbarbacoa.itch.io/duskgxm> (v1.1.0, `Dusklight-1-1-0.vpk`,
-22 MB, built 2026-11-03, AI-assisted, code not shared). The workspace holds a copy at
-`../Dusklight-1-1-0.vpk`. What it establishes, and what it does not:
+**A THIRD port exists, it RUNS IN VITA3K, and it rendered the reference frame this project
+de-scoped (2026-11-11).** `capitanbarbacoa` publishes "Dusklight PSVita" at
+<https://capitanbarbacoa.itch.io/duskgxm> (v1.1.0, `Dusklight-1-1-0.vpk`, 22 MB, built 2026-11-03,
+AI-assisted, code not shared). The workspace holds a copy at `../Dusklight-1-1-0.vpk`.
+
+**It was run, not just read.** `TPV_VPK=... tests/vita3k/run.sh run 40 4` boots it in the same harness we
+use for ours, on the same `GZ2P01.iso` (symlinked to `ux0:data/dusklight/Zelda.iso`, the path it expects).
+Result, saved as `tests/vita3k/screenshots/theirs_prelaunch_{1..4}.png`:
+
+- it reaches its own prelaunch/preset screen **on top of a fully rendered 3D scene** - the Ordon
+  spring backdrop, textured and lit, with the HUD-free scene visible around the modal;
+- consecutive frames differ **30% of the scene-crop pixels (max-abs-diff 149)**, so it is a live scene,
+  not a frozen frame; screenshot sizes (390-400 KB) sit in the same range as our gameplay frames;
+- it does **not** crash in the emulator (it did on a fresh firmware-less work dir, which was a setup
+  fault: it wants `ur0:data/external/libshacccg.suprx`, and our own runs only warn on that same
+  fallback, so the emulator's own `ur0:data/libshacccg.suprx` is enough).
+
+**Two of my earlier claims in this section were WRONG and are retracted here:**
+
+1. *"The `eboot.bin` is encrypted (`flags 0x100c0`), so it is not analyzable."* **False.** Our own eboot,
+   which we build ourselves, has the **identical** `flags 0x100c0` - that is not an encryption marker.
+   The real reason `strings` finds nothing in either file is **compression**: valid zlib streams start at
+   `0x1000` (verified: 420 KB, 184 KB and 582 KB decompress cleanly). A plaintext `\x7fELF` sits at
+   offset `0xa0` in both. So it is a compressed-but-readable SELF, and it **could** be unpacked; this
+   session did not do that, and it should be treated as a separate, deliberate task rather than a
+   "closed door". The lesson is the one this project keeps relearning: **validate an instrument against a
+   known-good input first** - comparing against our own eboot took one command and would have prevented
+   both wrong claims.
+2. *"`res/rml/vita.rcss` does not apply to us because we stub RmlUi entirely."* True today, but it
+   understates what their run proves: **the Dusk UI works on this GPU in the emulator**, prelaunch and
+   all. It is not a limitation of the hardware or of aurora; it is a gap in *our* port, and their
+   `vita.rcss` is the measured, ready-made answer for the part that would be slow.
+
+What it establishes, and what it does not:
 
 - **It is a hardware-tuned reference for the same GPU.** Their notes: aiming for at least 25 FPS, about
   80% of the game at 30 FPS, requires an **overclocked** console with settings high, and they recommend
@@ -1432,12 +1462,14 @@ publishes "Dusklight PSVita" at <https://capitanbarbacoa.itch.io/duskgxm> (v1.1.
   need SCE keys, which is out of scope; the `param.sfo` and the `res/` tree are readable and that is all
   that was used.
 - **`res/rml/vita.rcss` is a hardware-measured list of what to remove from the Dusk UI**: every
-  `backdrop-filter`, `box-shadow` and `filter:` becomes a flat background or a border, with numbers
-  attached (a 22-mod catalog page took **8.5 s** to build, GPU frames of **300-600 ms**). **It does not
-  apply to us**: our build compiles exactly one file from `src/dusk/ui/`
-  (`icon_provider.cpp`) and stubs RmlUi/WGPU entirely (`vita/src/dusk_ui_icon_provider_stub.cpp`,
-  CMakeLists.txt:203), so we render no RmlUi documents at all. It becomes relevant the day the Dusk UI is
-  wired up on this port, and it is the file to copy at that point.
+  `backdrop-filter`, `box-shadow` and `filter:` becomes a flat background or a border, with the numbers
+  attached (a 22-mod catalog page took **8.5 s** to build; GPU frames of **300-600 ms** from
+  `GeometryBoxShadow`/`SaveLayerAsTexture` alone, each shadow rendered into its own layer and texture,
+  game thread waiting on the GPU). **Today our build renders no RmlUi documents at all** - it compiles
+  exactly one file from `src/dusk/ui/` (`icon_provider.cpp`) and stubs the rest
+  (`vita/src/dusk_ui_icon_provider_stub.cpp`, CMakeLists.txt:203) - so there is nothing yet for this file
+  to fix. **But their run shows the UI working on this GPU in Vita3K**, so the gap is ours, not the
+  hardware's or aurora's, and this is the file to copy the day the Dusk UI is wired up here.
 - **They ship a precompiled shader cache and we do not.** `shader_paketote.bin` (5.75 MB, magic `DSPK`,
   ~4334 entries at 16 bytes each, obfuscated payload) is a *cold* cache baked at build time. Ours is only
   a *warm* one: `vglSetShaderCachePath("ux0:data/tpvita/shader_cache")` persists what the console has
