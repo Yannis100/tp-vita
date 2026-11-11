@@ -1450,6 +1450,49 @@ Result, saved as `tests/vita3k/screenshots/theirs_prelaunch_{1..4}.png`:
    all. It is not a limitation of the hardware or of aurora; it is a gap in *our* port, and their
    `vita.rcss` is the measured, ready-made answer for the part that would be slow.
 
+**Their eboot WAS unpacked, and it says one thing that matters (2026-11-11).**
+`tools/unpack_self.py` decompresses a SELF in place. It is validated against our own build first,
+which is the whole point: the output must contain `Aurora (vitaGL) initializing`,
+`ux0:data/tpvita/shader_fail` and `input script: ACTIVE`, three strings visible in our source. It does, so
+the unpacker is trustworthy before it is pointed at a foreign file.
+
+Two traps are documented in that script because both cost time here. `SceHeader` flags `0x100c0` do
+**not** mean encrypted (our own eboot carries the identical value). And the program headers are **not**
+`Elf32_Phdr` even though `e_phentsize` is 32 -- `p_offset`/`p_vaddr` are SCE segment descriptors, so
+walking them yields plausible nonsense (`type=0x0159a284`). What works is scanning for zlib stream headers
+and decompressing each stream in place; the streams are contiguous. Result: 31 MB of readable image for
+ours, 32 MB for theirs.
+
+**What the analysis found, and what it did not.** Their build is **stripped**: `aurora::gx::` appears 5
+times in ours and 0 in theirs, `dusk::` 26 vs 1, and the GXM/vitaGL entry points are imported by NID rather
+than named. So there is **no symbol-level comparison to be had**, and this should not be repeated expecting
+one. What *is* readable is a string-level structural difference, and it is significant:
+
+| | ours | theirs |
+|---|---|---|
+| WGSL source as literals (`@fragment`/`@vertex`) | **0** | **5** |
+| `textureSample` (WGSL builtin) | **0** | **15** |
+
+**They ship upstream aurora's WebGPU shaders as WGSL text and translate them to GXM at runtime; we
+generate GLSL from the GX state instead.** That is the architectural difference between the two ports, and
+it explains a lot at once: it is why their patch set is 17 careful edits to aurora's `lib/gx/` (they are
+keeping upstream's shader path intact underneath), why their `GXTexture`/filter fixes were the same ones
+upstream was making (they track upstream), and why our two active fixes were needed at all -- on our route
+the GX-to-GLSL generator is *our* code, so upstream's shader fixes do not reach us and defects like the
+swapped min-filter table are ours to find. It is also the honest answer to "should we switch routes?":
+theirs is closer to upstream and gets upstream's fixes for free, ours avoids a WGSL-to-GXM translation
+layer on a Cortex-A9. Neither is obviously right, and this is not evidence to switch -- only evidence of
+what the difference costs and buys.
+
+**Their screenshots are NOT yet a valid reference for our rendering, and this is the trap to avoid.**
+The frames exist and are live (verified), but they show a **different scene at a different time of day**:
+theirs is the prelaunch backdrop, ours are in-game dialogue and the outdoor field. Comparing region
+luminance between them would be meaningless, and this project has already published wrong conclusions twice
+by comparing things that were not comparable (HANDOVER section 7.8). To use their build as a reference
+properly, the next session must drive **both** ports to the *same* point -- same scene, same camera, same
+frame -- which their preset/Play UI makes possible but was not done here. Until then, treat their frames as
+proof that a correct picture is reachable on this GPU, not as a pixel reference.
+
 What it establishes, and what it does not:
 
 - **It is a hardware-tuned reference for the same GPU.** Their notes: aiming for at least 25 FPS, about
