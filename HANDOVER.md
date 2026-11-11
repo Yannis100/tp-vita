@@ -121,8 +121,21 @@ export PATH="$VITASDK/bin:$PATH"
 
 ```sh
 cd /home/yanserm1/psvita/tp-vita
-cmake --build build -j"$(nproc)"
+cmake -S . -B build            # ALWAYS, see the trap below
+cmake --build build --target tpv_vita-release.vpk-vpk -j"$(nproc)"
 ```
+
+**Two traps, both silent, both cost time in this session.**
+
+1. **The target is `tpv_vita-release.vpk-vpk`, not `tpv_vita-release.vpk`.** Ask for the wrong name and
+   `cmake --build` prints nothing, exits **0**, and builds nothing; check `ls -la build/*.vpk` against the
+   clock rather than trusting the exit code (`cmake --build build --target help | grep vpk` lists the real
+   one).
+2. **The aurora overlay is only re-synced at configure time.** Editing `vita/aurora/overlay/**` or
+   `vita/aurora/patches.py` and then building regenerates nothing, so the build silently uses the previous
+   tree. This bit me here: after restoring a reverted fix in the overlay, the suites still failed, because
+   `build/aurora_lib/` still held the reverted copy. Always run `cmake -S . -B build` after touching either,
+   and verify with `grep` in `build/aurora_lib/` that the change actually landed.
 
 Fresh configure (only needed if CMake files changed):
 
@@ -1305,7 +1318,7 @@ better, hardware.
   answered by eye, not by a desktop build.
 - Card saves, pause menu, gameplay content.
 
-### 7.4b Upstream status and the two fixes taken from DuskOnVita (2026-11-10)
+### 7.4b Upstream status and the three fixes taken from DuskOnVita (2026-11-10, extended)
 
 **Upstreams are quiet. Verify before re-deriving:**
 
@@ -1320,8 +1333,8 @@ dusklight's own sources (see the header comment in `vita/aurora/patches.py`). **
 exact same dusklight pin** (`77705f8`), so its aurora work is directly comparable rather than
 ahead of us.
 
-**Two correctness fixes taken from DuskOnVita / upstream aurora**, both verified against the source
-rather than trusted:
+**Three correctness fixes taken from DuskOnVita / upstream aurora**, each verified against the source
+and against our own build's numbers rather than trusted:
 
 1. **GX min-filter table had two entries swapped.** `kHwToGxFilter` in `overlay/gfx/texture.hpp` is the
    inverse of `GX2HWFiltConv = {0x00,0x04,0x01,0x05,0x02,0x06}`, so hardware bits `0x2` must decode to
@@ -1338,15 +1351,71 @@ rather than trusted:
    bulk append (upstream's `0b39c95` cannot be taken verbatim: at our pin the whole light array is
    appended in one call, so there is no per-light site to wrap).
 
-**One latent fix worth nothing yet:** negative LOD bias was cast float→`u8`, which ARM saturates to 0
-(upstream also fixed this). Patched in `patches.py`, but **`kUseTexLodBias = false` in
-`vita_shader.cpp`, so nothing consumes it and no pixels change.** Recorded as latent so nobody credits it
-with a rendering improvement later.
+3. **The save path allocates 64 KiB on an 8 KiB stack.** `copy_stream()` in aurora's `io.cpp` has a
+   `std::array<uint8_t, 64*1024>` local, and every card write goes through it (`open_atomic_file` then
+   `copy_stream`, called from `CardRawFile.cpp` and `FileIO.cpp`). The thread it runs on is the memory-card
+   thread from `m_Do_MemCard.cpp`, whose `STACK_SIZE` is **`0x2000` (8 KiB)** -- `0x1000` only under
+   `PLATFORM_GCN` -- and dusklight's `OSCreateThread` runs the thread body on a detached `std::thread`, so
+   that is the real stack the body runs on. The static `MemCardStack` array is bookkeeping, not the thread's
+   stack. 64 KiB against 8 KiB is an 8x overflow on the first write. This is the defect DuskOnVita hit on
+   hardware as a data abort (their patch `0005-vita-copy-stream-stack`), and the numbers are ours, not
+   theirs. **Active in our build**, and it sits on the save path that section 2 still lists as untested: on
+   hardware it would have presented as "saving crashes", with no address clue pointing at a 64 KiB local.
+   Fixed to 4 KiB chunks (the loop already handles short reads, so only throughput changes). **Vita3K cannot
+   reproduce this** -- host thread stacks are megabytes -- so no emulator run would ever have shown it.
 
-**Verified:** clean build, `e2e` 87 scenes / 14,242 checks / 0 failed, `texture` 3,780 / 0 failures, and
-the texture suite's negative control still detects an expected mismatch. **Not verified:** no pixels were
-compared on a real scene, so neither fix has been shown to improve the picture — only that it cannot
-regress the host suites.
+**One latent fix worth nothing yet:** negative LOD bias was cast float->`u8`, which ARM saturates to 0
+(upstream also fixed this). Patched in `patches.py`, but **`kUseTexLodBias = false` in
+`vita_shader.cpp`, so nothing consumes it and no pixels change.** Recorded as latent so nobody
+credits it with a rendering improvement later.
+
+**Verified:** clean build, VPK produced, `e2e` **91 scenes / 14,266 checks / 0 failed**, `texture`
+3,780 / 0 failures with its negative control still detecting an expected mismatch. **Not verified:** no
+pixels were compared on a real scene, so none of the three fixes has been shown to improve the picture --
+only that none can regress the host suites.
+
+**The decoding fixes now have tests, and getting that right took a correction.**
+`tests/host/e2e/scenes_texobj.hpp` adds four scenes that drive the real `GXInitTexObjLOD` / `GXInitTexObjFilter` / `GXInitTexObjLODBias` /
+`GXLoadTexObj` through the real FIFO and command processor, then read back what `gxState().loadedTextures`
+decoded. Before this, `grep -rn 'min_filter|lod_bias' tests/host/` was empty, so both defects could have been
+reverted the same day with every suite still green. Fix 3 is not tested here -- it is a stack-depth
+constraint, which no host run can observe (host stacks are megabytes); it rests on the arithmetic above.
+Proven by reverting each defect in turn:
+
+- the swapped min-filter table is caught by the round-trip scene, in exactly the two slots it corrupts
+  (`GX_TEXMAP3 min_filter = 4, expected 3` and `GX_TEXMAP4 min_filter = 3, expected 4`);
+- **the LOD-bias UB is not detectable at runtime on x86 at all, and my first attempt at it silently passed
+  with the defect present.** That is worth writing down, because the reason is subtle: at runtime gcc emits
+  `cvttss2si` then stores the low byte, so `(uint8_t)(32.0f * -4.0f)` gives `0x80` -- the correct answer --
+  in *both* the buggy and the fixed form. It is only at compile time that gcc folds the same expression to
+  `0`. Same expression, two different answers: the signature of UB, and the same divergence that ARM's
+  saturating conversion produces on hardware. The fix is therefore pinned by `static_assert`s over a
+  `constexpr` encoder instead, where the buggy form is ill-formed (`overflow in constant expression`) and
+  the fixed form is well defined because integral conversions are modulo. Verified both ways: the build
+  fails with those two assertions when the defect is reintroduced.
+
+**What was audited and deliberately NOT taken** (so a future session does not redo it). DuskOnVita carries
+17 aurora patches, 53 dusklight patches, 2 borealis and 5 vitaGL. Almost all are performance work written
+against *their* GXM backend and do not map onto our vitaGL one -- `command_processor.cpp` register-decode
+fast paths, static display lists, a GX worker thread, frame overlap. Specifically:
+
+- **vitaGL patches (3 substantive):** not takeable as patches -- we consume vitaGL as a prebuilt
+  `libvitaGL.a` from VitaSDK, not as source. Their uniform-reservation and sampler-object changes are
+  performance/safety work on vitaGL itself; adopting them would mean building vitaGL from source, which is
+  a project, not a cherry-pick.
+- **`borealis/0002` (device paths are absolute):** real defect class, but only affects `borealis::data`,
+  which our build does not use for the game's paths (we hand aurora absolute `ux0:` paths directly).
+- **abseil patch:** byte-for-byte the same two hunks as our own `patches/abseil-vita.patch`. Nothing to take.
+- **`aurora/0012` `lib/gfx/texture.hpp`:** identical fix to the one already applied here; we additionally
+  took the idea for the tests.
+- **`aurora/0005`** is fix 3 above, the one substantive port.
+- **Upstream aurora's 24 commits:** only four were candidates and all are no-ops for Twilight Princess.
+  `f77492f` (truncate vertex count, skip 0 draws) is ordering, not correctness, for us -- the decode already
+  clamps to `availBytes / vtxStride`, `draw_op` already returns early on `vtxCount == 0`, and GL ignores
+  incomplete primitives. `6dc60dc` (`GXSetZScaleOffset`), `8aa4c09` (`GDSetTexImgPtr`) and `9873709`
+  (`GXClear`/`GXClearSubrect`) add functions the game never calls: `grep -rn GXSetZScaleOffset dusklight/src/`
+  finds no caller, and TP has its own GX lib underneath. The rest are `aurora::input`, WPAD/KPAD, SDL,
+  `OSUtf`, `AURORA_RVL` and the presentation API -- all behind the `505b5eb` migration wall.
 
 **What DuskOnVita has that we should ask about, not re-derive.** Their console results are the thing our
 Vita3K-only workflow cannot produce: GX worker time down 6.6 ms in Ordon village, 8.0 in Kakariko,

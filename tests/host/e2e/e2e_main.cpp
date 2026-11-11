@@ -400,6 +400,7 @@ constexpr int kLightColors[8][3] = {{100, 0, 0}, {0, 100, 0}, {255, 255, 255}, {
 constexpr uint32_t kMasks[4] = {(1u << 0) | (1u << 5), 1u << 1, 1u << 3, 1u << 6};
 
 #include "scenes_texture.hpp"
+#include "scenes_texobj.hpp"
 #include "scenes_indirect.hpp"
 #include "scenes_tp_lines.hpp"
 #include "scenes_alpha.hpp"
@@ -1031,6 +1032,7 @@ std::vector<Scene> make_scenes() {
                }});
 
   add_texture_scenes(s);
+  add_texobj_scenes(s);
   add_indirect_scenes(s);
   add_tp_line_scenes(s);
   add_alpha_scenes(s);
