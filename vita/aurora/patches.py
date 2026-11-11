@@ -234,6 +234,32 @@ PATCHES += [
 ]
 
 PATCHES += [
+    # A 64 KiB buffer on the save/load worker's stack, which is 8 KiB here. This is the defect
+    # DuskOnVita hit on hardware as a data abort (their 0005), and it applies to us unchanged because
+    # the numbers are ours, not theirs:
+    #   * m_Do_MemCard.cpp gives the card thread STACK_SIZE = 0x2000 (8 KiB) -- 0x1000 only under
+    #     PLATFORM_GCN -- and dusklight's OSCreateThread runs the thread body on a detached
+    #     std::thread, so that is the real stack the body runs on. The static MemCardStack array is
+    #     bookkeeping there; it is not the thread's stack.
+    #   * copy_stream() allocates std::array<uint8_t, 64*1024> on that stack -- 8x the whole thing --
+    #     and zero-initialises it.
+    #   * every card write goes through it: open_atomic_file -> copy_stream, called from CardRawFile.cpp
+    #     and FileIO.cpp for saves. So this is a save-path crash, i.e. exactly the path HANDOVER §2
+    #     still lists as untested. On hardware it would present as "saving crashes", with no address
+    #     clue pointing at a 64 KiB local.
+    # Vita3K cannot reproduce it: host thread stacks are megabytes. Copy in 4 KiB chunks instead;
+    # identical read/write/EOF/error semantics, 1/16 the peak stack.
+    ("io.cpp",
+     """bool copy_stream(SDL_IOStream* src, SDL_IOStream* dst) noexcept {
+  std::array<uint8_t, 64 * 1024> buffer{};""",
+     """bool copy_stream(SDL_IOStream* src, SDL_IOStream* dst) noexcept {
+  // PORT: 64 KiB does not fit the 8 KiB card-thread stack (m_Do_MemCard.cpp STACK_SIZE = 0x2000, and
+  // OSCreateThread runs the body on a std::thread). The loop below already handles short reads, so
+  // the chunk size affects throughput only.
+  std::array<uint8_t, 4 * 1024> buffer{};"""),
+]
+
+PATCHES += [
     # create_directories() must create PARENTS. SDL_CreateDirectory is documented as doing so, but
     # that is a property of each platform implementation, not of the API: the Vita backend is a bare
     # mkdir(2) (SDL_SYS_CreateDirectory in SDL_sysfsops.c.obj, one sceIoMkdir call and no loop, unlike
