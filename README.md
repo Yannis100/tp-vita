@@ -5,26 +5,28 @@ A native recompile of the **Twilight Princess** game code for the **PS Vita**
 The game code and JSystem are compiled for ARM, Aurora's GX command processor drives a new
 **vitaGL (GLES2)** renderer, and the build produces an installable VPK (see [`PLAN.md`](PLAN.md)).
 
-**Current status: builds, links and packages (`build/tpv_vita.vpk` passes `check_vpk.py`), and the
-game boots and renders.** In Vita3K (headless, `tests/vita3k/`) with a user-supplied disc image in
-`ux0:data/tpvita/`, `mDoMch_Create()` returns 1, `main01()` reaches its main loop and keeps
-iterating, and real frames are rendered with a content bbox of `(271,128)–(1008,671)` on a 1280×800
-canvas, which is the pixel-exact result predicted by the 608×448 EFB and the aspect-fit in
-`present()`. Zero failing allocations and no crash markers on a clean run. Screenshots carry
-78,360–87,870 distinct colours; before the texture-upload fix of 2026-11-02 they carried only
-~1,600–4,000, because every GX texture upload was silently failing (see `HANDOVER.md` §7.3).
+**Current status: builds, links and packages (`build/tpv_vita-release.vpk` passes `check_vpk.py`),
+and the game boots, renders and reaches gameplay.** In Vita3K (headless, `tests/vita3k/`) with a
+user-supplied disc image in `ux0:data/tpvita/`, `mDoMch_Create()` returns 1, `main01()` reaches its
+main loop and keeps iterating, and real frames are rendered with a content bbox of
+`(271,128)–(1008,671)` on a 1280×800 canvas, which is the pixel-exact result predicted by the 608×448
+EFB and the aspect-fit in `present()`. Zero failing allocations and no crash markers on a clean run.
+Screenshots carry 78,360–87,870 distinct colours; before the texture-upload fix of 2026-11-02 they
+carried only ~1,600–4,000, because every GX texture upload was silently failing (`HANDOVER.md` §7.3).
+A scripted, frame-counted run then reaches the intro narration and in-game Ordon village gameplay;
+see `tests/vita3k/screenshots/` and §3d.6.
 
 **What that does not prove.** Vita3K is an emulator: nothing here has run on real hardware. The
-screenshots show a rendered 3D scene, but nobody has confirmed it is the *correct* scene (no
-reference comparison against a real GameCube or the desktop build). Audio is disabled
-(`DUSK_AUDIO_DISABLED`); card saves, the pause menu and most of the game's content have never been
-exercised. Treat "boots and renders" as the accurate claim, not "playable".
+picture has been judged correct by eye from the screenshots, not by a per-pixel diff against a
+reference. Save *reload*, the pause menu and most of the game's content have never been exercised,
+and audio is disabled (`DUSK_AUDIO_DISABLED`). Treat "boots, renders and reaches gameplay" as the
+accurate claim, not "playable".
 
 The vertex decoder, shader generator, texture decoders and disc discovery are tested on the host (`tests/host/`),
 and synthetic GX scenes (not game content) are rendered end to end through the real command processor ->
-GL replay -> EFB -> present path on Mesa (`tests/host/e2e`, 87 scenes, 14,242 pixel checks, 133 scripted negative
-controls). Mesa is not vitaGL, so vitaGL's shader translator and the Vita GPU are still unverified; the backend,
-input and audio have only been compiled. No game assets are included — you supply your own disc image.
+GL replay -> EFB -> present path on Mesa (`tests/host/e2e`, 91 scenes, 14,266 pixel checks, 133 scripted negative
+controls). Mesa is not vitaGL, so vitaGL's shader translator and the Vita GPU are still unverified; the backend
+and audio have only been compiled. No game assets are included — you supply your own disc image.
 
 ## What "compiles" means today
 
@@ -85,10 +87,15 @@ tp-vita/
 ```sh
 tools/fetch_deps.sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTPV_PACKAGE=ON
-cmake --build build -j
+cmake --build build --target tpv_vita-release.vpk-vpk -j"$(nproc)"
 # optional sanity check; the script ships with the vita-port skill, so substitute your own path
-python3 ~/.roo/skills/vita-port/scripts/check_vpk.py build/tpv_vita.vpk
+python3 ~/.roo/skills/vita-port/scripts/check_vpk.py build/tpv_vita-release.vpk
 ```
+
+`tools/build.sh release|dev|debug` builds the three variants (distinct title IDs, so a dev build cannot
+overwrite a release install). **Always re-run the `cmake -S . -B build` configure step after editing
+`vita/aurora/overlay/**` or `patches.py`** — the merged tree is only re-synced then. The VPK target is
+`tpv_vita-release.vpk-vpk`; asking for `…vpk` exits 0 and builds nothing.
 
 `build/aurora_lib` (upstream Aurora `lib/` + `vita/aurora/overlay/*` + `vita/aurora/patches.py`) is
 assembled at configure time; edits to the overlay re-run the assembly automatically. The link step
@@ -101,8 +108,8 @@ Host tests (x86, Mesa llvmpipe for the GL ones): `tests/host/{vertex,shader,text
 
 You supply the game and one Sony module; neither is in the VPK.
 
-1. Install `tpv_vita.vpk` (VitaShell). Needs HENkaku/enso and the **`libshacccg.suprx`** shader
-   compiler in `ur0:data/` (the same file other vitaGL ports need).
+1. Install `tpv_vita-release.vpk` (VitaShell). Needs HENkaku/enso and the **`libshacccg.suprx`**
+   shader compiler in `ur0:data/` (the same file other vitaGL ports need).
 2. Copy your own **GameCube** Twilight Princess image (USA `GZ2E01`, Japan `GZ2J01` or PAL `GZ2P01`) as a
    plain **`.iso` / `.gcm`** or **`.ciso`** file to `ux0:data/tpvita/` (or `ux0:data/tpvita/rom/`). Any file
    name works; `GZ2E01.iso` is tried first. RVZ/WIA/GCZ/WBFS/NFS images and the Wii release are not readable.
@@ -133,17 +140,20 @@ and the borealis source; the screens are checked on the host as pixels, not on a
 ## Honesty notes
 
 - **Build-verified**: game code + JSystem + the Vita backend compile for `arm-vita-eabi`, the ELF links
-  with no unresolved symbols, and the VPK packages and passes `check_vpk.py` (7 entries,
-  0 errors, 0 warnings).
+  with no unresolved symbols, and the VPK packages and passes `check_vpk.py` (8 entries, 0 errors, 0 warnings).
 - **Host-verified**: vertex decode (71k checks vs an independent reference), shader generation (random valid
   GX configs, incl. lines/points, link as GLSL ES 1.00 on Mesa), texture decoding (byte-identical to
   upstream Aurora), disc discovery, the first-boot diagnosis (font, text layout, disc scan, the disc decision table, config lookup,
-  boot log, shader-source dump: 10,686 checks, 23 negative controls), and 26 synthetic scenes rendered through command processor -> replay -> EFB ->
-  present on Mesa (triangle colours, depth, blending, culling, alpha test, textures, lighting, lines/points,
-  indexed display lists, scissor, viewport, EFB copy re-use, fog, fog range with the game's own table, per-draw light masks). That harness found a real bug: light masks were uploaded as raw `u32` and read as
-  floats, so every light was skipped (fixed 2026-10-26).
+  boot log, shader-source dump: 10,686 checks, 23 negative controls), and **91** synthetic scenes rendered through command processor -> replay -> EFB ->
+  present on Mesa (triangle colours, depth, blending, culling, alpha test, textures including the texture-object
+  decode, lighting, lines/points, indexed display lists, scissor, viewport, EFB copy re-use, fog, fog range with
+  the game's own table, per-draw light masks, offscreen targets, present scaling). That harness found a real bug:
+  light masks were uploaded as raw `u32` and read as floats, so every light was skipped (fixed 2026-10-26).
+- **Run in Vita3K, not on hardware**: the VPK installs and boots, frames render, and a frame-counted scripted
+  run reaches the intro narration and in-game Ordon gameplay. Save reload, audio, performance and runtime
+  memory are still unmeasured, and nothing has run on a real Vita.
 - **Never executed**: dst-alpha replace, perspective fog types, indirect/bump TEV, texture formats beyond RGBA8
-  through GL, offscreen targets, present scaling to 960x544, backend, ImGui renderer, input, audio, anything under real vitaGL (its shader translator, the
+  through GL, ImGui renderer, audio, anything under real vitaGL on real hardware (its shader translator, the
   `kFboRowsFlipped=false` and `gl_FragCoord` assumptions), performance, runtime memory, and `nod_lite` against a
   real disc image.
 - **Build-verified only** (first-boot diagnosis): the on-screen error screen (CDRAM framebuffer + `sceDisplaySetFrameBuf`),

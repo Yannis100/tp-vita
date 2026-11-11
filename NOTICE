@@ -58,7 +58,8 @@ vitaGL (LGPL-3.0-or-later) — read this before publishing a binary
 
   Source:  https://github.com/Rinnegatamante/vitaGL
   Build:   linked from the prebuilt archive in VitaSDK, vdpm package
-           `vitaGL 0.0.0.r1448.gcd3791e-1` (arm-vita-eabi/lib/libvitaGL.a)
+           `vitaGL 0.0.0.r1488.g2bdbe89-1` (arm-vita-eabi/lib/libvitaGL.a), from the
+           stable `2026.08` package channel (sequence 2026111076)
   Licence: LGPL version 3 or later, as stated in its source headers. Its licence texts are NOT
            reproduced here because no vitaGL source is included in this repository.
 
