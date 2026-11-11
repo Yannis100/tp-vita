@@ -1417,6 +1417,37 @@ fast paths, static display lists, a GX worker thread, frame overlap. Specificall
   finds no caller, and TP has its own GX lib underneath. The rest are `aurora::input`, WPAD/KPAD, SDL,
   `OSUtf`, `AURORA_RVL` and the presentation API -- all behind the `505b5eb` migration wall.
 
+**A THIRD port exists, and it is closed source but leaves useful evidence (2026-11-11).** `capitanbarbacoa`
+publishes "Dusklight PSVita" at <https://capitanbarbacoa.itch.io/duskgxm> (v1.1.0, `Dusklight-1-1-0.vpk`,
+22 MB, built 2026-11-03, AI-assisted, code not shared). The workspace holds a copy at
+`../Dusklight-1-1-0.vpk`. What it establishes, and what it does not:
+
+- **It is a hardware-tuned reference for the same GPU.** Their notes: aiming for at least 25 FPS, about
+  80% of the game at 30 FPS, requires an **overclocked** console with settings high, and they recommend
+  reducing resolution. That is the honest performance ceiling for this game on a Vita, from a third
+  independent implementation, so **do not expect 30 FPS unclocked at native resolution** from this port.
+- **The `eboot.bin` is NOT analyzable and was not attempted.** The SELF header is encrypted
+  (`flags 0x100c0`), so a naive segment-table parse yields garbage (it "found" 5922 segments — that was
+  ciphertext being read as a struct). VitaSDK ships `vita-make-fself` only, no inverse. Reading it would
+  need SCE keys, which is out of scope; the `param.sfo` and the `res/` tree are readable and that is all
+  that was used.
+- **`res/rml/vita.rcss` is a hardware-measured list of what to remove from the Dusk UI**: every
+  `backdrop-filter`, `box-shadow` and `filter:` becomes a flat background or a border, with numbers
+  attached (a 22-mod catalog page took **8.5 s** to build, GPU frames of **300-600 ms**). **It does not
+  apply to us**: our build compiles exactly one file from `src/dusk/ui/`
+  (`icon_provider.cpp`) and stubs RmlUi/WGPU entirely (`vita/src/dusk_ui_icon_provider_stub.cpp`,
+  CMakeLists.txt:203), so we render no RmlUi documents at all. It becomes relevant the day the Dusk UI is
+  wired up on this port, and it is the file to copy at that point.
+- **They ship a precompiled shader cache and we do not.** `shader_paketote.bin` (5.75 MB, magic `DSPK`,
+  ~4334 entries at 16 bytes each, obfuscated payload) is a *cold* cache baked at build time. Ours is only
+  a *warm* one: `vglSetShaderCachePath("ux0:data/tpvita/shader_cache")` persists what the console has
+  already translated, so the **first** run pays full price. §7.8 measured that price at **200-700 ms per
+  program** with the first ~70 built lazily, i.e. tens of seconds of stutter spread over the opening
+  scenes, on a device where the player just launched the game. Vita3K cannot show this (its translator is
+  a host compiler), and **nobody has yet verified that our cache file is even written on a real Vita** —
+  `grep -rn shader_cache tests/` finds no check. When hardware arrives, this is the first thing to measure,
+  and it is worth more than any of the micro-optimisations in §7.8/§7.9.
+
 **What DuskOnVita has that we should ask about, not re-derive.** Their console results are the thing our
 Vita3K-only workflow cannot produce: GX worker time down 6.6 ms in Ordon village, 8.0 in Kakariko,
 13.6 in Hyrule Field (18 → 28 FPS); `C_MTXConcat` and J3D envelope sums through NEON, verified bit-exact
