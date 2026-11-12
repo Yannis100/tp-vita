@@ -1916,7 +1916,13 @@ nothing about a Cortex-A9.
     callee.** §7.12c recorded that `--dvd` made their build skip the prelaunch flow, from reading
     `m_Do_main.cpp`. The harness passes no `--dvd` at all (`in_container_script.sh:32`). One grep in the
     launcher would have caught it. When a cause names an input, find where that input is supplied.
-22. **Never tune a detector until it agrees with you.** `compare_port_frames.py` refused a verified
+22. **A shallow clone with one commit cannot answer "is there anything new upstream".** The
+    `/tmp/DuskOnVita` copy is `is-shallow-repository: true` with a single squashed commit, so
+    `git log` shows one entry and `git fetch` shows no change *either way* — both read as "nothing new"
+    whether or not upstream has moved. Measured 2026-11-12: the API-published tip is `6bf5f57d`
+    (2026-11-10), the same commit the clone holds, and the repo has one issue (#1, closed) and no open
+    PRs. Get the tip from the GitHub commits API, not from a shallow clone's log.
+23. **Never tune a detector until it agrees with you.** `compare_port_frames.py` refused a verified
     same-screen pair at 0.538 while scoring a known-different pair 0.533 (§7.12c). Lowering the
     threshold would have admitted both. The honest move is to keep the strict guard and add an
     explicitly-labelled operator assertion — and to state in the report which half of the result is
