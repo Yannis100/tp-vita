@@ -1669,19 +1669,36 @@ frame on slot 1, and the `B` / `Confirm A` bar — the GameCube prompt glyphs, o
 > | `th_` | `skipPreLaunchUI:true`, `cardFileType:1` | 8 shots, all live 3D — no menu |
 > | `th2_` | same, `cardFileType:0` (GCIFOLDER) | 8 shots, all live 3D — no menu |
 > | `th3_` | 11-Nov 89-byte config (no `wasPresetChosen`) + `hold c` | reached the **prelaunch PLAY screen**, then 736x544 UI frames — not the file select |
+> | `th4_` | `skipPreLaunchUI:true` + `cardFileType:0` + `hold Return` (Start) | 8 shots, all live 3D (60-74% deltas) — no menu |
+> | `th5_` | `skipPreLaunchUI` **removed** (launch UI left up), `cardFileType:0`, `hold Return` | reaches their **launch UI at 736x544** and sits there (deltas 1.9-5.9%); not the slot list |
 >
-> The reason the first two could not work is now read from source, and it is worth keeping:
-> **`m_Do_main.cpp:914` puts the whole prelaunch/file-select flow behind `if (!dvd_opened)`**, and this
-> harness passes `--dvd` for OUR build, so `dvd_opened` is true and the block is skipped entirely. Their
-> build therefore boots straight into the game whenever a save is on the card — which is exactly
-> `th_`/`th2_`. The `th3_` run did reach the UI, but the surface came back **736 px wide** (the prelaunch
-> UI resizes it) and the frames show the PLAY screen, not the save-slot list.
+> `th5_` is the only attempt that changed the variable the others held constant, and it did move the
+> picture: with `skipPreLaunchUI` removed the build stops in a static 736x544 launch screen instead of
+> running 3D. That screen is **not** "Choose a Quest Log" — it has no three-row slot list and no
+> parchment board (captured as `tests/vita3k/screenshots/theirs_launchui_20261112.png`). So the launch
+> UI is on the path, but `hold Return` there did not produce the slot list either.
 >
-> So the measurement below stands on the capture that was taken while the file existed, and it is
-> recorded in full so it can be checked; **it is not currently reproducible.** To retry, the productive
-> next step is to copy `sf_5_05_file_select.png` out of the archive the moment it exists, and to reach
-> the screen the same way the original session did — the `sf_` prefix implies `theirs_skip_prelaunch.txt`
-> with a save-free card, not a Circle press. **Rule: a frame cited as evidence must be copied into
+> **The cause of the first, second and fourth attempts is NOT established, and one wrong explanation was
+> written here and then retracted within the same session.** It said `m_Do_main.cpp:914` gates the
+> prelaunch flow behind `if (!dvd_opened)` and that this harness passes `--dvd`. That is false:
+> `in_container_script.sh:32` launches `./Vita3K -c ... --frontend sdl -w /vpk/app.vpk` and passes
+> **no `--dvd`**, so `dvd_opened` stays false (it is only set inside the `parsed_arg_options.count("dvd")`
+> branch at `m_Do_main.cpp:811`) and the block at :914 **does** run. A source claim that fits the symptom
+> is not a verified cause — the flag had to be grepped for in the launcher, and it was not.
+>
+> What IS verified about those runs: they render live 3D continuously, i.e. their build is past the
+> menus and in the game. The plausible reading — not tested — is that with a save on the card and
+> `skipPreLaunchUI`, their build continues into the game without ever offering the slot list, and that
+> the original `sf_` capture came from a run whose config left the prelaunch UI up. That is a
+> hypothesis for the next session, not a finding.
+>
+> The `th3_` run did reach their UI, but the surface came back **736 px wide** (the prelaunch UI resizes
+> it) and the frames show the PLAY screen, not the save-slot list.
+>
+> So the measurement below stands on the capture taken while the file existed, and it is recorded in
+> full so it can be checked; **it is not currently reproducible.** The productive next step is to copy
+> `sf_5_05_file_select.png` out the moment it exists, and to reproduce the original session's config
+> rather than guessing at it. **Rule: a frame cited as evidence must be copied into
 > `tests/vita3k/screenshots/` in the same session it is captured.** §7.12's own "capture is no longer
 > reproducible" note is the same failure, one month earlier.
 
@@ -1803,7 +1820,11 @@ built for.
     had not been presented yet. Three blank shots at 20 s / 23 s / 26 s are what proved that a START
     injected at frame 300 lands inside the boot -> title transition and is discarded (§7.12c), which is
     why a single press did nothing while three presses worked. Keep them in the record.
-21. **Never tune a detector until it agrees with you.** `compare_port_frames.py` refused a verified
+21. **A source claim that fits the symptom is not a verified cause — check the launcher, not only the
+    callee.** §7.12c recorded that `--dvd` made their build skip the prelaunch flow, from reading
+    `m_Do_main.cpp`. The harness passes no `--dvd` at all (`in_container_script.sh:32`). One grep in the
+    launcher would have caught it. When a cause names an input, find where that input is supplied.
+22. **Never tune a detector until it agrees with you.** `compare_port_frames.py` refused a verified
     same-screen pair at 0.538 while scoring a known-different pair 0.533 (§7.12c). Lowering the
     threshold would have admitted both. The honest move is to keep the strict guard and add an
     explicitly-labelled operator assertion — and to state in the report which half of the result is
