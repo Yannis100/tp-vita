@@ -1,0 +1,44 @@
+# Frame-counted input that goes TITLE -> FILE SELECT and then STOPS.
+#
+# Purpose: reach the one screen both runnable ports provably render, so a same-scene
+# pixel diff against capitanbarbacoa's sf_5_05_file_select.png is legitimate
+# (tp-vita HANDOVER 7.12).
+#
+# Copy to $TPV_V3K_WORK/home/.local/share/Vita3K/Vita3K/ux0/data/tpvita/input_script.txt
+# then run:  tests/vita3k/run.sh script tests/vita3k/scripts/waits_file_select.txt fs3_
+#
+# ---------------------------------------------------------------------------------------
+# WHY THIS IS A SHORT SWEEP AND NOT ONE PRESS (2026-11-12, third attempt, measured)
+#
+# Attempt 2 used a SINGLE START at frame 300 and it did nothing: all 21 screenshots were the
+# live 3D attract loop out to 134 s, and the injector log confirms only five steps ran
+# (frames 0, 60, 240, 300 START, 340 hold-1600). So one press at that frame is simply eaten.
+#
+# The timing is not a guess. Attempt 2's samples were BLANK (263-byte, mode=1) at 20 s, 23 s
+# and 26 s, then live 3D from 29 s. That blank window is the boot -> title transition, and
+# frame 300 lands inside it. A press there is discarded, which is exactly what happened.
+#
+# What is known to work: attempt 1 pressed START at frames 300, 450 and 600 and DID leave the
+# title - the run ended on the player name screen ("Enter name", "Link"). So the presses get
+# through once they land after the transition, and the cost of a press that lands on the file
+# select is that it walks past it (which is how attempt 1 lost the screen).
+#
+# So: three presses, spaced 140 frames apart, starting after the blank window closes at about
+# frame 390. Attempt 1's spacing was 150 frames and every press after the first was effective.
+# The sampler in waits_file_select.txt photographs every 3 s throughout, so if a press does
+# confirm a slot and walk off the file select, the screen is still captured before the press.
+#
+# If the file select is not in this run's samples, raise the FIRST press and keep the same
+# spacing - do not add presses. More presses is what destroyed attempt 1.
+# ---------------------------------------------------------------------------------------
+
+60 .           # settle; PADInit and the boot images
+180 .          # logos
+60 .           # attract loop, first cutscene
+90 .           # cover the blank boot -> title transition seen at 20-26 s in attempt 2
+40 START       # press 1: title screen -> FILE SELECT
+140 .          # hold nothing; the sampler photographs whatever this reached
+40 START       # press 2
+140 .
+40 START       # press 3
+1200 .         # press nothing else; hold the screen for the sampler

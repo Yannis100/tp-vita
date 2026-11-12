@@ -1,0 +1,52 @@
+# Drive the THIRD-PARTY VPK (capitanbarbacoa's "Dusklight PSVita", DUSKGXM01) past its own prelaunch UI.
+#
+# This is the xdotool harness script (in_container_script.sh grammar: wait / tap / hold / shot), NOT the
+# frame-counted injector: the injector lives inside OUR app, and that app is not the one running here.
+#
+# WHY EVERY PRESS IS A `hold`, NOT A `tap` (measured 2026-11-11)
+# The first version of this script used 0.12 s taps. `Left` landed and moved the preset selection, but
+# the following `X` did nothing at all -- four later screenshots showed a pixel-identical modal. Their
+# build polls input once per frame, and under Vita3K's software renderer this app runs at roughly 7 fps,
+# so a frame is ~140 ms and a 120 ms tap can begin and end between two polls. tests/vita3k/README.md
+# records the same failure for our own app ("a 12 ms xdotool key tap was missed 3 times out of 3").
+# Hold for 1 s so at least several frames observe the press.
+#
+# WHAT THE SCREEN SHOWS (tests/vita3k/screenshots/theirs_prelaunch_*.png): a "WELCOME TO DUSKLIGHT" modal
+# with two choices, "Classic" and "Dusklight", with "Dusklight" preselected. Behind it: PLAY, SETTINGS,
+# MODS, QUIT. Classic is described by their own UI as "Enhancements disabled to match the GameCube
+# version. Good for speedrunning or simple nostalgia!" -- the only fair preset to compare against our
+# build, which applies no enhancements. Dusklight adds a higher-quality bloom pass, a higher-quality
+# depth-of-field pass and a projected shadow, so choosing it would compare their extra passes against our
+# plain rendering and produce a meaningless diff.
+#
+# Key map is Vita3K's default, read from cfg/config.yml, not guessed:
+#   Left -> keyboard-button-left: ArrowLeft     Cross -> keyboard-button-cross: KeyX
+#   Start -> keyboard-button-start: Enter
+#
+# The harness sleeps 20 s before the first command, so nothing here covers install/start-up.
+
+wait 25
+
+# --- preset: move the selection from Dusklight to Classic, then confirm ---------------------------
+shot prelaunch_initial
+hold Left 1
+wait 2
+shot preset_on_classic
+hold x 1
+wait 3
+shot after_preset_confirm
+
+# --- Play. If the modal is gone the cursor should be on PLAY (top of the right-hand column). -------
+hold x 1
+wait 8
+shot after_play
+wait 12
+shot after_play_wait
+
+# --- If the game is now running it shows the GC logo then the attract loop; give it time. ----------
+wait 20
+shot later_1
+wait 25
+shot later_2
+wait 25
+shot later_3

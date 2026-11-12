@@ -1,0 +1,10 @@
+# Short diagnostic: does a screenshot capture work at all against THEIR VPK, and at which point?
+# Three captures only, so a failure is attributable to a specific stage instead of to "later".
+# Precondition: config.json already carries backend.wasPresetChosen + backend.skipPreLaunchUI
+# (tests/vita3k/scripts/write_theirs_classic_config.py).
+wait 15
+shot 01_early
+wait 20
+shot 02_mid
+wait 30
+shot 03_late

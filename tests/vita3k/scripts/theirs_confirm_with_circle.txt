@@ -1,0 +1,29 @@
+# The modal *can* be confirmed -- with Circle, not Cross.
+#
+# Root cause, from source rather than guessing (2026-11-11):
+#   dusklight/src/dusk/ui/input.cpp:156-178  map_pad_button(PADButton)
+#       PAD_BUTTON_A -> Rml::Input::KI_RETURN     <- Confirm, map_nav_event ui.cpp:647
+#       PAD_BUTTON_B -> Rml::Input::KI_ESCAPE     <- Cancel
+#   and dusklight/src/dusk/ui/ui.cpp:633-659  map_nav_event() turns KI_RETURN into
+#   NavCommand::Confirm.
+# So this UI confirms on the pad's *A* button, and the preset window prints "A/B/X/Y", i.e. it is
+# using an A/B/X/Y layout where A is the south/asian "A". On Vita3K's default keyboard map that button
+# is `c` (keyboard-button-circle: KeyC). Cross (`x`) is the *east* button -> B -> Cancel, which is
+# exactly the observed behaviour: Cross never confirmed, and navigation still worked because D-pad
+# maps to KI_LEFT/RIGHT.
+#
+# WHY THIS MATTERS beyond the modal: navigating the prelaunch UI and the in-game menu to load an
+# existing save needs a working Confirm, and that is what makes a like-for-like pixel comparison with
+# our build possible at all.
+#
+# Precondition: config.json has NO backend.wasPresetChosen, so the preset modal is up.
+wait 25
+shot 01_modal_initial
+hold Left 1
+wait 2
+shot 02_on_classic
+hold c 1
+wait 3
+shot 03_after_circle
+wait 4
+shot 04_after_circle_2

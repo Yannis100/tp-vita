@@ -1,0 +1,56 @@
+# Drive THEIR build from a cold config to the SAME save our port reaches.
+#
+# Goal (HANDOVER §7.4b): our build and theirs have never been compared on the same scene, so no pixel
+# comparison has been valid. Their build reads the SAME GCI our build writes --
+# ux0:data/TwilitRealm/Dusklight/EUR/Card A/01-GZ2P-gczelda2.gci -- so loading save slot 1 on both
+# sides is the way to make the comparison like-for-like.
+#
+# CONFIRM IS CIRCLE (`c`), NOT CROSS (`x`). Source: map_pad_button() gives PAD_BUTTON_A -> KI_RETURN
+# (ui/input.cpp:171), map_nav_event() turns KI_RETURN into NavCommand::Confirm (ui/ui.cpp:647), and
+# this UI prints an "A/B/X/Y" layout. Cross is the east button = B = Cancel. Proven by run cc_.
+#
+# Precondition: config.json holds ONLY the disc path and no backend.wasPresetChosen, so the preset
+# modal is up at first frame. /tmp/theirs-config.json.bak-* holds the two-key original.
+#
+# This is a wall-clock script: the sequence is fixed, the timing is not. Every wait below is generous
+# because software GL runs this at a few frames per second, and a fixed frame number would be a lie.
+
+wait 25
+shot 01_modal
+
+# --- preset: Dusklight -> Classic, then confirm with Circle -------------------
+hold Left 1
+wait 2
+shot 02_on_classic
+hold c 1
+wait 4
+shot 03_after_preset
+
+# --- the prelaunch menu: PLAY is focused after the modal closes ---------------
+hold c 1
+wait 10
+shot 04_after_play
+
+# --- disc boot: GC logo, then the title screen --------------------------------
+wait 25
+shot 05_title_a
+wait 25
+shot 06_title_b
+
+# --- into the file select: A (Circle) on PRESS START -------------------------
+hold c 1
+wait 12
+shot 07_after_start
+wait 12
+shot 08_file_select
+
+# --- pick the first (only) save slot -----------------------------------------
+hold c 1
+wait 10
+shot 09_after_slot
+wait 20
+shot 10_loading
+wait 25
+shot 11_in_game_a
+wait 25
+shot 12_in_game_b

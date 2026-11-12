@@ -1,0 +1,66 @@
+# Continue THEIR build past the name-entry screen into gameplay, then compare with our port.
+#
+# WHERE THE PREVIOUS RUN STOPPED (sv_, measured 2026-11-11)
+# The drive reached the *name-entry* screen, not the file select: PRESS START on the title started a
+# NEW game. Frames sv_8..sv_12 were static (0.1% of pixels between them), i.e. the run sat on
+# "Enter name" with "L i n k" pre-filled and did nothing for the rest of the script.
+#
+# THE EXIT, copied from what already worked for OUR build (HANDOVER §3d.6), not guessed:
+#   d_name.cpp:395  START in PROC_MOJI_SELECT moves the ABC/abc/END cursor row to END.
+#   d_name.cpp:1211 A in PROC_MENU_SELECT with the cursor on END calls nameCheck() + menuAbtnSelect()
+#                   and ends the screen.
+# A alone *types* the highlighted letter, so the pair is required; repeating it is safe.
+#
+# THE CONFIRM BUTTON IS `c` (Circle), per map_pad_button(): PAD_BUTTON_A -> KI_RETURN -> Confirm.
+# This screen's own footer says so: "Clear (X)  Confirm (O)". START is `Return` in Vita3K's map
+# (keyboard-button-start: Enter) and is *not* a Confirm, so it is the right key for the cursor move.
+#
+# Precondition: config.json must again have NO backend.wasPresetChosen (the preset modal is up), because
+# the previous run wrote backend.wasPresetChosen=true after confirming Classic.
+wait 25
+shot 01_modal
+hold Left 1
+wait 2
+hold c 1
+wait 4
+shot 02_after_preset
+hold c 1
+wait 10
+shot 03_after_play
+wait 25
+shot 04_title
+hold c 1
+wait 12
+shot 05_name_screen
+
+# --- leave the name screen: START (cursor to END), then A/Circle (accept END) ---
+hold Return 1
+wait 3
+shot 06_after_start
+hold c 1
+wait 3
+shot 07_after_circle_a
+hold Return 1
+wait 3
+hold c 1
+wait 4
+shot 08_after_second_pair
+
+# --- the horse-name screen follows the player-name screen; same pair ----------
+hold Return 1
+wait 3
+hold c 1
+wait 4
+shot 09_after_horse
+
+# --- then the intro/cutscene; give it time and watch for real gameplay ---------
+wait 30
+shot 10_intro_a
+wait 30
+shot 11_intro_b
+wait 40
+shot 12_gameplay_a
+wait 40
+shot 13_gameplay_b
+wait 40
+shot 14_gameplay_c

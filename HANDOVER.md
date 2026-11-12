@@ -303,6 +303,12 @@ The run continued into the new-game intro ("Enter horse name" → "Epona") and "
 *new* game rather than continuing. Whether that is intended for a card never loaded in that session,
 or a defect in the load path, is not determined — the file-select screen itself was never captured.
 
+**Amended 2026-11-11 (§3d.7).** The GCI left on disk by that run has an **empty** `mPlayerName`, because
+`initdata_to_card()` clears it by design. So the second run could not have shown a continuing game from
+that file: an unnamed slot is what the file select draws as "New Quest Log". The "began a new game"
+observation therefore carries no information about the load path, and §3d.7 explains how the file select
+actually labels a slot. Reload stays untested until a save written after both name screens is loaded.
+
 ### 3d.3 Why the title screen was cut, and the rects to measure next time (2026-11-05)
 
 The reported symptom: the logo filled the frame and "PRESS START" plus the copyright line were
@@ -521,6 +527,76 @@ Do not write "the stall is fixed". Two things it did establish, both still true:
 success** — `cPhs_COMPLEATE_e`, which `cDyl_LinkASync` returns unconditionally on `TARGET_PC`, so that
 `[DIAG]` line is noise on this build.
 
+### 3d.7 Cross-build save test: the fixture is a valid, EMPTY save (2026-11-11)
+
+The test being set up was "drive capitanbarbacoa's Vita build to the save our port wrote". Its premise
+was wrong, and reading the bytes is what showed it. Recorded here so the next session does not run the
+same experiment expecting a player name on the file select.
+
+**What the run established, in order.**
+
+1. **The card is mounted, with our file.** The guest log contains
+   `[INFO | aurora::card] Loaded GC Card Image: ux0:/data/TwilitRealm/Dusklight/EUR/Card A`, and the
+   emulator log shows the guest opening
+   `ux0:/data/TwilitRealm/Dusklight/EUR/Card A/01-GZ2P-gczelda2.gci` twice. No
+   `MemoryCardA.EUR.raw` was created. The card-type fix worked.
+2. **The slot label is not a failure signal.** All three slots read `New Quest Log`. Before the
+   screenshot was read, "New Quest Log" was taken to mean the save was not found. It means the
+   opposite, and the source says so — [`dFile_info_c::setSaveData()`](../dusklight/src/d/d_file_sel_info.cpp:121):
+
+   | condition | label | return |
+   |---|---|---|
+   | checksum invalid | `This Quest Log is Corrupted` | `-1` |
+   | checksum valid, `mPlayerName[0] == 0` | `New Quest Log` | `1` |
+   | checksum valid, name set | the player's name | `0` |
+
+   `New Quest Log` therefore proves the checksums passed **and** the name field is empty.
+3. **An empty save is what the game writes at that point.** [`initdata_to_card()`](../dusklight/src/d/d_save.cpp:1918)
+   calls `save.init()` and then, explicitly and by design, `setPlayerName("")` and
+   `setHorseName("")`. The GCI was written by a run that answered "Yes" to creating the save file and
+   never completed a name entry, so an unnamed slot is the correct content.
+4. **The file is structurally valid, measured.** `tools/gci.py` reports `exit=0`:
+
+   ```
+   header: GZ2P-01 name='gczelda2' blocks=4
+   size:   32832 bytes, expected 32832 (ok)
+   status: banner=1 anim=4 iconFormat=0155 iconSpeed=0155 iconAddr=0x0 commentAddr=0x2400
+   primary @0x4000: dataVersion le=6 be=100663296 (ok)
+     sector checksum: ok (big-word/little-store)
+     slot 1: checksum valid  name='' horse='' time=0 stage='F_SP108'  displays='New Quest Log'
+     slot 2: checksum valid  name='' horse='' time=0 stage='F_SP108'  displays='New Quest Log'
+     slot 3: checksum valid  name='' horse='' time=0 stage='F_SP108'  displays='New Quest Log'
+   ```
+
+   (One `primary` sector is quoted; the `backup` at `0x6000` prints the identical six lines, and both
+   are in the file. `dataVersion be=100663296` is the same four bytes read the other way — `0x06000000`
+   — and is not a defect: `mDoMemCdRWm_Restore()` copies the int without swapping it.)
+
+   `banner=1`/`anim=4` are `CARD_STAT_BANNER_C8`/`CARD_STAT_ANIM_BOUNCE`; `iconFormat=iconSpeed=0x0155`
+   is five C8 icons then three `NONE`/`END`, which is exactly what
+   [`mDoMemCdRWm_CheckCardStat()`](../dusklight/src/m_Do/m_Do_MemCardRWmng.cpp:436) requires. So the
+   `Restore()` path is not rejecting anything.
+
+**Two endianness facts, both measured, both easy to get wrong.**
+
+- `mDoMemCdRWm_CalcCheckSum()` declares `u16 high, low`, so each accumulator wraps at 65536 before the
+  `high << 16 | low` pack. Widening them to `u32` changes the result and reports a valid file as broken.
+- `BE(u16)` is a no-op byte type on a little-endian host ([`endian.h:352`](../dusklight/include/helpers/endian.h:352)),
+  so the sector checksum reads **big-endian words** but stores the `u32` result in **host byte order**.
+  The file matches `big-word/little-store` and nothing else. Conflating those two axes produced two
+  false "MISMATCH" reports before the pair was separated.
+
+**What this changes about §3d.2's open question.** §3d.2 says a second run "began a *new* game rather
+than continuing" and calls save RELOAD untested. Loading this GCI cannot demonstrate a reload: the slot
+it produces is indistinguishable from an empty one, because it *is* an empty save. A reload test needs a
+save with a non-empty `mPlayerName` — i.e. one written after both name screens complete. Until then
+"save reload" stays untested, and a file-select screenshot showing `New Quest Log` is not evidence
+either way.
+
+**The fixture to build next.** Complete the player- and horse-name screens, then copy the resulting GCI
+out and check it with `tools/gci.py`; a slot that reports `name='Link'` is the precondition for the
+cross-build test to mean anything.
+
 ---
 
 ## 4. What was done in the first sessions
@@ -670,7 +746,7 @@ Each suite has its own `run.sh`; run them from `tp-vita/` with `VITASDK` set.
 | texture | `./tests/host/texture/run.sh` | 3,780 checks, **0 failures** (negative control still detected) |
 | disc | `./tests/host/disc/run.sh` | 14 + 10,686 checks, **0 failures** |
 | crash | `./tests/host/crash/run.sh` | 19 assertions against the real generated table |
-| printf | `./tests/host/check_printf_formats.sh` | clean — no `%z`/`%j`/`%t`/`%hh` in `vita/` |
+| printf | `./tests/host/check_printf_formats.sh` | clean — no `%z`/`%j`/`%t`/`%hh` in **code** under `vita/` (comments excluded; see §6.1) |
 | e2e | `./tests/host/e2e/run.sh` | **91 scenes, 14,266 pixel checks, 0 failed**; `TPV_E2E_ASAN=1` for AddressSanitizer |
 
 The shader suite **reports** configs exceeding Vita uniform limits; that is its purpose, not a failure.
@@ -679,6 +755,27 @@ Current maxima: `fsVec4=26`, `vsVec4=153`, `maxAttribs=19`; over the caps: 93 co
 
 Do not hand-build a link line for a suite: each `run.sh` already does it with its own stubs. That
 detour was wasted once already.
+
+### 6.1 The printf guard was failing on its own documentation (2026-11-12)
+
+`check_printf_formats.sh` grepped `vita/` for `%[-+ #0-9.*]*(z|j|t|hh)[diouxX]` and **matched a comment**
+in `vita/src/input_script.cpp:351` that documents the `%zu` lesson — the note explaining why the guard
+exists. So the suite was red while §6 called it clean, and the failure was indistinguishable from a real
+violation in a summary line.
+
+Fixed by stripping comments before matching: line comments, trailing comments and multi-line block
+comments. String literals are deliberately **not** stripped, because a `"%zu"` inside a string is exactly
+what the guard is for.
+
+**Both directions proven.**
+- Real violations still caught, including one on the same line as a preceding block comment:
+  `int x = 1; /* "%zu is fine here" */ log.line("%jd", v);` → exit 1.
+- Comments and strings that merely mention `%zu` / `%td` → exit 0.
+- The real tree: exit 0, with no comment-only noise.
+
+The rule this is an instance of: **a check that cannot pass is a check that will be deleted.** Before
+trusting a red or green suite line, run it and look at what it actually matched — §6's "clean" was a
+claim, not an observation.
 
 ---
 
@@ -724,6 +821,18 @@ while the observed value has `& 0x1F == 0x1F`. As IEEE-754, `0xBF18265F` ≈ -0.
 32-aligned, so it does not come from a 32-aligned calculator. The failure path still records
 `caller=%p` in `exp_trace`. **Next step:** with 24 MiB more arena, watch whether the rate changes; if it
 recurs, symbolise `caller=%p` with `arm-vita-eabi-addr2line -e build/tpv_vita`.
+
+**Update 2026-11-12 (§7.12b) — it recurs, and now reproducibly.** Two consecutive idle runs on
+`build/tpv_vita-release.vpk` (dated 2026-11-11 11:56) aborted with
+`JKRExpHeap.cpp:281 Aborting due to allocation failure!`, `crash.log` naming
+`borealis::log::detail::write_fatal`. The guest log breaks off mid-line while the attract loop streams
+`demo38_wl_cut01_gp_1_o.bck` / `_l.bck` / `demo38_wl_cut00_gp_1_o.bmd`, so the failing allocation is in
+that resource load, not in `mDoMch_Create`. **2 of 2 is not a rate**, but it contradicts "one run in
+seven … retired", so treat the failure as live. The specific `0xBF18265F` value was **not** observed in
+these two runs — `JKRExpHeap.cpp:281` does not log the size — so the corruption arithmetic above is
+still untested against these cases. **The next step is the same one §7.1 already named**, and it is now
+cheaper: make `JKRExpHeap.cpp:281` print the requested size, alignment, heap name and free bytes, then
+read them from `fatal.txt`.
 
 ### 7.2 BMD loader invalid reads — ROOT-CAUSED AND FIXED (2026-11-02)
 
@@ -1016,12 +1125,75 @@ upstream's shader fixes never reach us. It is also the honest answer to "should 
 Theirs gets upstream fixes for free; ours avoids a WGSL→GXM translation layer on a Cortex-A9. Neither is
 obviously right, and this is not evidence to switch.
 
-**Their screenshots are NOT a valid pixel reference, and this is the trap.** The frames are live, but they
-show a **different scene at a different time of day** (their prelaunch backdrop vs our in-game dialogue
-and field). Comparing region luminance would be meaningless, and this project has published wrong
-conclusions twice by comparing unlike things (§7.8). Using their build as a reference needs **both** ports
-driven to the *same* scene, camera and frame — possible with their preset/Play UI, not done here. Until
-then, treat their frames as proof that a correct picture is reachable on this GPU.
+**Their screenshots are NOT yet a valid pixel reference, and this is the trap.** The first frames we took
+weren't a valid reference either: they showed **a different scene at a different time of day** (their
+prelaunch backdrop vs our in-game dialogue and field). Comparing region luminance would be meaningless,
+and this project has published wrong conclusions twice by comparing unlike things (§7.8). Using their
+build as a reference needs **both** ports driven to the *same* scene, camera and frame. Until then, treat
+their frames as proof that a correct picture is reachable on this GPU.
+
+#### 7.4b.1 Their UI confirms on Circle, not Cross — and the config is the other lever (2026-11-11)
+
+**The modal is clickable. The prior session pressed the wrong button.** Cross (`x`) never confirmed it —
+measured twice, with a 0.12 s tap and a 1 s hold, four later screenshots pixel-identical — but that is
+not a Vita3K defect and not a timing problem: **this UI confirms on the pad's `A` button, which on Vita
+is Circle (`c`)**. The mechanism, read from source:
+
+- `dusklight/src/dusk/ui/input.cpp:156-178` `map_pad_button()`: `PAD_BUTTON_A -> KI_RETURN`,
+  `PAD_BUTTON_B -> KI_ESCAPE`.
+- `dusklight/src/dusk/ui/ui.cpp:633-659` `map_nav_event()`: `KI_RETURN -> NavCommand::Confirm`,
+  `KI_ESCAPE -> NavCommand::Cancel`.
+- So the *east* face button (Cross) is `B` = Cancel, and the *south* button (Circle) is `A` = Confirm.
+  The preset window prints "A/B/X/Y" and its Play/Settings/Mods/Quit column behaves the same way.
+- Navigation always worked because the D-pad maps to `KI_LEFT/RIGHT`, which is why `hold Left` moved the
+  selection and made the earlier session suspect timing.
+
+**Proven by run** (`cc_` prefix, 2026-11-11): `hold Left 1` → Classic highlighted gold border;
+`hold c 1` → the modal closes and PLAY takes the focus highlight, over the live disc scene. A previous
+attempt with `hold Return 1` did **not** confirm either — Vita3K translates a host Return into the pad's
+Start, not into a `KI_RETURN` keydown, so the host key that works is `c`.
+
+**Why this matters beyond the modal:** loading an existing save from their in-game menu needs a working
+Confirm, and that is the gate on the like-for-like comparison in §7.4b.2.
+
+**The other lever is `config.json`, and it is exact rather than a guess.** Their build serialises every
+registered `ConfigVar` to a flat JSON object (`dusk/config.cpp:538-567`), and the preset modal's Confirm
+handler is `PresetWindow` (`dusk/ui/preset.cpp:102-112`): it calls `applyPresetClassic()` and then
+`backend.wasPresetChosen = true; config::save();`. Writing those same keys therefore produces the same
+state as clicking the button:
+
+- `tests/vita3k/scripts/write_theirs_classic_config.py` writes a transcription of `applyPresetClassic()`
+  (`preset.cpp:13-26`: `bloomMode`/`depthOfFieldMode` = `Classic` = 1, `internalResolutionScale` and
+  `shadowResolutionMultiplier` = 1, `menuScalingMode` = `GameCube` = 0, toasts off, `enableMenuPointer`
+  false, `lockAspectRatio` true), plus `backend.wasPresetChosen: true` and optionally
+  `backend.skipPreLaunchUI: true`.
+- `AuroraSetViewportPolicy(AURORA_VIEWPORT_FIT)` is the one line of `applyPresetClassic()` that is not a
+  config var. It requests the viewport our port already uses, which is consistent with the measurement
+  below.
+- Their config lived at `ux0:data/TwilitRealm/Dusklight/config.json`, i.e. the **same data directory our
+  port uses**, and it already pointed `backend.isoPath` at `ux0:data/tpvita/GZ2P01.iso`. Their card
+  setting `backend.cardFileType: 0` is `CARD_GCIFOLDER`, so both builds read the same
+  `EUR/Card A/01-GZ2P-gczelda2.gci`.
+
+**With that config their build boots straight into gameplay.** `d1_` run, three captures, no key presses:
+
+| shot | distinct colours | bbox | mean | diff vs previous |
+|---|---|---|---|---|
+| `d1_1_01_early` | 46,660 | `(270,128)-(1007,671)` | 24.4 | — |
+| `d1_2_02_mid` | 68,704 | `(270,128)-(1007,671)` | 43.9 | 39.1% of pixels |
+| `d1_3_03_late` | 44,915 | `(270,128)-(1007,671)` | 42.8 | 37.3% of pixels |
+
+The frames show the Hyrule Castle courtyard/gate cutscene with Epona and the sunset castle — live 3D, not a
+menu. **Their bbox is `(270,128)-(1007,671)`, exactly one pixel left of ours `(271,128)-(1008,671)`.** The
+width matches (738 columns either way); only the x origin differs. That is a measured agreement between
+the two independent viewport implementations and worth knowing before any pixel diff: a naive
+pixel-to-pixel comparison would be off by one column.
+
+**A harness bug hid this for one run, and it is fixed.** `in_container_script.sh` called
+`import ... 2>/dev/null || true`, so a failed capture left no file, no message and no non-zero status. The
+first `s1_` run produced **one** file out of eight shots and reported success. The capture now prints a
+warning with `import`'s own error and flags empty files. Anything that reasons from a screenshot count must
+still check the file exists — see §7.8.
 
 What it establishes:
 
@@ -1348,6 +1520,229 @@ dropped is visible in a row count), use a source that carries the field you are 
 the tool state its own reliability. Only the third was in the original design, and a bug one layer down
 defeated it.
 
+### 7.12 Three-port frame comparison: the pixel diff is not yet possible, and the number that would be quoted is meaningless (2026-11-12)
+
+**Status (amended by §7.12c, 2026-11-12): a same-scene pair WAS produced — the file select, reached by
+our build and measured against `sf_5_05_file_select.png` — and the two layouts agree to about one pixel.
+Our half survives in `tests/vita3k/screenshots/ours_file_select_20261112.png`; the third port's half was
+lost with its work directory, and three attempts to re-capture it did not reproduce the screen, so the
+pair is **not currently re-measurable**. Relative *rendering quality* is still not established, and could
+not be established from that pair even when both halves existed: the captures differ by an animated
+cursor and by the pad's glyphs, which is by design. Everything below about why the earlier attempt failed
+is kept because the failure mode is instructive.**
+
+Three TP→Vita ports are relevant:
+
+| port | code | runnable here | frames available |
+|---|---|---|---|
+| ours (`tp-vita`) | yes | yes (`build/tpv_vita-release.vpk`) | yes, new ones captured today |
+| capitanbarbacoa "Dusklight PSVita" | **no** (itch.io, closed) | yes (`Dusklight-1-1-0.vpk`) | yes (`nm_`, `sf_`) |
+| DuskOnVita (`NathanKneT`) | yes | **no** — GitHub publishes **no release and no VPK**; needs a full VitaSDK source build | **none on this machine** |
+
+So a three-way image comparison cannot be produced today. Two of three can be run; the third cannot be
+run at all without building it.
+
+**The measurement that matters, and the trap it avoids.** Diffing frames from different scenes gives a
+number that looks like evidence and is not. Measured, on the 738x544 content region:
+
+```
+ours(r1488_gameplay_ordon) vs theirs(nm_12_gameplay_a) : 90.9% of pixels differ
+theirs(nm_12_gameplay_a)   vs theirs(nm_14_gameplay_c) : 21.0% of pixels differ   <- same run
+```
+
+90% is the scene change, not the renderer. A fingerprint correlation over all available captures
+confirms it: **every cross-port pair is below 0.5**, while known same-scene pairs score 0.88–1.00.
+There is no ours↔theirs pair showing the same screen anywhere in the archive.
+
+**Why the screens do not line up, concretely.** The two builds' scripts produce different screens and
+their shot labels are unreliable:
+
+- `nm_4_04_title.png` is **not** a title screen — it is the file select. `nm_3_03_after_play.png` is
+  the file select too. Reading a filename as evidence is the §7.8 trap again.
+- Our idle run **did** reach the true title once (`PRESS START`, `©2006 Nintendo`, logo uncropped over
+  the attract backdrop). That frame was not kept and **the capture is no longer reproducible** — see the
+  crash note below. Their archive has no title capture to compare it to either.
+- Pressing START in **our** build via the host harness does not advance the title (`Return` and `c`
+  both left the frame unchanged across 10–12 s waits), so the file select is not reachable that way.
+  The frame-counted injector does work (`input_script.log` ran to frame 2,860) but its save-reload
+  script lands in gameplay, not on the file select.
+
+**Geometry is NOT the blocker, and that was checked.** Both ports letterbox to the **same 738 px
+width** at the same x on the 960x544 surface, so a same-scene diff would be legitimate. DuskOnVita is
+the one that differs — its own test pins `viewport(118,0,724,544)` against our `(111,0,738,544)` — but
+its frames cannot be captured here anyway. `tools/compare_port_frames.py` handles this by comparing only
+the overlap and reporting the geometry separately, so a viewport difference is never smeared into an
+image-error percentage.
+
+**Tooling added so the next attempt does not redo this.**
+
+- `tools/compare_port_frames.py` refuses a pair whose fingerprint correlation is below `--min-correlation`
+  (default 0.85) and prints no diff at all. A refusal is the correct result for a different-scene pair.
+  Controls verified: different scenes → refused (exit 1); same scene → measured (exit 0, 30.7%);
+  identical file → 0.0%; a real same-screen UI pair (`sf_5` vs `nm_4_04`) → measured (r=0.977, 8.8%,
+  the residual being the animated slot highlight). `--port-status` prints the table above so a report
+  never implies a three-way comparison that did not happen.
+- Our captures from today, all `738x544` and healthy (8k–85k colours):
+  `our_1..6` (idle/attract, title at `our_5`), and the injector-driven gameplay frames.
+
+**The one experiment that would settle relative rendering**, in order of cost: (1) drive **our** build
+to the file select — the static UI both runnable ports provably render — and diff it against
+`sf_5_05_file_select.png`; the injector must be given a script that reaches the file select instead of
+loading a save. (2) Build DuskOnVita from source to obtain its frames. Until one of those exists, no
+claim about which port renders better is supportable.
+
+**Two separate startup faults found while doing this. Both are ours, not the renderer's.**
+
+**(a) A `remove_all` that never returns.** A first idle run never got past the vitaGL splash in 90 s.
+Cause: `ux0:data/TwilitRealm/Dusklight/mods/.cache/dev.twilitrealm.luau` existed as a **directory**, and
+the emulator log showed an unbroken `remove_file ... Error code: 39 (Directory not empty)` loop.
+[`loader.cpp:363`](../dusklight/src/dusk/mods/loader/loader.cpp:363) calls
+`fs::remove_all(m_cacheDir, ec)` **once**, so `remove_all` itself is looping on Vita/Vita3K instead of
+returning the error in `ec`. Removing that directory let the app boot and render normally. Not diagnosed
+further, and **not** the blank-frame symptom: only short runs (≤90 s) then produced the documented
+263-byte blanks.
+
+**(b) A reproducible `JKRExpHeap` allocation abort at the attract loop — new evidence for §7.1.**
+Two consecutive idle runs aborted with `Trace/breakpoint trap (core dumped)`, and the recorders named it:
+
+```
+fatal.txt : [/home/yanserm1/psvita/dusklight/libs/JSystem/src/JKernel/JKRExpHeap.cpp:281]
+            Aborting due to allocation failure!
+crash.log : abort_caller=0x81c81b0d  borealis::log::detail::write_fatal(...)
+```
+
+`fatal.txt` and `crash.log` are both fresh, and `symbols: table matches this build`. The guest log stops
+mid-write — the last line is a truncated `Loading Resource: demo38_wl_cut00_gp_1_o.bmd (` — so the
+allocation failure happens while the attract loop streams demo resources
+(`demo38_wl_cut01_gp_1_o.bck`, `_l.bck`, then that `.bmd`).
+
+What this changes about §7.1: the `0xBF18265F` corruption was recorded there as "the allocation is still
+unexplained" and the rate as "one run in seven … 14 consecutive release runs produced no fatal". Here it
+is **2 out of 2** on the current release VPK, at the title/attract stage. That is not a rate estimate
+(n=2), but it is the first time this failure has been **reproduced on demand with a named caller** rather
+than inferred, and it contradicts "retired". The earlier "14 clean runs" were idle runs too, so the
+difference is likely tree state rather than scenario — `build/tpv_vita-release.vpk` is dated 2026-11-11
+11:56, newer than those runs. Next step is §7.1's own: symbolise the allocation site and print the
+failing size and heap figures, which `JKRExpHeap.cpp:281` does not currently log.
+
+**One earlier capture of the title does exist from before these crashes** and shows the logo, `PRESS
+START` and `©2006 Nintendo` over the attract backdrop at `738x544`. It was transient and is not in the
+archive; re-capturing it is blocked until (b) is understood. Do not claim a title screen from this build
+until then.
+
+### 7.12c The file select WAS reached, and it is a valid same-screen pair with the third port (2026-11-12)
+
+**Status: §7.12's central blocker is closed.** Both runnable ports have now been photographed on the
+same screen — the file select — and the pair is geometrically the same screen, verified by
+measurement, not by filenames.
+
+**How the screen was finally reached.** §7.12 recorded it as "transient, missed by a coarse sampler".
+Both halves of that were true and the fix was two changes, not one:
+
+1. **The sampler was photographing a hole.** Run `fs_` had 19 screenshots and still missed the screen.
+   Its mtimes say why: the last live-3D frame was at 16 s, the first menu frame at 25 s, and the
+   transition sat in that 9-second gap with no screenshot in it. A coarse sampler does not merely miss
+   a screen, it reports "the game never showed it". `waits_file_select.txt` now samples every 3 s
+   through the whole boot -> title -> file select window.
+2. **The press count was wrong in both directions.** A SINGLE START at frame 300 did nothing at all
+   (attempt 2: 21 shots, every one the live attract loop, injector log confirming the step was
+   applied). The reason is visible in attempt 2's samples: frames at 20 s, 23 s and 26 s were **blank**
+   (263-byte, `mode=1`). Frame 300 lands inside the blank boot -> title transition and is discarded.
+   Three presses starting after that window (frames 390, 570, 750) do get through — that is what
+   attempt 1's three presses did — and the run then landed on the **file select** at `fs3_16`.
+
+   **The lesson:** "press N times" and "press once" are both guesses about a state machine; only the
+   blank-frame timestamps say when the title actually exists. Keep the blank frames in the record,
+   they are the timing evidence.
+
+**The captured screen.** `tests/vita3k/screenshots/ours_file_select_20261112.png`
+(from `fs3_16_p_74s`): "Choose a Quest Log", three slots all reading `New Quest Log`, the selection
+frame on slot 1, and the `B` / `Confirm A` bar — the GameCube prompt glyphs, on the parchment board.
+
+> **The reference frame has since been lost, and re-capturing it did NOT succeed (2026-11-12).** Our
+> capture survives (it was copied into `tests/vita3k/screenshots/`), but `sf_5_05_file_select.png` lived
+> only in `/home/yanserm1/psvita/tooling/vita3k-work/out/`, a transient emulator work directory that was
+> reset by a later run. Three re-capture attempts were then made and **none reproduced the screen**:
+>
+> | attempt | their config | result |
+> |---|---|---|
+> | `th_` | `skipPreLaunchUI:true`, `cardFileType:1` | 8 shots, all live 3D — no menu |
+> | `th2_` | same, `cardFileType:0` (GCIFOLDER) | 8 shots, all live 3D — no menu |
+> | `th3_` | 11-Nov 89-byte config (no `wasPresetChosen`) + `hold c` | reached the **prelaunch PLAY screen**, then 736x544 UI frames — not the file select |
+>
+> The reason the first two could not work is now read from source, and it is worth keeping:
+> **`m_Do_main.cpp:914` puts the whole prelaunch/file-select flow behind `if (!dvd_opened)`**, and this
+> harness passes `--dvd` for OUR build, so `dvd_opened` is true and the block is skipped entirely. Their
+> build therefore boots straight into the game whenever a save is on the card — which is exactly
+> `th_`/`th2_`. The `th3_` run did reach the UI, but the surface came back **736 px wide** (the prelaunch
+> UI resizes it) and the frames show the PLAY screen, not the save-slot list.
+>
+> So the measurement below stands on the capture that was taken while the file existed, and it is
+> recorded in full so it can be checked; **it is not currently reproducible.** To retry, the productive
+> next step is to copy `sf_5_05_file_select.png` out of the archive the moment it exists, and to reach
+> the screen the same way the original session did — the `sf_` prefix implies `theirs_skip_prelaunch.txt`
+> with a save-free card, not a Circle press. **Rule: a frame cited as evidence must be copied into
+> `tests/vita3k/screenshots/` in the same session it is captured.** §7.12's own "capture is no longer
+> reproducible" note is the same failure, one month earlier.
+
+**Same screen as `sf_5_05_file_select.png`, measured.** Comparison of the centre-column dark-run
+structure, which is where a menu's layout lives:
+
+| element (centre y) | ours | theirs | offset | height ours/theirs |
+|---|---:|---:|---:|---:|
+| slot 1 row | 189.5 | 191.0 | −1.5 | 30 / 29 |
+| slot-1 lower bevel | 264.5 | 266.0 | −1.5 | 36 / 35 |
+| slot 2 top | 306.0 | 306.5 | −0.5 | 29 / 28 |
+| slot 2 row | 381.5 | 382.5 | −1.0 | 36 / 36 |
+| slot 3 top | 421.5 | 422.5 | −1.0 | 28 / 28 |
+| Confirm bar | 529.0 | 530.0 | −1.0 | 29 / 27 |
+
+**Six of seven structural elements match at −1.5 … −0.5 px with height ratios 1.00–1.07.** Each image
+has exactly one unmatched 20-px element, and they are 398 px apart from the slot-1 row — the animated
+selection highlight, on a different slot in each capture. Identical layout, one moving cursor.
+
+**Do not quote a pixel-difference percentage for this pair.** Measured, it is meaningless:
+59.8 % at the best alignment, 63.9 % after a scale search. That is not a rendering defect. It is one
+animated highlighted row plus sub-pixel text edges: on a 2D screen of ~50k colours, a 1-px offset
+re-lights most glyph edges and the comparison counts each as an error. The structural measurement
+above is the evidence; the percentage is not.
+
+**The detector was wrong, and it was not "fixed" by loosening it.** `compare_port_frames.py` refused
+this pair at correlation +0.538 against its 0.85 bar. Lowering the bar would have been wrong, and the
+numbers say why:
+
+```
+verified SAME screen  ours(file select) vs sf_5_05(file select)   +0.538
+verified SAME screen  ours(name screen) vs nm_5(name screen)      +0.372  (nm_5 not even top-4)
+KNOWN DIFFERENT       ours(attract loop) vs sf_5_05(file select)  +0.533
+```
+
+A same-screen pair at 0.538 and a different-scene pair at 0.533 means **no threshold separates them**.
+The 32x32 global luminance fingerprint is dominated by the shared parchment board and the letterbox
+edges, so every 2D menu in this game fingerprints alike. Gradient, high-pass, row-profile and
+bright-fraction fingerprints were each tried and each ranked a *title screen* above the true file
+select; none was shipped. Instead the tool keeps its strict bar and gains an explicit escape hatch:
+
+```sh
+tools/compare_port_frames.py ours.png theirs.png \
+  --assert-same-screen "Choose a Quest Log board, slots 1/2/3 all New Quest Log"
+```
+
+The reason is required, echoed into the output and into `--json` as `asserted_same_screen`, and the
+result is labelled `scene identity asserted` — the pixels are computed, the identity is the operator's
+claim. A refusal without the flag is unchanged (exit 1), so the guard still catches the accident it was
+built for.
+
+**What this does and does not establish.**
+
+- **Established:** both ports render this screen, and their menu layouts agree to about one pixel.
+  That is the geometry half of §7.12's open question, and it needed no renderer change.
+- **NOT established:** which port renders *better*. The pair differs in the animated highlight and in
+  the button glyphs, which is by design, so there is no like-for-like pixel claim to make here. The
+  §7.4b fixes (min-filter table, light normalisation) still have no pixel evidence attached.
+- **Still missing:** DuskOnVita's frames. It publishes no VPK, so the three-way comparison remains two
+  ports until it is built from source.
+
 ---
 
 ## 8. Traps and gotchas
@@ -1399,6 +1794,20 @@ defeated it.
 18. **Validate an instrument against a known-good input before pointing it at a foreign file.** The
     "encrypted eboot" claim (§7.4b) cost two wrong conclusions; comparing against our own eboot was one
     command.
+19. **At most 10 images may be in one model prompt.** Reading 11 or more PNGs in a single turn makes the
+    whole request fail with HTTP 400 `At most 10 image(s) may be provided in one prompt` and the session
+    must be resumed, losing the turn. This killed two sessions (2026-11-11, 2026-11-12). Read screenshots
+    in batches of **10 or fewer per turn**, and prefer the numeric decode in §3 — it needs no images at
+    all, so a frame can be measured without spending any of the budget.
+20. **Blank frames are timing evidence, not failures.** A 263-byte `mode=1` capture means the surface
+    had not been presented yet. Three blank shots at 20 s / 23 s / 26 s are what proved that a START
+    injected at frame 300 lands inside the boot -> title transition and is discarded (§7.12c), which is
+    why a single press did nothing while three presses worked. Keep them in the record.
+21. **Never tune a detector until it agrees with you.** `compare_port_frames.py` refused a verified
+    same-screen pair at 0.538 while scoring a known-different pair 0.533 (§7.12c). Lowering the
+    threshold would have admitted both. The honest move is to keep the strict guard and add an
+    explicitly-labelled operator assertion — and to state in the report which half of the result is
+    computed and which half is a human claim.
 
 ---
 

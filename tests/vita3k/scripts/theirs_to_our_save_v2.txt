@@ -1,0 +1,68 @@
+# Drive THEIR build to the save OUR port writes, now that the card format is fixed.
+#
+# RESULT OF RUNNING THIS (2026-11-11, "sf_" frames). The card path fix WORKED and the premise
+# of the test was WRONG. Do not read this script as "the save is missing" if the slots say
+# "New Quest Log".
+#
+#   - `aurora::card` logged `Loaded GC Card Image: .../EUR/Card A`, and the guest opened
+#     `EUR/Card A/01-GZ2P-gczelda2.gci` twice. No `.raw` card was created.
+#   - All three slots read "New Quest Log", which per dFile_info_c::setSaveData()
+#     (dusklight/src/d/d_file_sel_info.cpp:121) means checksum VALID + EMPTY player name.
+#     A corrupt save would read "This Quest Log is Corrupted" instead.
+#   - `tools/gci.py` confirms it: exit 0, every quest-log checksum valid, every
+#     `mPlayerName` empty. initdata_to_card() writes an empty name by design.
+#
+# So this GCI cannot demonstrate a save reload: it is a valid but unnamed save, and an
+# unnamed save is what an empty slot looks like. A reload test needs a save written AFTER
+# the player- and horse-name screens complete; check it with `tools/gci.py` first and
+# require `name='Link'` before drawing any conclusion from the file select.
+#
+# THE BUG THIS FIXES (found 2026-11-11, "nm_" run)
+# Their build reached gameplay but started a NEW game, and it had written
+# ux0:data/TwilitRealm/Dusklight/MemoryCardA.EUR.raw (16 MiB) instead of reading our
+# ux0:data/TwilitRealm/Dusklight/EUR/Card A/01-GZ2P-gczelda2.gci. Cause, from source:
+#     extern/aurora/include/dolphin/card.h:19-22
+#         typedef enum { CARD_RAWIMAGE, CARD_GCIFOLDER } CARDFileType;   // RAWIMAGE = 0, GCIFOLDER = 1
+#     src/m_Do/m_Do_MemCard.cpp:84
+#         CARDSetLoadType((CARDFileType)dusk::getSettings().backend.cardFileType.getValue());
+# The config key `backend.cardFileType` was ABSENT from their config.json, so getValue() returned 0,
+# i.e. CARD_RAWIMAGE -- even though settings.cpp:187 declares the default as CARD_GCIFOLDER, because a
+# missing key falls back to the integer zero, not to the declared default.
+# tests/vita3k/scripts/write_theirs_classic_config.py now writes backend.cardFileType = 1 explicitly.
+#
+# Confirm is Circle (`c`). See theirs_confirm_with_circle.txt for the proof.
+#
+# Precondition: run write_theirs_classic_config.py WITHOUT --skip-prelaunch is NOT what we want here;
+# we want wasPresetChosen=true (no modal) but skipPreLaunchUI absent (so PLAY still exists):
+#     python3 tests/vita3k/scripts/write_theirs_classic_config.py \
+#         "<work>/home/.local/share/Vita3K/Vita3K/ux0/data/TwilitRealm/Dusklight/config.json"
+wait 30
+shot 01_prelaunch
+
+# --- PLAY (focused by default) ------------------------------------------------
+hold c 1
+wait 12
+shot 02_after_play
+
+# --- title, then PRESS START ---------------------------------------------------
+wait 30
+shot 03_title
+hold c 1
+wait 12
+shot 04_after_start
+
+# --- file select. Expect "New Quest Log" on all three slots: the fixture is a valid,
+# --- unnamed save. "This Quest Log is Corrupted" would be the failure signal.
+wait 6
+shot 05_file_select
+hold c 1
+wait 10
+shot 06_after_slot_confirm
+wait 20
+shot 07_loading
+wait 25
+shot 08_in_game_a
+wait 25
+shot 09_in_game_b
+wait 30
+shot 10_in_game_c

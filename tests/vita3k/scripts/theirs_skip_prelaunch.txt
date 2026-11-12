@@ -1,0 +1,33 @@
+# THEIR build (capitanbarbacoa "Dusklight PSVita", DUSKGXM01), unattended.
+#
+# Load-bearing precondition: ux0:data/TwilitRealm/Dusklight/config.json must already hold
+#   backend.wasPresetChosen=true   (no preset modal, m_Do_main.cpp:1036)
+#   backend.skipPreLaunchUI=true   (no PLAY button, m_Do_main.cpp:1010-1020)
+#   plus the Classic preset values. Write it with
+#   tests/vita3k/scripts/write_theirs_classic_config.py.
+# Without that file this script cannot leave the modal: measured 2026-11-11, `hold x 1` left the
+# preset dialog pixel-identical across two runs, so the modal is driven by config here, not by keys.
+#
+# NO KEY PRESSES, deliberately. Every press is wall-clock in this harness and the emulator's speed
+# varies between runs, so a press is a source of noise. With the config above the app boots into the
+# game by itself; the job of this file is only to wait and look.
+#
+# Timings are generous on purpose: this runs under software GL at a few frames per second, and
+# HANDOVER §3 records that the first seconds of any Vita3K run are blank frames.
+
+wait 30
+shot 01_boot_30s
+wait 30
+shot 02_60s
+wait 30
+shot 03_90s
+wait 60
+shot 04_150s
+wait 60
+shot 05_210s
+wait 60
+shot 06_270s
+wait 90
+shot 07_360s
+wait 120
+shot 08_480s

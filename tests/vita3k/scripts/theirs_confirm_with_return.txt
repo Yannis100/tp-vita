@@ -1,0 +1,20 @@
+# Test the actual cause of the "modal cannot be clicked" finding.
+#
+# `map_nav_event` (dusklight/src/dusk/ui/ui.cpp:633-659) maps Confirm from RmlUi's
+# KI_RETURN / KI_NUMPADENTER, NOT from a pad Cross button. Navigation works because KI_LEFT/UP/etc.
+# are mapped. So pressing Cross (Vita3K `x`) can never confirm this UI, but Enter should.
+# Vita3K's default keyboard map has keyboard-button-start: Enter (cfg/config.yml), so `Return` here
+# is the same key that reaches their UI as KI_RETURN.
+#
+# Precondition: config.json has NO backend.wasPresetChosen, i.e. the preset modal is up.
+# Restore it with /tmp/theirs-config.json.bak-* or the two-key original.
+wait 25
+shot 01_modal_initial
+hold Left 1
+wait 2
+shot 02_on_classic
+hold Return 1
+wait 3
+shot 03_after_return
+wait 4
+shot 04_after_return_2

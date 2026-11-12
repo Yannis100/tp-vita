@@ -1,0 +1,78 @@
+# Harness script for the frame-counted file-select run: waits and screenshots only.
+#
+# Used with frame_file_select.txt installed as ux0:data/tpvita/input_script.txt. No host key
+# presses, because with the injector active a wall-clock key press is noise that can change
+# the result (HANDOVER 3d.5).
+#
+# ---------------------------------------------------------------------------------------
+# WHERE THE SCREEN ACTUALLY WAS, MEASURED (2026-11-12, second attempt)
+#
+# The previous run had 19 screenshots and still missed the file select. The mtimes say why:
+#
+#   11:31:37  fs_1  boot                              224 KB
+#   11:31:45  fs_2  attract loop, live 3D             575 KB
+#   11:31:53  fs_3  attract loop, live 3D             573 KB
+#   11:32:02  fs_4  NAME SCREEN, static 2D            508 KB
+#   ...       fs_5..fs_19  byte-identical name screen 508 KB
+#
+# So the LAST 3D frame is at 16 s and the first menu frame is at 25 s, and the file select -
+# which is a frame count apart from both - sits in that 9-second hole with NO screenshot in
+# it. A coarse sampler does not just miss the screen, it reports "the game never showed it".
+#
+# Two changes follow from that:
+#   1. After the single START the sampling is 3 s apart, not 8-12 s, for the whole window in
+#      which the transition can occur.
+#   2. A file-select screen STAYS UP once reached (input_script.txt presses nothing after
+#      its one START), so the later samples are also allowed to catch it - they are not
+#      redundant, they are the cheap half of the evidence.
+#
+# File size is the first-pass classifier, before any image is opened:
+#   ~224 KB  boot/splash       (few colours)
+#   ~575 KB  live 3D           (high entropy - attract loop, cutscene, gameplay)
+#   ~508 KB  static 2D menu    (name screen, and a file select should look like this)
+# The numeric decode in HANDOVER 3 then separates a menu from a 3D scene properly.
+#
+# Screenshots land in $TPV_V3K_WORK/out/<prefix>N_<name>.png.
+# ---------------------------------------------------------------------------------------
+wait 20
+shot a_20s
+wait 3
+shot b_23s
+wait 3
+shot c_26s
+wait 3
+shot d_29s
+wait 3
+shot e_32s
+wait 3
+shot f_35s
+wait 3
+shot g_38s
+wait 3
+shot h_41s
+wait 3
+shot i_44s
+wait 3
+shot j_47s
+wait 3
+shot k_50s
+wait 4
+shot l_54s
+wait 4
+shot m_58s
+wait 5
+shot n_63s
+wait 5
+shot o_68s
+wait 6
+shot p_74s
+wait 8
+shot q_82s
+wait 10
+shot r_92s
+wait 12
+shot s_104s
+wait 15
+shot t_119s
+wait 15
+shot u_134s
