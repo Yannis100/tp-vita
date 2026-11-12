@@ -1852,6 +1852,53 @@ none of the levers that got it there exist here.
 transfer from a different codebase. The 151.94 ms/frame figure in §7.6 is a Vita3K number and says
 nothing about a Cortex-A9.
 
+#### 7.13.1 What "G2" means, and a contradiction in their own docs (2026-11-12)
+
+**"G2" is not a switch.** It is the **third build stage of the GXM backend**, and their
+`docs/ARCHITECTURE.md` names the three stages explicitly:
+
+| stage | what it added |
+|---|---|
+| **G0** | the backend table and the per-frame draw digest — the interface, no drawing |
+| **G1** | the backend itself on SceGxm: display buffers, CDRAM texture pool, uncached vertex ring, shader patcher, GXP cache, state |
+| **G2** | the three optimisation switches below |
+
+They are independent, GXM-only, and **all default `off`** in the options table
+(`docs/PERFORMANCE.md:107-109`):
+
+| switch | values | default | what it does |
+|---|---|---|---|
+| `--vita-gxm-resident` | on/off | **off** | certified geometry and static-list indices stay in a GPU arena instead of being copied every frame |
+| `--vita-gxm-compact` | off/on/colors | **off** | integer positions, normals and texture coords keep their GX format, scaled exactly in the vertex shader; `colors` also sends RGBA8 colours as bytes |
+| `--vita-gxm-primitives` | on/off | **off** | quads, strips and fans drawn natively, without index lists (patch `aurora/0008`) |
+
+**They are not GXM-specific in spirit, only in implementation.** Each removes a copy, a conversion or an
+index list — the same three things a vitaGL port could also stop doing. That is the transferable idea;
+the flags themselves are not portable.
+
+**The contradiction, and how it resolves.** The README's A/B table says "GXM + G2" and its caption says
+g2c is "the native renderer with resident geometry, packed vertex formats and native primitives", while
+the options table gives all three a default of `off`. Both are true in different modes, and
+`platform/vita/main_vita.cpp` says which:
+
+- the **play profile** (`PlayProfile[]`, line 89) contains `--vita-gpu=gxm --vita-gxm-resident=on
+  --vita-gxm-compact=colors --vita-gxm-primitives=on`. A launch that selects **no** renderer option gets
+  this implicitly (`implicitProfile`), so on a normal launch all three are **on**.
+- selecting **any** renderer option own-chooses them, and then each falls back to its table default,
+  **off**. `--vita-profile=off` turns every path off.
+
+So "G2 off" is the *explicit-option* state, not the shipped default. The `g2c-gxm` benchmark rows carry
+the bare note `--vita-gpu=gxm`; whether the profile added G2 on top depends on whether that run counted
+as `implicitProfile` or `explicitRenderer`, which the CSV row does not record. **That is a gap in their
+record, not a conclusion here: the +18.7 % / +19.9 % figures may or may not include G2.**
+
+**Where the backend's own share IS separable, and it is small.** Their play profile carries two later
+GXM additions with console numbers attached (`main_vita.cpp:126-128`): the pipeline memo, which took
+the worker's pipeline step from 10.7 to 5.1 ms in Ordon centre and 13.6 to 3.7 ms in Hyrule Field, and
+direct default-uniform writes, which took the **backend step from 24.0 to 23.1 ms — about 1 ms/frame**.
+A ~1 ms change on a 24 ms backend step is the resolution a pure backend optimisation actually has, which
+is consistent with §7.13's ceiling argument: backend draws are 10.9 ms of a 37.9 ms GX worker.
+
 ---
 
 ## 8. Traps and gotchas
