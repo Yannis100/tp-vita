@@ -1899,6 +1899,91 @@ direct default-uniform writes, which took the **backend step from 24.0 to 23.1 m
 A ~1 ms change on a 24 ms backend step is the resolution a pure backend optimisation actually has, which
 is consistent with §7.13's ceiling argument: backend draws are 10.9 ms of a 37.9 ms GX worker.
 
+### 7.14 Which backend would theoretically be faster, and how much (2026-11-12)
+
+**This is a model, not a measurement. Every number is tagged with whether it was measured, and every
+assumption is named so it can be attacked.** The question "which backend is faster" has a short answer
+and a useful answer, and they differ.
+
+#### Short answer
+
+**Direct GXM, by roughly 1.1x** — and only on scenes whose bottleneck is the GX worker. It is *slower*
+where the GPU binds first. Switching backend is the **third-largest** lever available, behind threading
+and the vertex path.
+
+#### Why: the frame does not spend its time in the backend
+
+Measured, v61 on the console, one core, 333 MHz, 154 ms/frame (`DuskOnVita docs/PERFORMANCE.md`):
+
+| component | ms | share | what a backend swap can do |
+|---|---:|---:|---|
+| vertex preparation | 66 | 42.9 % | **nothing** — happens before the backend |
+| GX command decode | 31 | 20.1 % | **nothing** — happens before the backend |
+| **vitaGL calls** | **25** | **16.2 %** | this is the whole target |
+| J3D draw building | 20 | 13.0 % | **nothing** |
+| game simulation | 12 | 7.8 % | **nothing** |
+
+The GL layer is 25 ms of 154 ms. Even making it **free** caps the win at 1.19x. Removing 60 % of it —
+which is roughly what shedding GL's state machine, error checks and redundant bind validation gets you,
+**and that 60 % is an estimate, not a measurement** — gives:
+
+| change | frame | speedup |
+|---|---:|---:|
+| backend only (vitaGL calls −60 %) | 139.0 ms | **1.11x** |
+| + resident/packed geometry (vertex prep −75 %) | 89.5 ms | **1.72x** |
+| + GX thread and frame overlap (2 cores busy) | ~54 ms critical path | **~2.9x** |
+
+Those rows are **Amdahl arithmetic on measured components with assumed removal fractions**; only the
+154 ms total and the per-component split are measured. The ordering, however, does not depend on the
+assumptions: a layer that is 16 % of the frame cannot beat changes that address 43 % and 20 % of it.
+
+**A second, independent ceiling agrees.** In g2c's GX worker, 37.9 ms total, **backend draws are 10.9 ms
+(28.8 %)**. If the worker is ~76 % of that frame, a completely free backend buys at most **~22 % of frame
+time** — and that is the optimistic bound for a backend that does nothing.
+
+#### Where direct GXM wins, and where it loses
+
+Measured, g2c, 444 MHz, same build, same scenes:
+
+| Scene | vitaGL | GXM + G2 | sign |
+|---|---:|---:|---|
+| Link's house (GPU-bound at 100 %) | 20.24 | 19.45 | **−3.9 %** |
+| Ordon, outside (worker/main-thread-bound) | 22.94 | 27.23 | **+18.7 %** |
+| Faron fight | 11.71 | 14.04 | **+19.9 %** |
+
+So "which is faster" is **scene-dependent by sign**, not merely by magnitude. Two mechanisms explain it:
+the gain appears only when the CPU side is the limit, and GXM's fixed submission cost is not free, so on
+a GPU-bound scene the cheaper-looking path can come out slightly behind.
+
+#### Which backend for `tp-vita` specifically
+
+`tp-vita` is **vitaGL only, single-threaded, no GX worker, no frame overlap, no resident geometry, no
+static display lists**, and requests no clock change. Two consequences:
+
+1. **Its GL layer is a smaller share than 16 %.** The 25 ms in that table is the *whole* GL call cost
+   inside a pipeline that had already been optimised; our replay path also does decode, state caching
+   (`sCache`), fog-range LUT rebuilds (§7.3b) and shadow-list work in the same thread. Moving to GXM
+   would not delete any of that.
+2. **The lever that dominates here is not the backend at all.** Our nearest measured anchor is v61 —
+   6.34 FPS in the house, 7.39 outside — which is *exactly* the single-core, stock-clock,
+   every-draw configuration this port ships in. The gap between that and the other port's 12–28 FPS is
+   almost entirely **threading, resident/static geometry and the vertex path**, i.e. the 1.7x and 2.9x
+   rows, not the 1.11x row.
+
+**Theoretical answer, stated plainly:** a direct-GXM rewrite of this port's renderer is worth roughly
+**1.1x**, and it is the most expensive of the three levers because it means reimplementing the GL
+surface the replay path uses. A GX worker plus frame overlap is worth **more** and touches far less code.
+Resident/static geometry is worth more again. If the goal is frames, **the backend is the wrong thing to
+rewrite first**.
+
+#### What would falsify this
+
+- A run showing our per-frame `vitaGL` time is a much larger share than 16 %. Instrument the replay's GL
+  calls the way §7.9 instrumented decode, and the model is checkable without a console.
+- A GXM-without-G2 benchmark, which does not exist in their repository (§7.13.1) — that is the number
+  that would separate the backend from the G2 switches.
+- Any hardware run at all, which this port has never had.
+
 ---
 
 ## 8. Traps and gotchas
