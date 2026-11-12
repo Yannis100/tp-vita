@@ -1760,6 +1760,98 @@ built for.
 - **Still missing:** DuskOnVita's frames. It publishes no VPK, so the three-way comparison remains two
   ports until it is built from source.
 
+### 7.13 vitaGL vs GXM vs hybrid: what the numbers actually say (2026-11-12)
+
+The only port that ships **both** backends is DuskOnVita, so it is the only source of a same-scene,
+same-console A/B. Everything below is quoted from its `docs/benchmarks.csv` and `docs/PERFORMANCE.md`
+(a clone at `/tmp/DuskOnVita`), not estimated. **None of it was measured on this port.**
+
+#### The direct A/B: build g2c, PS Vita 1000, 444 MHz, 23 Oct
+
+| Scene | vitaGL | GXM + G2 | delta |
+|---|---:|---:|---:|
+| Link's house | 20.24 | 19.45 | **−3.9 %** |
+| Ordon, outside the house | 22.94 | 27.23 | **+18.7 %** |
+| Faron fight | 11.71 | 14.04 | **+19.9 %** |
+
+**It is not a constant win, and the sign flips with the scene.** Their own note says Link's house turned
+out to be *GPU-bound at full resolution* — at 100 % the GPU is the limit, so a cheaper CPU-side backend
+buys nothing and GXM's slightly different submission costs 4 %. The two scenes that gain ~19 % are the
+ones limited by the GX worker or the main thread.
+
+**This A/B is not a pure backend swap, and that matters.** `g2c-gxm` carries G2: resident geometry
+(`--vita-gxm-resident`), packed 8/16-bit vertex formats (`--vita-gxm-compact`) and native
+quads/strips/fans (`--vita-gxm-primitives`). There is **no published "GXM without G2" run**, so the
+backend's own share of that +19 % is unmeasured. Someone reading "+19 % for switching to GXM" would
+overstate the backend by an unknown amount.
+
+#### Why the ceiling is around 20 %, from the frame itself
+
+The GX worker's 37.9 ms per frame (g2c, Link's house) decomposes as:
+
+| part | ms | share |
+|---|---:|---:|
+| **backend draws** | **10.9** | **28.8 %** |
+| pipeline lookup | 8.2 | 21.6 % |
+| XF: matrices, lights | 6.0 | 15.8 % |
+| BP: TEV, blend, textures | 6.0 | 15.8 % |
+| draw parsing | 2.9 | 7.7 % |
+| CP: vertex arrays | 2.3 | 6.1 % |
+| draw setup, command loop, static lists | 1.6 | 4.2 % |
+
+A backend swap can only touch the **10.9 ms** of backend draws. Even making them free cannot exceed
+about a quarter of GX worker time, which is why the measured win is ~19 % on worker-bound scenes and
+negative where the GPU binds first.
+
+And the backend is not where the frame goes. Their first console profile (v61, one core, 333 MHz,
+154 ms/frame) put **vertex preparation at 66 ms = 42.9 %**, GX decode 31 ms = 20.1 %, *vitaGL calls*
+25 ms = 16.2 %, J3D draw building 20 ms = 13.0 %, simulation 12 ms = 7.8 %.
+
+**So the renderer is the third-order lever, not the first.** The first-order levers are the ones that
+move work off one core or remove it: threading, resident/static geometry, and the vertex path.
+
+#### What each non-renderer lever was worth (same backend)
+
+Ordon village centre, 10 Nov, one thing added at a time:
+
+| change | FPS | vs control |
+|---|---:|---:|
+| control (every new speed-up off) | 12.29 | — |
+| GX worker speed-ups only | 13.05 | +6.2 % |
+| + direct uniforms + actor fast paths | 13.87 | +12.9 % |
+| + Performance (picture-only, opt-in) | 15.60 | +26.9 % |
+
+Frame overlap alone, console, Ordon at 75 %: **20.5 → 25.9 FPS (+26 %)**. Clocks 333 → 444 MHz is ~1.33×
+on paper. Those are larger than the backend swap and they compose.
+
+#### Hybrid
+
+Two different things get called "hybrid", and only one is interesting:
+
+1. **Both backends present, selectable at run time** (what DuskOnVita actually does). Cost is one
+   function-pointer table; value is a fallback when one backend cannot start — their GXM writes
+   `gfx_init_failure` and exits if `sceGxmProgramCheck` or a pool allocation fails. That is a
+   robustness argument, not a performance one.
+2. **One scene drawn by both, split by pass.** This is the only hybrid with a performance story, and it
+   comes straight out of their gap list: their GXM backend does **not** yet do off-screen passes and
+   EFB copies — shadows, heat haze, the minimap — and some indirect-texture effects. Those are exactly
+   the paths vitaGL already implements correctly here (§7.6: 11,338 resolve ops, ~11/frame, all reaching
+   `draw_quad`). A hybrid that keeps GXM for the main pass and vitaGL for EFB-copy/off-screen passes
+   would run two GL contexts' worth of state on a 128 MiB GPU budget with no measured data to justify
+   it. **No one has measured it, and this document should not imply otherwise.**
+
+#### What this predicts for `tp-vita`, labelled as a prediction
+
+This port is **vitaGL only, single-threaded, no GX worker, no frame overlap, no resident geometry, no
+static display lists**, and it does not request a clock change. The closest measured point is
+**v61: 6.34 FPS in Link's house and 7.39 outside at 333 MHz on one core with every draw**. That is the
+band to expect from the current build on hardware — not the 12–28 FPS the other port reports, because
+none of the levers that got it there exist here.
+
+**What is NOT claimed:** no hardware run of this port has ever happened, so all of the above is
+transfer from a different codebase. The 151.94 ms/frame figure in §7.6 is a Vita3K number and says
+nothing about a Cortex-A9.
+
 ---
 
 ## 8. Traps and gotchas
