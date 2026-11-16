@@ -2268,10 +2268,64 @@ small BTB that is plausibly a few cycles per call, so 47 sites in inner loops is
 effect. **Vita3K cannot resolve it** (§7.8), so this must be measured on hardware or not claimed at all.
 
 **Cheapest experiment, in order:**
-1. Order the hot libraries first (no profile, no `-ffunction-sections`): confirm with `nm` that
-   `memcpy`/`memset`/`malloc`/`__aeabi_idiv`/`_Znwj` move to the start and that the `_veneer` count drops
-   from 316 toward the 156 cold C++ ones.
-2. Only if that works, add `-ffunction-sections` plus a profile for the game-code part.
+1. ~~Order the hot libraries first (no profile, no `-ffunction-sections`)~~ -- **DONE AND IT FAILED,
+   see §7.19b**: archive-level ordering moved 4,921 functions and made the hot veneer count worse
+   (58 -> 90). Do not repeat it.
+2. The remaining option is function-granular: `-ffunction-sections` plus a CPU profile, naming the ~40
+   hot targets individually through `vita_hot_order.py` (§7.18).
+
+### 7.19b Experiment 1 was run and it FAILED: moving libc first made the hot veneers worse (2026-11-16)
+
+§7.19 predicted that moving the hot libc/libgcc/new-delete code to the front of `.text` would remove
+roughly 47 veneers **without any profile**. That was tested on the real binary and it is **wrong**.
+
+**Method, a controlled A/B.** The baseline ELF was saved, then relinked from the *identical* object
+files by replaying `build/CMakeFiles/tpv_vita.dir/link.txt` with one flag inserted:
+
+    SECTIONS { .text.hotlibs : {
+        *libc.a:*(.text .text.*)  *libgcc.a:*(.text .text.*)
+        *libsupc++.a:*(.text .text.*)  *libstdc++.a:*(.text .text.*)  *libm.a:*(.text .text.*)
+    } }
+    INSERT BEFORE .text;
+
+`INSERT BEFORE` was chosen deliberately over the plain `-T` fragment of §7.18, because it merges with the
+default script instead of replacing it -- and it works: `.text.hotlibs` was created at `0x81000010`,
+before `.text` at `0x81099580`, with 4,921 functions moved into it.
+
+**Result: worse.**
+
+| | total `_veneer` | **hot** veneers | cold veneers |
+|---|---:|---:|---:|
+| baseline | 316 | **58** | 258 |
+| libc-first | 310 | **90** | 220 |
+
+The total dropped by 6, but the number that matters **rose by 32**. Hot veneers removed were only
+`_ZdlPv` and `__aeabi_d2ulz`; hot veneers *added* were `_ZnwjRKSt9nothrow_t`, `__aeabi_d2lz`,
+`__aeabi_f2lz`, `__aeabi_uidiv`, `calloc`, `realloc`, `sprintf`, `strcpy`.
+
+**Why it failed, and this is the real lesson.** `libc.a` is not a pile of small leaf functions. It is
+mostly stdio, locale, time and filesystem code, and moving *the whole archive* to the front moved that
+bulk **between** the game code and where `memcpy`/`malloc` had been. The 628 KB that went to the front
+was not the hot part. `memcpy` and `malloc` did **not** move at all: in the experiment both are still in
+section 4 (`.text`) at `0x82273b99` / `0x82272e49`, i.e. still ~18.4 MiB out, still out of range of the
+first 2.4 MiB of code. So the change bought nothing on the targets it was aimed at and displaced other
+code into new long-branch relationships.
+
+**What this kills and what it does not:**
+
+- **Killed:** the §7.19 claim that this needs no profile and no `-ffunction-sections`. Archive-level
+  ordering is too coarse -- it moves 4,921 functions to reach perhaps 40, and the collateral damage
+  exceeded the gain. A 316/58 baseline that goes to 310/90 is a regression, not a win.
+- **Not killed:** the underlying constraint. `.text` is still 18.55 MiB against a 16.00 MiB reach, and
+  `memcpy` is still 18.45 MiB in. The problem is real; this attempt at it was not good enough.
+- **The honest next step, if anyone wants it:** function-granular ordering -- `-ffunction-sections`, a
+  CPU profile, and `vita_hot_order.py` (§7.18) naming the ~40 hot targets *individually* instead of
+  naming the archive. That is the experiment this one was a cheap proxy for, and the proxy failed.
+
+**State left behind:** the build was restored from the saved baseline and verified (316 veneers,
+`memcpy` back at `0x82273cb9`), and `git status` is clean -- **no source change was made**. The two ELFs
+and the fragment are in `/tmp/exp1/` (`tpv_vita.baseline`, `tpv_vita.experiment`, `hotlibs.ld`,
+`link.txt`) if someone wants to re-measure.
 
 ## 8. Traps and gotchas
 
@@ -2363,6 +2417,12 @@ effect. **Vita3K cannot resolve it** (§7.8), so this must be measured on hardwa
     uses the first flag with a different file format — so a recipe copied between linkers fails in a way
     that reads like a syntax typo. Confirm the mechanism with two `nm` calls on two links, with and
     without the flag, never by the flag being accepted.
+27. **An archive is not a set of leaf functions.** `*libc.a:*(.text .text.*)` looks like "put libc
+    first" and actually relocates 4,921 functions, most of them stdio/locale/time/filesystem bulk, while
+    the two you wanted (`memcpy`, `malloc`) do not move at all. Measured: the hot veneer count went
+    58 -> 90 (§7.19b). Archive-level link ordering is too coarse to control distance; if you need to
+    control it, go function-granular and *verify the specific symbols' addresses*, not the section
+    layout and not the flag being accepted.
 
 ---
 
