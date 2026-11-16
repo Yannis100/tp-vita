@@ -2200,6 +2200,37 @@ where the frame goes, and with §7.14's ranking of the levers.
 `libshacccg.suprx` (the skill's ground rule). Take their **patch, their tools and their numbers**; take
 nothing from that directory, and do not vendor the repo wholesale.
 
+### 7.18 `vita_hot_order.py` exists now, and the flag that makes it work is not the obvious one (2026-11-16)
+
+Celosia's hot-code idea is worth having and does not need their patch, so it is now a skill tool:
+`~/.roo/skills/vita-port/scripts/vita_hot_order.py`. It reads `<profile>:<elf>` pairs (Vita3K's
+`<thread> <pc> <lr> <weight>` samples), attributes each PC to a symbol with `nm -n -S`, normalises each
+profile so a long run cannot outvote a short one, and writes a linker-script fragment listing the
+functions hottest first.
+
+**Verified on this machine, not assumed:**
+
+- The generator resolves PCs correctly and orders by weight. A four-function fixture profiled
+  heavy-to-light produced the emitted order `main, fn_b, fn_c, fn_a` -- descending weight, with the
+  unsampled function last. Reproduced twice.
+- `-Wl,-T,<fragment>` **works**: the linked symbols came out at offsets 0/4/8 in the requested order,
+  with `.rodata`/`.data`/`.bss` still present (36 sections).
+- `-Wl,--section-ordering-file=<fragment>` **does not work for this**, and the error is specific:
+  `output section '.text.<name>' must already exist`. GNU ld orders *output* sections; it cannot order
+  per-function input sections. `SECTIONS { }`, bare names and `SORT_BY_NAME(...)` are all syntax errors
+  to it. LLD accepts that flag with a different format, which is how the wrong recipe spreads.
+- `-Wl,--sort-section,name` reorders but alphabetically, not by heat.
+
+**Caveat before we use it on `tp-vita`:** a `-T` fragment can displace the default script's entry-point
+and segment handling. On a bare test link the entry point came out `0x0`. Our VPK goes through
+`vita-elf-create` and `vita-make-fself`, so the fragment has to be checked against the whole packaging
+chain, not just the ELF.
+
+**What we still lack** to apply it here: `-ffunction-sections` is **not** enabled (our ELF has one
+`.text` and zero `.text.*` sections), and nothing in `tests/vita3k/` captures a CPU profile. So this is a
+prepared tool with a verified mechanism, not a measured win. Two prerequisites, both small: add
+`-ffunction-sections` behind an option, and run Vita3K with its profiler on for a scripted route.
+
 ## 8. Traps and gotchas
 
 1. **`tp-vita/` is a git repo** (`Yannis100/tp-vita`), but `build/` and `deps/` are gitignored, so **a
@@ -2284,6 +2315,12 @@ nothing from that directory, and do not vendor the repo wholesale.
     Verify a third-party patch by resolving its `index` blob hashes to a real commit, then applying it
     with `--fuzz=0` to a pristine checkout of *your* pin — not by trusting its header, and not by
     applying it to a tree you have already modified (the failures cascade and the count becomes fiction).
+26. **A linker flag that exists is not a linker flag that does the job.** GNU ld 2.46 accepts
+    `--section-ordering-file` and still cannot order per-function code, because it orders *output*
+    sections that must already exist (§7.18). The same idea needs `-Wl,-T,<fragment>` here, while LLD
+    uses the first flag with a different file format — so a recipe copied between linkers fails in a way
+    that reads like a syntax typo. Confirm the mechanism with two `nm` calls on two links, with and
+    without the flag, never by the flag being accepted.
 
 ---
 
