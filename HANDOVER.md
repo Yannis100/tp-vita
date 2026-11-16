@@ -1958,7 +1958,12 @@ a GPU-bound scene the cheaper-looking path can come out slightly behind.
 #### Which backend for `tp-vita` specifically
 
 `tp-vita` is **vitaGL only, single-threaded, no GX worker, no frame overlap, no resident geometry, no
-static display lists**, and requests no clock change. Two consequences:
+static display lists**, and **does** request 444 MHz (see the correction below). Two consequences:
+
+**CORRECTION (2026-11-16):** the sentence above said this port "requests no clock change". It does:
+`vita/src/main.cpp:68-71` sets ARM 444 MHz, bus 222, GPU 222, xbar 166. The comparison to v61 -- which
+was taken at stock 333 MHz -- therefore **understates** our headroom rather than overstating it, and the
+444-vs-333 factor is already banked. The ranked lever order is unaffected; see §7.20.
 
 1. **Its GL layer is a smaller share than 16 %.** The 25 ms in that table is the *whole* GL call cost
    inside a pipeline that had already been optimised; our replay path also does decode, state caching
@@ -2361,6 +2366,82 @@ anything measurable here — which is also why Vita3K could never have shown it 
 
 **Do not spend more time on code layout on this port.** If the frame budget matters, §11's answer stands:
 hardware, because everything measurable here is bottlenecked on the emulator's own honesty.
+
+## 7.20 What to implement for performance, in order, with what is already spent (2026-11-16)
+
+Asked directly, so this is the ranked answer grounded in measurements already in this document. **Three
+of the obvious levers are already spent or already closed**, and saying so first stops the next session
+from re-opening them:
+
+| lever | state | evidence |
+|---|---|---|
+| clocks 333 -> 444 MHz | **already done** | `vita/src/main.cpp:68-71` sets ARM 444 / bus 222 / GPU 222 / xbar 166. Not a lever, it is the configuration all our numbers were taken in |
+| draw batching | **closed** | 442 draws reach only 377 calls = 1.17x, and two earlier surveys over-counted it (§7.3c) |
+| code layout / hot ordering | **closed** | worth ~0.05 % of a frame; the cheap version made the hot veneer count worse (§7.19c) |
+| direct GXM backend | **wrong lever first** | 1.11x Amdahl, and the most code of any option (§7.14) |
+
+### Rank 1 -- a GX worker thread plus frame overlap. The biggest lever, and we have none of it.
+
+Our replay runs **single-threaded**: no worker, no overlap. The sibling port's own numbers put threading
+and overlap at **20.5 -> 25.9 FPS (+26 %) on console at 75 %**, *and* it composes with everything else.
+The v61 profile says why: vertex preparation (42.9 %) and GX decode (20.1 %) are **63 % of the frame** and
+both are pure CPU that does not need the main thread to block on it.
+
+The work: move `vita_gl_replay`'s decode-and-submit onto a second thread, double-buffer the command/vertex
+arena, and let the main thread start the next frame's simulation while the worker drains. This is the
+"~2.9x" row in §7.14's Amdahl table, and unlike GXM it deletes no functionality.
+
+**Prerequisites, both already solved elsewhere in this document:** the heap is now sane (§7.15 reclaimed
+10.79 MiB, so a second stack and arena fit), and `std::thread` actually works because pthread is linked
+properly (the `--undefined=pthread_cancel` block in `CMakeLists.txt`). **Read §7.1's abort history before
+touching threading** -- thread-local allocation failures were the original symptom.
+
+### Rank 2 -- resident / static geometry. Second biggest, and mostly a memory question.
+
+Vertex preparation is the single largest component of the frame at **42.9 %**. The sibling port's
+`--vita-gxm-resident` keeps decoded vertices resident instead of re-decoding per frame, and their
+`+6.2 %` (GX worker speed-ups) and larger gains stack on it. Verbatim from §7.14: resident/packed
+geometry is worth **more than the backend and more than threading alone** in the optimism-matched row
+(vertex prep −75 % gives 1.72x on its own).
+
+The cost is **memory, not risk**: resident geometry trades our reclaimed heap for lookups. That is
+exactly why Rank 1 comes first -- it makes the frame cheaper before we spend 100 MB.
+
+Our §7.9 vertex cache is the partial version of this and it already works: **74 % hit rate**, correct,
+and it halves decode work. Extending it from "cache the decode" to "keep the decoded meshes" is the
+incremental path, not a rewrite.
+
+### Rank 3 -- GXM for the main pass only, keeping vitaGL for EFB copies. The honest hybrid.
+
+§7.13/§7.14 say the backend is worth **1.11x** and is the most expensive lever, so do it last or not at
+all. The measured case where it *does* pay is scene-dependent: **+18.7 % / +19.9 %** on worker-bound
+scenes and **−3.9 %** where the GPU binds first. And their GXM backend still cannot do off-screen passes
+or EFB copies (shadows, heat haze, minimap), which our vitaGL path already does correctly (§7.6).
+
+So if this is ever done, it is the second hybrid in §7.13: GXM for the main pass, vitaGL for the
+EFB-copy/off-screen passes. **Nobody has measured that, including them.** Do not start here.
+
+### What is genuinely free, and worth doing before any of the above
+
+- **A CPU profile of our own route.** Every percentage above is borrowed from another port. We have no
+  profile at all: nothing in `tests/vita3k/` captures one. Vita3K writes one when its profiler is enabled,
+  and `scripts/vita_hot_order.py` can already read the format. **Without our own split we cannot tell
+  which of Rank 1 or Rank 2 to do first** -- we are borrowing a Wii/PS2 port's shape and guessing it fits.
+- **Fix §7.14's stale claim.** It says this port "requests no clock change"; `main.cpp:68` does. The
+  numbers are still valid, but the sentence is wrong and would mislead someone looking for a quick win.
+
+### The uncomfortable half of the answer
+
+Ranks 1-2 are worth roughly **1.7x-2.9x** on the sibling port at 444 MHz. But our measured anchor is
+**6.34 FPS in the house / 7.39 outside** (v61-equivalent, single core), while the other ports reach
+**12-28 FPS** with the same class of hardware. That gap is bigger than any single lever below, which
+means the honest first question is not "what do I implement" but **"where does our frame actually go?"**
+-- and we cannot answer it from here, because Vita3K understates CPU-bound guest work by roughly an order
+of magnitude (§7.8).
+
+**Recommendation: get a console.** One hardware profile turns the ranked list above from inference into
+a work order. Everything else in this document is already at the limit of what the emulator can honestly
+tell us.
 
 ## 8. Traps and gotchas
 
