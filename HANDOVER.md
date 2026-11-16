@@ -2132,6 +2132,74 @@ mismatch before it measures anything about either port's correctness.
   their `prof_frame_p50_us` of 33.257 ms is the emulator pacing to the 30 Hz tick, **not** a hardware
   frame time. Do not quote it as one.
 
+### 7.17 Celosia: a second Vita port with a patched vitaGL, and what is actually liftable (2026-11-16)
+
+[`HenryKun55/celosia`](https://github.com/HenryKun55/celosia) — GPL-3.0, 76 stars, created 2026-10-02,
+last push 2026-11-15 — is *Shadow of the Colossus* (PS2) statically recompiled to C++ with PS2Recomp,
+rendering through Metal on Apple Silicon and **OpenGL ES / vitaGL on the Vita**. It is a second worked
+precedent for the static-recompilation route, and it is the most detailed public record of vitaGL
+behaviour on real hardware that this project has found.
+
+#### It patches vitaGL, and the base is verifiably our pin's child
+
+`PS2Recomp/ps2xRuntime/platform/vita/vitagl/celosia.patch`: **2,131 lines, 16 files, 107 hunks**,
+prefixing its additions `vglCelo*`. The base was not taken from a comment — the patch's own blob hash
+for `source/buffers.c` (`9ef4257`) resolves to vitaGL commit **`92888a7e`, 2026-09-24** ("Add optional
+vertex layouts caching for shaders pipeline"). Our `vdpm` pin is **`2bdbe89`, 2026-09-23**, and
+
+    git merge-base --is-ancestor 2bdbe89 92888a7e  ->  true
+    git rev-list --count 2bdbe89..92888a7e          ->  1
+
+so **our installed r1488 is the direct parent of their patch base.** That is the best possible
+alignment, and it still does not make the patch applicable: applied with `--fuzz=0` to a pristine
+`2bdbe89`, `buffers.c` fails outright and `gxm.c` loses 2 of 12 hunks. Applied to **its own declared
+base** `92888a7e` it *still* fails 3 hunks and reports "patch unexpectedly ends in middle of line".
+**The file is a published diff, not a cleanly applicable patch series**, so treat it as a *reference
+for what to change and why*, not as a vendor drop.
+
+#### Their measured wins, which are the part worth reading
+
+Every item below is theirs, measured on their port, and none is verified here:
+
+| Their switch / patch | What it fixes | Their number |
+|---|---|---|
+| `SOTC_VGL_CIRCULAR_KB=3072`, `_IMMEDIATE_KB=64` (from 32768/4096) | the defaults are grossly oversized; immediate mode is unused but was 4 MiB | **29 MB** of main-RAM + phycont pools back |
+| `vglCeloOwnMips` (`SOTC_GL_OWN_MIPS`) | vitaGL **ignored** the texels of mip levels >= 1 and downscaled level 0 with `sceGxmTransferDownscale`, an async GPU transfer | correctness |
+| `vglCeloTexImageSwizzled` | uploads in GXM Morton order instead of rows | texel locality |
+| `SOTC_GL_KEEP_LAYOUT` (`vglCeloLeanDraw` bit 2) | every mesh-pool switch re-patched the vertex program | **~170 re-patches/frame** avoided |
+| `celo_unif_copy` (`vglCeloLeanDraw` bit 0) | default uniform buffers copied via the faster path instead of `sceClibMemcpy` | 0.3–3 KB × ~1,500 draws/frame |
+| `vglCeloDepthTiled` | depth/stencil in GXM's tiled layout | **26.2 → 10.1 MB** depth traffic/frame |
+| `vglCeloUniformPool` | the uniform pool could come round onto uniforms the GPU had not read | ring hazard |
+| `SOTC_GL_KEEP_TARGETS` | **Vita3K** looks textures up in its colour-surface cache by address + stride and keeps a freed surface, so a later texture put there drew the old picture | emulator-only |
+| `SOTC_VGL_POOLS=console` | sizes vitaGL's pools as on a console inside Vita3K instead of from the emulator's larger free memory | testing honesty |
+| `SOTC_GL_INFLIGHT87` | GXM's **16 MB parameter buffer** holds every scene in flight; 2–3 frames in flight can overflow it into partial renders | they measured "matched, GPU idle between frames", so it **stays off** |
+
+**The 16 MB GXM parameter buffer is a hard structural bound on frames in flight**, and it is independent
+of anything §7.13–7.14 counted. It is a third constraint on the renderer alongside bandwidth and draw
+calls, and §7.14's model does not include it.
+
+**One result is a negative and is more valuable than the positives:** they implemented the
+vitaGL-to-GXM **hybrid** by patching vitaGL itself, not by bolting a second backend beside it, and they
+still do not ship it as the default. That is consistent with §7.13's finding that the backend is not
+where the frame goes, and with §7.14's ranking of the levers.
+
+#### Tooling worth adopting, which does not depend on their patch
+
+- `tools/vita_hot_order.py` + `game/overrides/vita_hot_order.ld` — generates a linker script that places
+  the **hottest functions at the start of `.text`**, from Vita3K profiles. Cheap, and it applies directly
+  to us: our link order is whatever CMake emits.
+- `game/pgo/vita-pgo.tar.xz` — they ship **PGO profile data for the Vita build**. We have never tried PGO.
+- `tools/vita_profile.py`, `tools/vita3k.sh` — their emulator/profile wrapper, the same shape as our harness.
+- `-DPS2X_VITA_FUNCTION_SECTIONS=OFF` to A/B the hot-code ordering, i.e. they kept the control.
+
+#### Do not copy their tree: it contains Sony binaries
+
+`PS2Recomp/ps2xRuntime/vita/module/` holds **real Sony modules**, not stubs — `libGL.suprx` 1,325,945 B,
+`libGLESv2.suprx` 1,995,561 B, `libIMGEGL.suprx` 97,629 B, `libgpu_es4_ext.suprx` 39,821 B,
+`libpvrPSP2_WSEGL.suprx` 17,869 B. Redistributing those is the same class of problem as shipping
+`libshacccg.suprx` (the skill's ground rule). Take their **patch, their tools and their numbers**; take
+nothing from that directory, and do not vendor the repo wholesale.
+
 ## 8. Traps and gotchas
 
 1. **`tp-vita/` is a git repo** (`Yannis100/tp-vita`), but `build/` and `deps/` are gitignored, so **a
@@ -2211,6 +2279,11 @@ mismatch before it measures anything about either port's correctness.
     surface** — the test file describes a harness, not the release (§7.16). A number read out of source
     is a claim about one configuration; only the running binary settles what it renders. This is trap 21
     one level down: check where the value is supplied, not where it is named.
+25. **A published patch is not an applicable patch.** Celosia's `celosia.patch` declares a base one
+    commit past our vitaGL pin, and still fails 3 hunks on that very base and ends mid-line (§7.17).
+    Verify a third-party patch by resolving its `index` blob hashes to a real commit, then applying it
+    with `--fuzz=0` to a pristine checkout of *your* pin — not by trusting its header, and not by
+    applying it to a tree you have already modified (the failures cascade and the count becomes fiction).
 
 ---
 
