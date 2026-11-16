@@ -55,15 +55,19 @@ So this tool does two jobs, in this order:
    same 960x544 surface but not at the same rectangle:
 
        ours (tp-vita)      738x544 at x=111   (HANDOVER §3: EFB 608x448 * 1.2143)
-       DuskOnVita          724x544 at x=118   (their tests/gxm_state_test.cpp: `viewport(118,0,724,544)`)
+       DuskOnVita          960x544 at x=0     (measured from v0.9.0 captures, HANDOVER §7.16)
+
+   Their own test file states `viewport(118,0,724,544)`, but the shipped release fills the surface.
+   Do not read a viewport out of a repository when a build can be measured (trap 24).
 
    Comparing full frames would count the different letterbox widths as image error. The tool
    intersects the two content boxes and compares only the overlap, and reports the geometry on its
    own so a width difference is visible as a fact rather than smeared into a percentage.
 
-3. **Third port.** DuskOnVita ships no VPK and publishes no release, so no capture of it can be made
-   without a full source build (VitaSDK + their patch stack). `--port-status` prints this, so a
-   report never implies a three-way comparison that did not happen.
+3. **Third port.** DuskOnVita v0.9.0 (2026-11-14) ships a VPK, and it runs (HANDOVER §7.16). It needs
+   a real ISO at `ux0:data/twilight-vita/game.iso` (a symlink is rejected) and `libshacccg.suprx` in
+   `ur0:data/external/`. It renders at a DIFFERENT width from ours, so a same-scene pair between the
+   two compares two render resolutions and is not a like-for-like quality check.
 
 Usage:
     compare_port_frames.py --port-status
@@ -102,16 +106,18 @@ KNOWN_GEOMETRY = {
         "source": "capitanbarbacoa, itch.io; measured content box 738x544 in its captures",
     },
     "duskonvita": {
-        "viewport": "724x544 at x=118",
-        "source": "NathanKneT/DuskOnVita tests/gxm_state_test.cpp: viewport(118,0,724,544)",
+        "viewport": "960x544 at x=0 (fills the surface; 160..1119 in 1280x800 window coords)",
+        "source": "measured from DuskOnVita 0.9.0 captures, HANDOVER §7.16; their "
+                  "tests/gxm_state_test.cpp viewport(118,0,724,544) is a harness, not the release",
     },
 }
 
 PORT_STATUS = {
     "ours": "runnable here (build/tpv_vita-release.vpk, Vita3K harness)",
     "dusklight_psvita": "runnable here (Dusklight-1-1-0.vpk), code not shared",
-    "duskonvita": "NOT runnable here: no release and no VPK in the repository; needs a full "
-                  "source build with VitaSDK and their patch stack",
+    "duskonvita": "runnable here (DuskOnVita-0.9.0.vpk, sha256 14c67742...8ed6b3): needs a real ISO "
+                  "at ux0:data/twilight-vita/game.iso (symlink rejected) and libshacccg.suprx in "
+                  "ur0:data/external/; renders 960 wide, not 738, so pairs are not like-for-like",
 }
 
 

@@ -51,8 +51,18 @@ while read -r cmd a b; do
       alive || { echo "app exited before hold $a"; break; }
       xdotool keydown "$a"; sleep "$b"; xdotool keyup "$a"; sleep 0.3 ;;
     shot)
+      # A capture that fails must say so. The old version sent import's stderr to /dev/null and
+      # `|| true`'d the exit status, so a run where 7 of 8 captures never happened looked like a run
+      # with one screenshot (measured 2026-11-11, the s1_ run against their VPK). Warn instead, and
+      # keep the counter moving so the remaining shots still carry their scripted names.
       n=$((n + 1))
-      import -window root "/work/out/${prefix}${n}_${a}.png" 2>/dev/null || true ;;
+      target="/work/out/${prefix}${n}_${a}.png"
+      if ! err=$(import -window root "$target" 2>&1); then
+        echo "WARNING: screenshot failed for '$a': $err"
+        [ -f "$target" ] || echo "WARNING: no file at $target either"
+      elif [ ! -s "$target" ]; then
+        echo "WARNING: screenshot for '$a' is empty: $target"
+      fi ;;
     *)
       echo "unknown script command: $cmd $a $b" >&2 ;;
   esac

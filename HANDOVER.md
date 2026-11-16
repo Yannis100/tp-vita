@@ -1984,7 +1984,153 @@ rewrite first**.
   that would separate the backend from the G2 switches.
 - Any hardware run at all, which this port has never had.
 
+### 7.15 The x20 Link heap was live on Vita, and is now x3 — 10.79 MiB back (2026-11-16)
+
+**Trigger:** DuskOnVita published **v0.9.0 on 2026-11-14, the first release with a VPK**. Its commit
+`1b6472c4` ("Crash fix: Link's own heaps are three times the original's size, not twenty", patch
+`dusklight/0077`) describes a failure mode that matches ours, and the check found it live here.
+
+#### The defect was ours too, and the guard that should have stopped it was defeated
+
+`daAlink_c::setOriginalHeap` multiplies Link's two heaps by **20** under `#if TARGET_PC`:
+
+```cpp
+u32 size = ROUND(i_size, 16);
+#if TARGET_PC
+    size *= 20;   // "prevent mods from crashing with higher-quality models"
+#endif
+```
+
+**This tree defines `TARGET_PC=1` for the Vita build as well**
+(`cmake/GameABIConfig.cmake:7`), so a guard that reads like "PC only" was **live on Vita**. Link's
+archive heap became `0xA2800 * 20 + 0xA0 = 0xCB20A0` = **12.70 MiB**, taken in one piece from the game
+heap every time Link is created — a stage change, or the restart after a fall.
+
+Our own `dvd_trace.txt` had this recorded all along:
+
+```
+JKRExpHeap: create: size=0xCB20A0 aligned=0xCB20A0 parent=gameHeap parentFree=0x14385B0
+```
+
+Nobody connected `0xCB20A0` to `0xA2800 * 20`. The lesson is §8 trap 16's, one layer up: **a
+platform guard is only real if the macro is not also defined for your platform** — check the compile
+definitions, not the `#if`.
+
+#### Fix, and the proof
+
+`#if TARGET_VITA` now does `size *= 3` before the `#elif TARGET_PC`. Measured in the same run, same
+harness, only the multiplier changed:
+
+| | request | MiB |
+|---|---:|---:|
+| before | `0xCB20A0` | 12.70 |
+| after | `0x1E78A0` | **1.90** |
+
+Both decompose exactly as `base * N + 0xA0`: `0xA2800*20 + 0xA0` and `0xA2800*3 + 0xA0`. The shield
+heap moved the same way, `0x7D000*3 = 0x177000`. **10.79 MiB reclaimed per Link creation.** No
+`fatal.txt`, no `crash.log`, frames render normally (all five captures `738x544` at the expected bbox),
+and the host suites are unchanged: e2e 91 scenes / 14,266 checks / 0 failed, texture 3,780/0, crash
+PASS, printf clean.
+
+**Not proven:** that this was the §7.1/§7.12b abort. Those runs died in the **attract loop** while
+streaming demo resources, before Link exists, and the failure carried no size. This fix removes a real
+12.70 MiB single-block request that could strand a stage change or a post-fall restart; whether it
+retires the attract-loop abort is **untested**, and the `0xBF18265F` corrupted-size case remains
+unexplained. Do not write "the heap abort is fixed".
+
+#### Their v0.9.0 console numbers, for the record
+
+PS Vita 1000, 13 Nov, default "Speed-ups: Original": Snowpeak Ruins 19 FPS, Kakariko 18–19, Ordon
+village 14 standing / 16 walking, Hyrule Field enemy areas 14.5, Palace of Twilight 14, Ordon widest
+view 10. With "Performance": Ordon village mostly 30, centre 22.6–24.4, Forest Temple 17.5–26.2.
+
+Also recorded by them and relevant here: **the minimap is not drawn in play**, and neither are Link's
+real-time shadow, water, bloom, depth of field or heat haze — the same class of gaps as §7.4b's list.
+Their known issue "some textures flicker" is still open, and Shader compilation stalls ~0.4 s per new
+stage with no warm-up bundle shipped.
+
+#### The §7.12 blocker is closed, and one class of comparison is now possible
+
+§7.12 said a three-way image comparison could not be produced because DuskOnVita "publishes no release
+and no VPK". That is no longer true: `DuskOnVita.vpk` (11,867,758 bytes, SHA-256
+`14c67742…8ed6b3`, verified against the published digest) is downloadable. **It does not make the
+perf comparison possible** — Vita3K cannot resolve frame rate (§7.8) — but it does make the
+**same-scene pixel comparison** possible, which is the one §7.12 was blocked on.
+
+**§7.16 narrows the last sentence**: the capture is now possible and has been done, but the two ports
+render at different widths (theirs 960, ours 738), so a same-scene pair is a comparison of two render
+resolutions, not a like-for-like quality check. What the release does give is a runnable third port
+whose structure can be inspected.
+
 ---
+
+### 7.16 DuskOnVita 0.9.0 runs here, and it does NOT letterbox — §7.12's geometry claim was wrong (2026-11-16)
+
+**DuskOnVita v0.9.0 (2026-11-14) is the first release with a VPK**, so the third port is finally
+runnable on this machine. It installs, boots, and reaches live 3D gameplay in Vita3K.
+
+#### Setup that was needed, and two traps that each cost a run
+
+1. `DuskOnVita.vpk`, 11,867,758 bytes, SHA-256 `14c67742…8ed6b3` — **verified against the digest in the
+   release notes** before use.
+2. Their disc path is `ux0:data/twilight-vita/`. **A symlink there does not work**: their reader reports
+   `disc_search: ux0:data/twilight-vita/game.iso=no_image`, because Vita3K does not resolve a symlink
+   through the guest filesystem. A **real copy** of the ISO is required (1.4 GB, reflinked).
+3. `libshacccg.suprx` must be at `ur0:data/external/`, not only `ur0:data/` — §7.4b records the same
+   requirement for the other third-party VPK.
+4. **The first run crashed in the emulator, not in the app**: `Unhandled SIGSEGV at rip 0x0000708900aeb38d`
+   / `Unhandled access to 0x460000000`. That RIP is a **host** address, i.e. a Vita3K fault during their
+   GXM backend start-up. The next run with identical inputs went through. Recorded as a per-run emulator
+   flake, not a defect to chase.
+
+Their own receipts show the run is real: `build_version: DuskOnVita 00.90 build 72d8bc7d (2026-11-14)`,
+`arm_mhz: 444`, `gpu_mhz: 222`, `game_main_enter`, and steady frame windows
+(`prof_frame_p50_us: 33257`, `prof_frame_p95_us: 33882` around the 33.334 ms tick).
+
+#### The measured finding: their picture is 960 wide, ours is 738
+
+Content box measured from the captures, non-black span inside the 1280x800 window:
+
+| port | content box (window coords) | width | height |
+|---|---|---:|---:|
+| DuskOnVita 0.9.0 | `(160,128)-(1119,671)` | **960** | 544 |
+| tp-vita | `(271,128)-(1008,671)` | **738** | 544 |
+
+Both start at the same `y` and both fill the Vita surface vertically. **Theirs fills the full 960 px
+surface; ours is pillarboxed to 738 px with 111 px bars on each side** (271 = 160 + 111, so ours is
+inset 111 px inside the same surface rectangle). Three of their four captures agree exactly on
+`960x544`; `dov090_4_04.png` reports only `960x408` at `y=205`, which is either a letterboxed cutscene
+or a dark scene — **this detector cannot tell a black bar from a black picture**, so that one frame is
+not evidence either way and no conclusion rests on it.
+
+Numbers above are what `tools/compare_port_frames.py` itself reports (`_content_box`, "any non-zero
+channel"), not a re-measured guess: an ad-hoc harness using a `max > 8` threshold reported `960x391` at
+`y=206` for that same frame, because a louder threshold clips the near-black edge rows. **When quoting a
+content box, quote the tool's function** — otherwise the geometry in this document stops matching the
+geometry the tool computes, and a later session cannot reproduce it.
+
+**This corrects §7.12**, which asserted the geometry was "NOT the blocker, and that was checked",
+because "both ports letterbox to the same 738 px width at the same x". That was inferred from *source*
+(`tests/gxm_state_test.cpp`'s `viewport(118,0,724,544)`) and from other ports' captures — never from a
+DuskOnVita frame, because none could be captured then. Now one can be, and **the shipped build does not
+use the viewport its own test file states**. `KNOWN_GEOMETRY` in `tools/compare_port_frames.py` is
+corrected to the measured box, and the `--port-status` note that they "ship no VPK" is corrected too.
+
+**Consequence for any future diff:** our 738 px is genuinely *inside* their 960 px, so the tool's
+intersection is legitimately 738 px wide — but a viewport difference this large means the two pictures
+are **scaled differently**, not merely offset. A pixel difference between them measures the resolution
+mismatch before it measures anything about either port's correctness.
+
+#### What this does and does not unblock
+
+- **Unblocked:** the third port produces frames here, so §7.12's "two of three can be run" becomes
+  three of three, and structural questions about their UI can be answered by looking at it.
+- **NOT unblocked:** a relative-quality claim. The ports render at different widths, so a same-scene
+  pair differs first by that. The scene still has to match as well: their run reaches gameplay on its
+  own schedule, ours needs the frame-counted injector (§7.12c).
+- **Still not measurable:** performance. Vita3K's noise is far larger than the differences (§7.8), and
+  their `prof_frame_p50_us` of 33.257 ms is the emulator pacing to the 30 Hz tick, **not** a hardware
+  frame time. Do not quote it as one.
 
 ## 8. Traps and gotchas
 
@@ -2059,6 +2205,12 @@ rewrite first**.
     threshold would have admitted both. The honest move is to keep the strict guard and add an
     explicitly-labelled operator assertion — and to state in the report which half of the result is
     computed and which half is a human claim.
+24. **A viewport constant in a repository is not the viewport of the shipped build.** §7.12 took
+    DuskOnVita's geometry from `tests/gxm_state_test.cpp: viewport(118,0,724,544)` and from that
+    concluded that both ports letterboxed to 738 px. Their v0.9.0 release measures **960 px, the full
+    surface** — the test file describes a harness, not the release (§7.16). A number read out of source
+    is a claim about one configuration; only the running binary settles what it renders. This is trap 21
+    one level down: check where the value is supplied, not where it is named.
 
 ---
 

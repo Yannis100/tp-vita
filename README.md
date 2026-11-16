@@ -57,6 +57,8 @@ tp-vita/
 ├─ cmake/                      # aurora.cmake, borealis.cmake, deps.cmake,
 │                              # game_sources.cmake (JSystem capture)
 ├─ tools/fetch_deps.sh         # fetch deps/ (abseil, imgui, rmlui, …)
+├─ tools/gci.py                # read/validate a .gci save: checksums, endianness, player name
+├─ tools/compare_port_frames.py # diff two ports' frames, or refuse when they show different scenes
 ├─ patches/abseil-vita.patch   # abseil fixups for arm-vita-eabi
 ├─ vita/
 │  ├─ include/                 # Vita shadow headers (webgpu/webgpu.h shim, …)
