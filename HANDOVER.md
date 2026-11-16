@@ -2327,6 +2327,41 @@ code into new long-branch relationships.
 and the fragment are in `/tmp/exp1/` (`tpv_vita.baseline`, `tpv_vita.experiment`, `hotlibs.ld`,
 `link.txt`) if someone wants to re-measure.
 
+### 7.19c Is any of this worth a frame? No — the arithmetic says ~0.05 % (2026-11-16)
+
+§7.19 and §7.19b established that the constraint is real (`.text` 18.55 MiB vs a 16.00 MiB reach) and that
+the cheap fix failed. This prices the remaining idea, so nobody spends a day on it for nothing.
+
+A veneer costs **one extra branch** (caller `BL` -> stub -> `B` -> target) plus one extra instruction
+fetch. At 444 MHz that is **2.25 ns per cycle**, and a 30 Hz frame is **33,333 us**:
+
+| cost/call | 1,000 calls/frame | 10,000 | 100,000 |
+|---|---:|---:|---:|
+| 2 cycles (4.5 ns) | 4.5 us (0.01 %) | 45 us (0.14 %) | 450 us (1.35 %) |
+| 4 cycles (9.0 ns) | 9.0 us (0.03 %) | 90 us (0.27 %) | 901 us (2.70 %) |
+| 10 cycles (22.5 ns) | 22.5 us (0.07 %) | 225 us (0.68 %) | 2,252 us (6.76 %) |
+
+**A realistic estimate.** ~40 hot veneers, each hit ~50 times a frame, at ~4 cycles: **18 us, i.e.
+0.05 % of the frame.** Even the absurd ceiling — 100,000 veneered calls every frame at 10 cycles — is 6.8 %.
+
+**Verdict: the hot-ordering work has no measurable performance value on this port.** For scale, the
+levers actually measured on the sibling port (§7.13) were 18-20 % for the backend and up to 40 % for the
+non-renderer work. 0.05 % is not in the same conversation, and it is far below the ~20 % noise floor of
+anything measurable here — which is also why Vita3K could never have shown it (§7.8).
+
+**So what was this worth?** Two things, neither of them frame time:
+
+1. **A verified mechanism for a port that needs it.** `vita_hot_order.py` and the `-T` / `INSERT BEFORE`
+   behaviour are confirmed on this toolchain (§7.18). It pays off where a hot set is genuinely far from
+   its own dependencies — a much larger `.text`, or game code calling cold code across a big gap. That is
+   not our situation: 258 of our 316 veneers are cold C++ runtime, and the hot ones are libc that we
+   cannot reposition at archive granularity anyway (§7.19b).
+2. **A closed question, with evidence.** Anyone (including a future session reading §7.17's enthusiasm
+   about Celosia) would otherwise try this. The answer is now written down with numbers.
+
+**Do not spend more time on code layout on this port.** If the frame budget matters, §11's answer stands:
+hardware, because everything measurable here is bottlenecked on the emulator's own honesty.
+
 ## 8. Traps and gotchas
 
 1. **`tp-vita/` is a git repo** (`Yannis100/tp-vita`), but `build/` and `deps/` are gitignored, so **a
