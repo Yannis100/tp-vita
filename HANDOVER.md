@@ -2273,8 +2273,14 @@ wants a rendering win, the honest position is that none is left that this tool c
 
 **Two candidates that are worth real work, in order:** (1) **hardware**, because everything about save reload,
 shader-cache write, performance and audio is unmeasurable here; (2) driving **both** ports to the same scene
-and frame, which is the only way the third port's build becomes a valid pixel reference and the only way to
-tell whether the §7.4b fixes improved the picture.
+and frame, the only way to tell whether the §7.4b fixes improved the picture.
+
+**But scope (2) correctly, because §7.16 changed it.** The third port now runs, and it renders **960 px wide**
+while ours renders **738**. So it is not a drop-in pixel reference: a same-scene pair differs first by that
+resampling, and only what survives a downsample to 738 can be attributed to the ports. Either compare at a
+common reduced scale and accept that the comparison is coarse, or treat their frame as a *structural*
+reference — is the HUD where it should be, is the minimap drawn (§7.15 says theirs is not) — rather than a
+pixel oracle. Stating which of the two is being attempted is part of the job.
 
 **If a run dies:** §7.1's arithmetic is now sane (24 MiB more arena), so watch whether the `0xBF18265F` rate
 changes before doing anything else; the failure path already records `caller=%p`.
