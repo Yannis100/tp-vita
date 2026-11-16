@@ -1070,8 +1070,54 @@ void set_vertex_pointers(const Program& p, const uint8_t* base) {
   enable_attribs(mask);
 }
 
+// ---- frame profiler (HANDOVER 7.21) -----------------------------------------------------------
+// Every percentage this port has ever quoted about its own frame was BORROWED from another port
+// (7.14 quotes a Wii/PS2 profile's 42.9 % vertex prep / 20.1 % GX decode). That is an assumption about
+// our shape, not a measurement of it. These counters answer "where does OUR frame actually go".
+//
+// Phase boundaries are chosen to be separable by what could move to another thread, because that is the
+// decision the numbers have to inform:
+//   decode   -- GX vertex decode / line expansion into sScratch. Pure CPU, no GL, candidate for a worker.
+//   submit   -- the GL calls themselves (set_vertex_pointers + glDraw*). Must stay on the GL thread.
+//   pass     -- uniform/texture/program binds around the draw (bind_fog_range, glUniform*, binds).
+//   resolve  -- EFB copies.
+//   other    -- everything else in replay() (init, clear, viewport/scissor, offscreen binds, surveys).
+// Costs: two clock reads per draw. Measured once as a ratio of frame time, never as an absolute FPS.
+struct PhaseTimes {
+  double decodeMs = 0;
+  double submitMs = 0;
+  double passMs = 0;
+  double resolveMs = 0;
+  double otherMs = 0;
+  uint32_t draws = 0;
+};
+
+PhaseTimes sPhase;       // this frame
+PhaseTimes sPhaseWindow; // accumulated over the reporting window
+
+// `other` is the remainder of replay() after the four draw phases. These break it down PER FRAME (they are
+// reset each frame), so a frame's split and its `otherMs` always agree.
+// `other` was 60 % of a gameplay frame, which is too large to leave as one bucket. These split it so the
+// next question has an answer: is it the frame's own setup, the clear, or the diagnostic batching survey
+// (which allocates hash maps over every draw and is NOT shipped code -- if the survey is the bulk of
+// `other`, then `other` is an artefact of this instrumentation and the real frame is the other 40 %).
+double sOtherSetupMs = 0;  // init_gl, flush_texture_deletions, ensure_efb, invalidate_cache
+double sOtherClearMs = 0;  // bind_target + clear_current
+double sOtherSurveyMs = 0; // the 7.3c batching survey, diagnostic only
+double sOtherTailMs = 0;   // per-op viewport/scissor/offscreen binds, and anything left over
+
+inline double ms_since(std::chrono::steady_clock::time_point a) {
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
+}
+
+// submit_geometry is the only place that issues glDraw*, so its time IS the submit phase.
 void submit_geometry(const Program& p, const uint8_t* vertices, uint32_t vertexCount, const uint16_t* indices,
                      uint32_t indexCount) {
+  const auto submitStart = std::chrono::steady_clock::now();
+  struct SubmitTimer {
+    std::chrono::steady_clock::time_point start;
+    ~SubmitTimer() { sPhase.submitMs += ms_since(start); }
+  } submitTimer{submitStart};
   set_vertex_pointers(p, vertices);
   if (indices != nullptr) {
     glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(indexCount), GL_UNSIGNED_SHORT, indices);
@@ -1182,15 +1228,34 @@ void draw_op(const Frame& frame, const gx::DrawData& draw) {
   }
   // The layout depends only on the shader config, so both passes (and either program variant) share it.
   const gx::vita::DecodedLayout layout = gx::vita::decoded_layout(config->shaderConfig);
+  const auto decodeStart = std::chrono::steady_clock::now();
   if (lineMode) {
     gx::vita::expand_lines(*config, draw, frame, layout, sScratch.chunks);
     if (sScratch.chunks.empty()) {
+      sPhase.decodeMs += ms_since(decodeStart);
       return;
     }
   } else {
     sScratch.decoded.resize(static_cast<size_t>(draw.vtxCount) * layout.stride);
     gx::vita::decode_draw(*config, draw, frame, layout, sScratch.decoded);
   }
+  sPhase.decodeMs += ms_since(decodeStart);
+  ++sPhase.draws;
+  // `pass` = everything draw_op spends that is not decode and not submit_geometry: program/uniform binds,
+  // texture binds, the fog-range LUT upload. Taken as the enclosing span minus what the two inner timers
+  // already booked, so the four phases stay disjoint and sum to the frame.
+  const auto passStart = std::chrono::steady_clock::now();
+  const double submitBefore = sPhase.submitMs;
+  struct PassTimer {
+    std::chrono::steady_clock::time_point start;
+    double submitBefore;
+    ~PassTimer() {
+      const double whole = ms_since(start);
+      const double submitInside = sPhase.submitMs - submitBefore;
+      const double pass = whole - submitInside;
+      sPhase.passMs += pass > 0 ? pass : 0.0;
+    }
+  } passTimer{passStart, submitBefore};
   if (dst_alpha_active(*config) && needs_source_alpha(*config)) {
     // No dual-source blending: write the constant destination alpha first (no color, no depth), then
     // draw the colors with alpha masked out.
@@ -1248,6 +1313,11 @@ uint32_t sBatchingSurveys = 0;
 
 void resolve_op(const ResolveOp& r) {
   ++sResolveSeen;
+  const auto resolveStart = std::chrono::steady_clock::now();
+  struct ResolveTimer {
+    std::chrono::steady_clock::time_point start;
+    ~ResolveTimer() { sPhase.resolveMs += ms_since(start); }
+  } resolveTimer{resolveStart};
   Target& source = *sCurrent;
   const bool fullTarget = r.rect.x <= 0 && r.rect.y <= 0 && r.rect.x + r.rect.width >= int32_t(source.width) &&
                           r.rect.y + r.rect.height >= int32_t(source.height);
@@ -1345,10 +1415,16 @@ void set_present_size(uint32_t width, uint32_t height) noexcept {
 
 void replay(Frame& frame) {
   ++sFrameIndex;
+  // Start a fresh per-frame phase record; `other` is filled at the end as the remainder.
+  sPhase = PhaseTimes{};
+  sOtherSetupMs = sOtherClearMs = sOtherTailMs = 0;
+  const auto frameStart = std::chrono::steady_clock::now();
+  const auto setupStart = std::chrono::steady_clock::now();
   init_gl();
   flush_texture_deletions();
   ensure_efb();
   invalidate_cache();
+  sOtherSetupMs += ms_since(setupStart);
   // Breadcrumbs for a first run: the first frames, then a heartbeat. If the process dies, the last line in the
   // log (flushed per Info line) says which frame it was working on and how many programs it had compiled.
   // TEMPORARY TIMING PROBE (item 4). An emulator cannot give a console frame rate, but it can give the
@@ -1376,7 +1452,26 @@ void replay(Frame& frame) {
              "{} draws this frame, {} programs total, {} resolve ops seen",
              sFrameIndex, windowMs, windowMs / 120.0, 120000.0 / (windowMs > 0 ? windowMs : 1),
              frame.draws.size(), sPrograms.size(), sResolveSeen);
+    // WHERE OUR FRAME GOES (HANDOVER 7.21). Reported as a share of the summed phases so it stays
+    // meaningful in an emulator whose absolute times are not a console's: read the RATIOS, not the ms.
+    {
+      const double total = sPhaseWindow.decodeMs + sPhaseWindow.submitMs + sPhaseWindow.passMs +
+                           sPhaseWindow.resolveMs + sPhaseWindow.otherMs;
+      auto pct = [total](double v) { return total > 0 ? 100.0 * v / total : 0.0; };
+      Log.warn("  phases: decode {:.1f}% | submit {:.1f}% | pass {:.1f}% | resolve {:.1f}% | "
+               "other {:.1f}%; {} draws",
+               pct(sPhaseWindow.decodeMs), pct(sPhaseWindow.submitMs), pct(sPhaseWindow.passMs),
+               pct(sPhaseWindow.resolveMs), pct(sPhaseWindow.otherMs), sPhaseWindow.draws);
+      // `other` broken down, as a share of the whole frame. If `tail` dominates, `other` is per-op work
+      // inside the op loop; if `setup` or `clear` dominates, it is per-frame overhead.
+      // `other` is broken down per frame; the values shown are this window's last frame, which is
+      // representative because a scene's composition is stable (measured: see HANDOVER 7.21).
+      Log.warn("    other split of frame: setup {:.1f}% | clear {:.1f}% | tail {:.1f}% (survey excluded)",
+               pct(sOtherSetupMs), pct(sOtherClearMs), pct(sOtherTailMs));
+      sPhaseWindow = PhaseTimes{};
+    }
     gx::vita::vertex_cache_report("window");
+    const auto surveyStart = std::chrono::steady_clock::now();
     // ONE-SHOT BATCHING SURVEY (HANDOVER 7.3c). Before anyone spends a session on draw batching, answer
     // the question that decides whether it is possible at all: how many of this frame's draws share a
     // pipeline AND a blend setup, i.e. could legally be merged into one longer draw if their vertex data
@@ -1519,9 +1614,11 @@ void replay(Frame& frame) {
              sFrameIndex, frame.draws.size(), sPrograms.size(), sResolveSeen, sResolveDrawn, sResolveNoDest);
   }
 
+  const auto clearStart = std::chrono::steady_clock::now();
   Target* efb = &sEfb;
   bind_target(*efb);
   clear_current(true, true, true, frame.clearColor, frame.clearDepth, true);
+  sOtherClearMs += ms_since(clearStart);
 
   Target* suspended = nullptr; // the EFB while an offscreen target is active
   for (const Op& op : frame.ops) {
@@ -1563,6 +1660,23 @@ void replay(Frame& frame) {
     Log.warn("frame ended inside an offscreen pass");
     bind_target(*suspended);
   }
+
+  // Close the frame's phase record. `other` is everything replay() spent outside the four draw phases;
+  // setup and clear are timed directly, and the tail (per-op viewport/scissor/offscreen binds and any
+  // remaining bookkeeping) is what is left of `other` after those two.
+  const double frameMs = ms_since(frameStart);
+  {
+    const double drawPhases = sPhase.decodeMs + sPhase.submitMs + sPhase.passMs + sPhase.resolveMs;
+    sPhase.otherMs = frameMs > drawPhases ? frameMs - drawPhases : 0.0;
+    const double tail = sPhase.otherMs - sOtherSetupMs - sOtherClearMs;
+    sOtherTailMs += tail > 0 ? tail : 0.0;
+  }
+  sPhaseWindow.decodeMs += sPhase.decodeMs;
+  sPhaseWindow.submitMs += sPhase.submitMs;
+  sPhaseWindow.passMs += sPhase.passMs;
+  sPhaseWindow.resolveMs += sPhase.resolveMs;
+  sPhaseWindow.otherMs += sPhase.otherMs;
+  sPhaseWindow.draws += sPhase.draws;
 }
 
 void present() {

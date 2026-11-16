@@ -2443,6 +2443,70 @@ of magnitude (§7.8).
 a work order. Everything else in this document is already at the limit of what the emulator can honestly
 tell us.
 
+### 7.21 Where OUR frame actually goes, measured — and it vindicates Rank 1 (2026-11-16)
+
+Every percentage this port had quoted about its own frame was **borrowed** from another port: §7.14's
+"vertex prep 42.9 %, GX decode 20.1 %" came from a Wii/PS2 profile. It is now measured.
+
+**Instrumentation** (`vita_gl_replay.cpp`): five disjoint phases per frame, summed over the same 120-frame
+window the existing probe already reports, plus a per-frame breakdown of the remainder. Boundaries are
+chosen by *what could move to another thread*, because that is the decision the numbers inform:
+
+| phase | what it covers | can it leave the main thread? |
+|---|---|---|
+| `decode` | GX vertex decode / line expansion into the scratch buffer | **yes** -- pure CPU, no GL |
+| `submit` | the `glDraw*` calls (`submit_geometry`) | no, GL thread |
+| `pass` | program/uniform/texture binds, fog-range LUT upload | mostly yes |
+| `resolve` | EFB copies | no |
+| `other` | remainder of `replay()`: setup, clear, per-op binds | -- |
+
+The five sum to 100.01 % over 9 gameplay windows, which is the check that the bookkeeping closes.
+
+#### The measurement (9 steady gameplay windows, frames 600-1680, 148-272 draws)
+
+| phase | mean | sd | min | max |
+|---|---:|---:|---:|---:|
+| **decode** | **36.9 %** | 3.7 | 27.9 | 39.6 |
+| submit | 14.7 % | 1.7 | 10.2 | 15.6 |
+| **pass** | **38.4 %** | 6.4 | 34.6 | 55.1 |
+| resolve | 1.8 % | 0.3 | 1.2 | 2.2 |
+| other | 8.3 % | 1.3 | 5.5 | 9.8 |
+
+`other` decomposed per frame: **setup 0.10 %, clear 0.79 %, tail 0.38 %.** So `other` is *not* per-frame
+overhead hiding the truth -- it is genuinely small, and the four draw phases really are the frame.
+
+#### What this says, and it confirms §7.20 rather than overturning it
+
+1. **decode + submit + pass = 89.9 %** of a gameplay frame, and every one of those three can move off the
+   critical path (decode entirely, submit is GL-thread but can be overlapped, pass mostly). **This is the
+   measured justification for Rank 1: a GX worker + frame overlap has ~90 % of the frame to work with**,
+   not the 23.6 % an earlier read of mine suggested.
+2. **decode alone is 36.9 %**, which is within noise of the borrowed "vertex preparation 42.9 %". The
+   sibling port's split generalised after all. **Rank 2 (resident/static geometry) has a real target**: it
+   attacks the single largest individual phase. Our §7.9 vertex cache already halves it at 74 % hit rate,
+   so the next step is keeping decoded meshes, not building a new decoder.
+3. **`pass` at 38.4 % is the largest phase and was not in the plan at all.** It is binds and the fog-range
+   LUT -- per-draw GL state work. That is a *third* lever the ranking in §7.20 missed: reduce state
+   changes per draw. It is also exactly what the §7.3c batching survey was measuring from a different
+   angle, so its evidence is reusable even though batching itself is closed.
+
+#### The mistake that produced a wrong answer first, recorded deliberately
+
+An earlier pass of this measurement reported **decode 3.3 %, other 59.7 %** and I wrote a section saying
+Rank 2 was dead. That was measured on the **wrong scene**: the modal frame in that run had 240 draws but
+was a *menu/loading* composition, and the run's gameplay windows were classified as "huge" outliers and
+excluded. Re-cutting the same log by frame range instead of by a draw-count heuristic gave the table above.
+
+**The lesson is the one §7.8 already records, committed again**: a population chosen by one threshold
+(`draws == mode`) is not the population you meant (playable gameplay). When a phase split decides a work
+order, state *which frames* were averaged and check the split against the frame count and draw count
+before drawing a conclusion from it.
+
+**What is still not claimed:** these are emulator ratios, not console ratios. Vita3K runs guest ARM far
+faster than a Cortex-A9 on some paths, and the 91.6 ms/frame mean here is emulator-paced. The *shares* are
+the useful output and they are the best evidence available without hardware. §11's conclusion is unchanged:
+a console profile is what converts this into a work order.
+
 ## 8. Traps and gotchas
 
 1. **`tp-vita/` is a git repo** (`Yannis100/tp-vita`), but `build/` and `deps/` are gitignored, so **a
@@ -2533,6 +2597,13 @@ tell us.
     uses the first flag with a different file format — so a recipe copied between linkers fails in a way
     that reads like a syntax typo. Confirm the mechanism with two `nm` calls on two links, with and
     without the flag, never by the flag being accepted.
+28. **Check WHICH frames your phase split averaged.** A first pass of §7.21 reported decode 3.3 % and
+    `other` 59.7 %, and on that basis Rank 2 was written off. The windows had been selected by
+    `draws == modal count`, which picked a menu composition, and the real gameplay windows were excluded
+    as "huge" outliers. Re-cutting by frame range gave decode 36.9 %, pass 38.4 %, other 8.3 % -- the
+    opposite conclusion. A phase split is only as good as its population, so print the frame numbers, the
+    draw counts and the window time alongside the percentages, and state which frames were averaged.
+    (Borrowing another port's split is a separate hazard, and it happened to be roughly right here.).
 27. **An archive is not a set of leaf functions.** `*libc.a:*(.text .text.*)` looks like "put libc
     first" and actually relocates 4,921 functions, most of them stdio/locale/time/filesystem bulk, while
     the two you wanted (`memcpy`, `malloc`) do not move at all. Measured: the hot veneer count went
