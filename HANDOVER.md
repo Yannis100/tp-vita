@@ -2231,6 +2231,48 @@ chain, not just the ELF.
 prepared tool with a verified mechanism, not a measured win. Two prerequisites, both small: add
 `-ffunction-sections` behind an option, and run Vita3K with its profiler on for a scripted route.
 
+### 7.19 Whether hot-ordering buys anything HERE: the veneers are real, but only 47 are hot (2026-11-16)
+
+§7.18 prepared the tool. This measures whether it is worth running, and the answer is narrower than the
+premise. **Our `.text` is 18.55 MiB against a 16.00 MiB Thumb-2 `BL` reach**, so the constraint is real
+and the binary is 2.55 MiB over it. `arm-vita-eabi-nm` finds **316 `_veneer` symbols**, i.e. the linker
+genuinely had to stub 316 call sites.
+
+**But a veneer is not evidence that a hot call is paying for it.** Classifying all 316 by resolved target:
+
+| Class | Count | Hot? |
+|---|---:|---|
+| C++ runtime: exceptions, iostream, locale, chrono, filesystem | **156** | no |
+| other libc (`rename`, `vsnprintf`, `atan`, `remainderf`, `__init_vita_heap`, `__sinit`) | 72 | mostly no |
+| **libc inner loops** (`memcpy`, `memset`, `malloc`, `fwrite`, `strtol`, `fflush`, `fgets`) | **31** | **yes** |
+| **libgcc** (`__aeabi_idiv`, `__aeabi_ldivmod`, `__aeabi_l2d`, `__aeabi_ul2d`, `__aeabi_d2ulz`) | **11** | **yes** |
+| **`operator new` / `delete`** (`_Znwj`, `_ZdlPv`, `_Znaj`, `_ZdaPv`) | **5** | **yes** |
+
+**So roughly 47 of 316 are on hot paths**, and they are exactly the ones that hurt: allocation, `memcpy`,
+integer division and float conversion are called from inside inner loops.
+
+**The mechanism is not "hot code is far from libc".** Measured: `memcpy` is at `0x82273cb8`, i.e.
+**18.45 MiB into `.text`** — the very end. Every call site in the **first 2.45 MiB** of `.text` is out of
+range of it. The veneers cluster around `0x813f8xxx` (≈4.0 MiB in), i.e. the boundary where code
+crossing the limit begins.
+
+**Which means the fix is narrower than a profile-driven hot set.** Anything that moves the ~47 hot
+libc/libgcc/new-delete targets from the end of `.text` to the **start** puts them within reach of the
+whole 18.55 MiB (18.55 < 2 × 16), and removes those veneers without any profile. That is a link-order
+fix for a handful of well-known libraries, not a hot-code ordering problem. A CPU profile is still
+needed for the *game* code case, but the game code is not what is being veneered.
+
+**What is NOT claimed:** that removing a veneer is worth a measurable frame time. A veneer is one extra
+branch through a stub — an extra instruction fetch and an extra indirect target. On a Cortex-A9 with a
+small BTB that is plausibly a few cycles per call, so 47 sites in inner loops is a real but small
+effect. **Vita3K cannot resolve it** (§7.8), so this must be measured on hardware or not claimed at all.
+
+**Cheapest experiment, in order:**
+1. Order the hot libraries first (no profile, no `-ffunction-sections`): confirm with `nm` that
+   `memcpy`/`memset`/`malloc`/`__aeabi_idiv`/`_Znwj` move to the start and that the `_veneer` count drops
+   from 316 toward the 156 cold C++ ones.
+2. Only if that works, add `-ffunction-sections` plus a profile for the game-code part.
+
 ## 8. Traps and gotchas
 
 1. **`tp-vita/` is a git repo** (`Yannis100/tp-vita`), but `build/` and `deps/` are gitignored, so **a
