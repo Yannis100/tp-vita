@@ -1171,6 +1171,24 @@ PassSplit sLastPass;   // end-of-frame snapshot, same reason as sLastSetupMs
 uint64_t sTextureBindsWindow = 0;
 uint64_t sFogUploadsWindow = 0;
 
+// ---- `submit` split (HANDOVER 7.26) -----------------------------------------------------------
+// `submit` is 85 % of the benchmark frame: the largest phase by far, and the only one left that is both
+// large and unattacked. It holds exactly two kinds of work, counted separately because they have
+// different fixes:
+//   attrib -- set_vertex_pointers: one glVertexAttribPointer per attribute, PER DRAW, plus a bitmask
+//             diff. Fixable by not re-pointing when neither the layout nor the buffer moved.
+//   draw   -- the glDrawElements/glDrawArrays call itself. On a real target this is the driver's cost.
+// The call counters also expose the MaxArrayVertices split (49,152 verts): a draw larger than that
+// becomes several glDrawArrays calls, which no per-draw phase share would reveal.
+struct SubmitSplit {
+  double attribMs = 0;
+  double drawMs = 0;
+  uint32_t setupCalls = 0; // set_vertex_pointers calls
+  uint32_t drawCalls = 0;  // glDraw* calls
+};
+SubmitSplit sSubmit;
+SubmitSplit sSubmitWindow;
+
 inline double ms_since(std::chrono::steady_clock::time_point a) {
   return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
 }
@@ -1590,9 +1608,28 @@ void submit_geometry(const Program& p, const uint8_t* vertices, uint32_t vertexC
     std::chrono::steady_clock::time_point start;
     ~SubmitTimer() { sPhase.submitMs += ms_since(start); }
   } submitTimer{submitStart};
+#if defined(TPV_SUBMIT_SPLIT)
+  // HANDOVER 7.26. `submit` is 85 % of this frame, and it contains two kinds of work: the attribute
+  // setup (one glVertexAttribPointer per attribute plus a bitmask diff, PER DRAW, even when nothing
+  // changed) and the draw call itself. Split them explicitly -- each span is closed right after the call
+  // it names, so neither can absorb the other.
+  struct Stamp {
+    std::chrono::steady_clock::time_point t{std::chrono::steady_clock::now()};
+    double take() { return ms_since(t); }
+  };
+  Stamp stamp;
+#endif
   set_vertex_pointers(p, vertices);
+#if defined(TPV_SUBMIT_SPLIT)
+  sSubmit.attribMs += stamp.take();
+  ++sSubmit.setupCalls;
+#endif
   if (indices != nullptr) {
     glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(indexCount), GL_UNSIGNED_SHORT, indices);
+#if defined(TPV_SUBMIT_SPLIT)
+    sSubmit.drawMs += stamp.take();
+    ++sSubmit.drawCalls;
+#endif
     return;
   }
   // glDrawArrays reads a fixed-size built-in index buffer on vitaGL: split, on triangle boundaries.
@@ -1600,8 +1637,16 @@ void submit_geometry(const Program& p, const uint8_t* vertices, uint32_t vertexC
     const uint32_t count = std::min<uint32_t>(vertexCount - first, MaxArrayVertices);
     if (first != 0) {
       set_vertex_pointers(p, vertices + static_cast<size_t>(first) * p.layout.stride);
+#if defined(TPV_SUBMIT_SPLIT)
+      sSubmit.attribMs += stamp.take();
+      ++sSubmit.setupCalls;
+#endif
     }
     glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(count));
+#if defined(TPV_SUBMIT_SPLIT)
+    sSubmit.drawMs += stamp.take();
+    ++sSubmit.drawCalls;
+#endif
     first += count;
   }
 }
@@ -2030,6 +2075,18 @@ void replay(Frame& frame) {
                  sPassWindow.passes ? static_cast<double>(sFogUploadsWindow) / sPassWindow.passes : 0.0);
       }
 #endif
+#if defined(TPV_SUBMIT_SPLIT)
+      // `submit` attributed, and the call counts that no phase share shows. `draws > setups` would expose
+      // the MaxArrayVertices split; `setups > draws` would mean a draw is prepared and not issued.
+      {
+        const double submitTotal = sSubmitWindow.attribMs + sSubmitWindow.drawMs;
+        auto spct = [submitTotal](double v) { return submitTotal > 0 ? 100.0 * v / submitTotal : 0.0; };
+        Log.warn("    submit split: attrib {:.1f}% | draw {:.1f}% of submit ({:.2f} ms of frame; {} setups, "
+                 "{} draw calls)",
+                 spct(sSubmitWindow.attribMs), spct(sSubmitWindow.drawMs), submitTotal,
+                 sSubmitWindow.setupCalls, sSubmitWindow.drawCalls);
+      }
+#endif
       // The decode worker's own accounting, as a share of the same frame total. `decode` above is now
       // only the part that could NOT be overlapped (the rendezvous plus any inline fallback), so the
       // reading that decides whether this worked is the PAIR: if `decode` is still ~37 % the work did
@@ -2298,6 +2355,13 @@ void replay(Frame& frame) {
   sPass = PassSplit{};
   sTextureBindCount = 0;
   sFogUploadCount = 0;
+#endif
+#if defined(TPV_SUBMIT_SPLIT)
+  sSubmitWindow.attribMs += sSubmit.attribMs;
+  sSubmitWindow.drawMs += sSubmit.drawMs;
+  sSubmitWindow.setupCalls += sSubmit.setupCalls;
+  sSubmitWindow.drawCalls += sSubmit.drawCalls;
+  sSubmit = SubmitSplit{};
 #endif
   sPhaseWindow.decodeMs += sPhase.decodeMs;
   sPhaseWindow.submitMs += sPhase.submitMs;
