@@ -748,6 +748,7 @@ Each suite has its own `run.sh`; run them from `tp-vita/` with `VITASDK` set.
 | crash | `./tests/host/crash/run.sh` | 19 assertions against the real generated table |
 | printf | `./tests/host/check_printf_formats.sh` | clean — no `%z`/`%j`/`%t`/`%hh` in **code** under `vita/` (comments excluded; see §6.1) |
 | e2e | `./tests/host/e2e/run.sh` | **91 scenes, 14,266 pixel checks, 0 failed**; `TPV_E2E_ASAN=1` for AddressSanitizer |
+| gate | `./tests/host/gate/run.sh` | **19 checks, 0 failed** — the filesystem/env switch precedence, §7.27. No GL, no overlay, builds in a second |
 
 The shader suite **reports** configs exceeding Vita uniform limits; that is its purpose, not a failure.
 Current maxima: `fsVec4=26`, `vsVec4=153`, `maxAttribs=19`; over the caps: 93 configs with fs>16,
@@ -2703,8 +2704,9 @@ identified as pure overhead. The order that follows is:
 2. **Coarsen the hand-off** (draw ranges of 8-32, or the whole next frame) so it is ~13-50 hand-offs
    per frame instead of 393. This is a change to make *before* spending a hardware session, because it
    is the difference between testing the mechanism and testing the overhead.
-3. **Then pin, and then measure on hardware** with `TPV_ENABLE_DECODE_WORKER` on and off. Only a
-   console run settles the sign.
+3. **Then pin, and then measure on hardware.** On a console the switch is a FILE, not an env var --
+   `ux0:data/tpvita/decode_worker` turns the worker on and `ux0:data/tpvita/no_decode_worker` forces it
+   off (§7.27; the env var only ever worked where a shell exists). Only a console run settles the sign.
 4. CapUnlocker last, if ever: it is a distribution cost for one core, and cores 1-2 are still idle.
 
 #### The honest summary
@@ -2904,6 +2906,61 @@ attributed, and the two that were large on the benchmark are either the driver (
 (closed by 7.25).** What is left to gain is not in the replay loop. That is a reason to go to hardware and
 measure the real scene, not a reason to keep optimising this one.
 
+### 7.27 Before the console, three things had to be fixed — and the decode worker was unreachable there (2026-11-17)
+
+The next step for this project is a hardware profile. Checking what a console run would actually need
+found that one of the two features it exists to measure **could not be switched on at all**.
+
+#### The defect: an optimised path that only the emulator could reach
+
+`decode_worker_allowed()` ended with `if (std::getenv("TPV_ENABLE_DECODE_WORKER") == nullptr) return
+false;` and, beside it, a marker file `ux0:data/tpvita/no_decode_worker` whose only power was to turn the
+worker OFF. **A Vita has no shell**, so the env var can never be set, and the worker could therefore never
+be enabled on hardware. §7.24 and §7.25 both describe it as "behind a flag", which was true only where a
+shell exists. The console A/B that would settle whether the ~3 % win is real was untestable, and nothing
+in a compile or an emulator run could reveal that.
+
+Fix: a matching `ux0:data/tpvita/decode_worker` file enables it, the same pattern
+`placement_requested()` in `vita/src/main.cpp` already used for pinning. Precedence is now
+**disable-file, disable-env, enable-env, enable-file** — the disable side first on both channels, so one
+`touch` always forces the control arm. An arm that cannot be forced OFF is worse than one that cannot be
+forced ON.
+
+#### The bug that fix introduced, caught by the test written for it
+
+The first version of the OFF test looked at only the first character (`0`/`n`/`f`). **`"off"` starts
+with `o`**, so `TPV_ENABLE_DECODE_WORKER=off` *enabled* the worker — which is §7.25's trap recurring in a
+new spelling: an A/B control arm silently running the feature under test. A 10-case gate test caught it
+at 2 failures before it shipped. The check now lowercases and compares whole words: `0`, `no`, `off`,
+`false`, `disable`, `disabled`, empty.
+
+That is worth stating plainly because it is the second time in two days: **a boolean switch read from
+`getenv` needs its OFF spellings enumerated and tested, not inferred from a first letter.**
+
+#### The other two changes
+
+| change | why |
+|---|---|
+| `TPV_DECODE_SLOTS` build override (`#ifndef`, default 24) | the ring is the largest allocation this port adds, on a heap §7.15/§7.1 show is tight. A shallower ring only reduces run-ahead; the ordinal handshake already tolerates the worker waiting, so it cannot affect correctness. `-DTPV_DECODE_SLOTS=8` is the intended first console build. |
+| ring footprint report | `peakSlotBytes` sums `capacity()` over the slots, recomputed **only when a slot grew** (unguarded it is a 24-slot loop ~400 times per frame). Deliberately NOT reset per window: it is a lifetime high-water mark, and resetting would print 0 for every warm scene. `capacity()`, not `size()` — a vector keeps its capacity. |
+
+#### Verification
+
+| check | result |
+|---|---|
+| new suite `tests/host/gate` | **19 checks, 0 failed** (10 originally; the OFF-spelling and ON-spelling loops were added after the fix) |
+| e2e, default and `TPV_DECODE_SLOTS=8` | 91 scenes, 14,266 pixel checks, 0 failed, both |
+| byte-exact A/B, worker ON | 80 results compared, **0 differed** |
+| vertex / texture / shader / disc / crash | 71,063 / 3,780 / ok / 10,686 / PASS |
+| `tools/build.sh release` | VPK built, 16,680,967 bytes |
+
+`decode worker: ENABLED by TPV_ENABLE_DECODE_WORKER=1` appears in the log, so the enable path is proven
+end to end rather than merely compiled.
+
+**What this does not claim:** nothing here measures a Vita. It makes the console test possible and
+reduces the chance that it fails for a reason unrelated to the question. The three arms to run are
+worker off, worker on, and the vertex cache on (§7.9, one constant, already correct).
+
 ## 8. Traps and gotchas
 
 1. **`tp-vita/` is a git repo** (`Yannis100/tp-vita`), but `build/` and `deps/` are gitignored, so **a
@@ -3086,6 +3143,25 @@ different point in the frame from where it was written.
     what is actually on the remote, or `git status` lies about being ahead/behind and a later push can
     look like a no-op. After a rewrite, restore it with `git update-ref refs/remotes/origin/main <sha>`
     using the pre-rewrite remote HEAD, then `git fetch` to confirm the two agree.
+40. **A `getenv` switch is not a switch on a Vita: there is no shell.** An env var can never be set there,
+    so a feature gated on `getenv(...) != nullptr` with no file-based alternative is *dead code on
+    hardware* while reading as "behind a flag" in the docs. The decode worker was in exactly this state
+    until §7.27: only `no_decode_worker` existed, a disable-only file. Every feature meant to be tunable
+    on a console needs a `ux0:data/tpvita/<name>` file, and it needs both an enable and a disable file so
+    either A/B arm can be forced. `placement_requested()` in `vita/src/main.cpp` was already right;
+    the worker was not. Grep for `getenv` before shipping and ask of each one "how does a console set
+    this?".
+41. **A boolean read from `getenv` needs its OFF spellings enumerated, not guessed from a first
+    letter.** Two separate bugs in two days: `getenv(...) == nullptr` treated `=0` as ON (§7.25), then a
+    leading-character check treated `=off` as ON because `off` starts with `o` (§7.27). Both times the
+    symptom was an A/B *control* arm that ran the feature under test, which produces a null result that
+    looks like a real one. Lowercase and `strcmp` against the whole word: `0`, `no`, `off`, `false`,
+    `disable`, `disabled`, empty. `tests/host/gate` exists to hold this, and caught the second bug.
+42. **`-- '*.png'` as a git pathspec silently matches nothing; use a pipe to `grep`.** A whole-history
+    screenshot audit written as `git ls-tree -r --name-only "$c" -- '*.png'` returned an empty list over
+    38 commits that did contain 17 PNGs, i.e. a clean result produced by a broken query. The same test
+    written as `... | grep '\.png$'` found all 17. When an audit's answer is "nothing found", re-run it
+    against a case you know is positive before believing it.
 
 ## 9. Files the port owns (`tp-vita/`)
 
@@ -3168,11 +3244,12 @@ available -- so it ships off by default and the next lever is not the one the ra
    Halo CE both treat pinning as a win in itself, and Halo CE's conclusion ("the render thread on core
    0 was the limit") is a diagnosis this port cannot currently make. Cost: no plugin, no new thread --
    a thread census plus two pins. Do this before asking for a 4th core.
-3. **Hardware**, unchanged and now more urgent: the decode worker is the second lever whose sign a
-   proxy got wrong (the vertex cache was the first, §7.9). Whether the overlap wins on a Cortex-A9 is a
-   single run with `TPV_ENABLE_DECODE_WORKER` set and unset, and nothing here can answer it. CapUnlocker
-   (the 4th core) is a distribution cost -- a user-installed kernel plugin -- for one core, and it is
-   last, not first.
+3. **Hardware**, unchanged and now *unblocked*: §7.27 fixed the fact that the decode worker could not
+   be switched on from a console at all, so the A/B is finally runnable. Run three arms -- worker off,
+   worker on (`ux0:data/tpvita/decode_worker`), and the vertex cache on (§7.9) -- on the same scene.
+   The worker is the second lever whose sign a proxy got wrong (the vertex cache was the first), and
+   nothing here can answer it. CapUnlocker (the 4th core) is a distribution cost -- a user-installed
+   kernel plugin -- for one core, and it is last, not first.
 4. **Overlap at a coarser granularity** (draw ranges of 8-32, or the whole next frame), which is the
    version of Rank 1 that does not pay 393 hand-offs per frame. Do the ceiling arithmetic in §7.23
    first: at 40 % decode it is worth ~61 ms a frame, at 11 % it is ~17 ms against a hand-off that

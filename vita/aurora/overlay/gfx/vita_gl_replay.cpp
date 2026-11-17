@@ -1216,7 +1216,16 @@ inline double ms_since(std::chrono::steady_clock::time_point a) {
 //    would steal the core the worker is using and make the frame slower than having no worker.
 //  * Any failure (the thread not starting, a slot never filled) falls back to the old path rather
 //    than deadlocking: the counters are reported every window so a silent fallback is visible.
-constexpr uint32_t kDecodeSlots = 24;
+// Overridable at build time so a FIRST console test can run shallower. The slots are the largest new
+// allocation this port makes, and 24 of them on a heap that HANDOVER 7.15/7.1 shows is tight was a
+// risk with no evidence behind it. A smaller ring only reduces how far the worker may run ahead; it
+// cannot change correctness, because the ordinal handshake already tolerates the worker waiting.
+// `-DTPV_DECODE_SLOTS=8` is the intended console-first build.
+#ifndef TPV_DECODE_SLOTS
+#define TPV_DECODE_SLOTS 24
+#endif
+constexpr uint32_t kDecodeSlots = TPV_DECODE_SLOTS;
+static_assert(kDecodeSlots >= 2, "the ring needs at least a slot in flight plus one being released");
 
 struct DecodeJob {
   uint32_t drawIndex = 0;
@@ -1284,6 +1293,15 @@ struct DecodeWorker {
   uint32_t inlineDecodes = 0;
   uint32_t waitCalls = 0;
   uint32_t waitBlocks = 0;
+  // MEMORY FOOTPRINT (2026-11-17, before the first console test). The ring holds kDecodeSlots decoded
+  // draws at once, and that is the largest allocation this port adds. On a Vita an allocation failure is
+  // a hard abort, and Vita3K does not model the 512 MiB user budget faithfully, so a figure that looks
+  // fine in the emulator proves nothing about the console. `peakSlotBytes` is the high-water mark of the
+  // sum of the slots' capacities, which is the number a console run needs. Written by the WORKER (it is
+  // the thread that fills slots), read by the GL thread at report time under the lock -- exactly the
+  // `decodeMs` pattern above, not a GL-thread-only field.
+  size_t peakSlotBytes = 0;
+  uint32_t slotGrows = 0; // how many times a slot had to reallocate, i.e. how much churn to expect
   std::thread thread;
 };
 // Intentionally leaked. The worker is detached and parks on a condition variable; if its storage had
@@ -1353,6 +1371,7 @@ void decode_worker_main() {
     const auto start = std::chrono::steady_clock::now();
     const gx::DrawData& draw = frame->draws[job.drawIndex];
     const gx::vita::DecodedLayout layout = gx::vita::decoded_layout(job.config->shaderConfig);
+    bool grew = false; // set when a slot allocated, which is when the footprint needs re-measuring
     if (job.lineMode) {
       gx::vita::expand_lines(*job.config, draw, *frame, layout, slot.chunks);
     } else {
@@ -1360,9 +1379,29 @@ void decode_worker_main() {
       // Do not let one oversized draw pin its slot's capacity for the rest of the run.
       if (slot.decoded.capacity() > 4 * bytes + 65536) {
         std::vector<uint8_t>().swap(slot.decoded);
+        grew = true;
+      }
+      if (slot.decoded.capacity() < bytes) {
+        grew = true; // this resize WILL allocate; a console run can see the churn rate
       }
       slot.decoded.resize(bytes);
       gx::vita::decode_draw(*job.config, draw, *frame, layout, slot.decoded);
+    }
+    // Ring footprint high-water mark, recomputed ONLY when a slot actually grew. Summed over all slots
+    // rather than reported per slot, because the question a console run has to answer is "how much heap
+    // does the worker hold at its worst". `capacity()` is the right figure -- `size()` would understate
+    // it, since a vector keeps its capacity until it is swapped away above. Guarded because this is a
+    // 24-slot loop on the worker's hot path; unguarded it would run ~400 times per frame.
+    if (grew) {
+      ++sWorker.slotGrows;
+      size_t held = 0;
+      for (uint32_t i = 0; i < kDecodeSlots; ++i) {
+        held += sWorker.slots[i].decoded.capacity();
+        held += sWorker.slots[i].chunks.capacity() * sizeof(gx::vita::ExpandedPrimitives);
+      }
+      if (held > sWorker.peakSlotBytes) {
+        sWorker.peakSlotBytes = held;
+      }
     }
     const double ms = ms_since(start);
     ++sWorker.nextJob;
@@ -1397,24 +1436,65 @@ bool decode_worker_allowed() {
     // fifteen idle ones this host has, and the point of the console number is that decode is 37-43 % of
     // a real frame there (7.20/7.21) rather than the 11 % measured on the benchmark. What would settle
     // it is one run on hardware with the flag on and off. Until then this is not shipped behaviour.
-    // Presence is not the question, the VALUE is. The first version tested `getenv(...) == nullptr`, so
-    // `TPV_ENABLE_DECODE_WORKER=0` ENABLED the worker: an A/B "control" arm that ran the feature under
-    // test and reported 2 threads while claiming to be off. Accept 0/off/no/false/empty as disabled.
+    // TWO SWITCHES, because the two places this runs have different affordances.
+    //
+    // On the HOST there is a shell, so an env var is the natural control. Presence is not the question,
+    // the VALUE is: the first version tested `getenv(...) == nullptr`, so `TPV_ENABLE_DECODE_WORKER=0`
+    // ENABLED the worker -- an A/B "control" arm that ran the feature under test while reporting it
+    // off. 0/off/no/false/empty all mean disabled.
+    //
+    // On a VITA there is NO SHELL. This function used to return false when the env var was absent, with
+    // only a disable-FILE beside it, so on hardware the worker could never be turned on at all and the
+    // console A/B this feature exists to settle was untestable. The enable-file below fixes that, and
+    // it is the same pattern `placement_requested()` in vita/src/main.cpp already uses for pinning.
+    //
+    // Order matters, and it is: disable-file, then disable-env, then enable-env, then enable-file.
+    // The disable side is checked FIRST on both channels so that one `touch` forces the control arm
+    // even when the env var is set or the enable-file is present. Checking the env var first would
+    // make `TPV_ENABLE_DECODE_WORKER=1` silently ignore a no_decode_worker file, and an A/B arm you
+    // cannot force OFF is worse than one you cannot force ON.
+    constexpr const char* kNoPath = "ux0:data/tpvita/no_decode_worker";
+    constexpr const char* kYesPath = "ux0:data/tpvita/decode_worker";
+    const auto exists = [](const char* p) {
+      if (std::FILE* f = std::fopen(p, "rb")) {
+        std::fclose(f);
+        return true;
+      }
+      return false;
+    };
+    // ACCEPT THE WHOLE WORD, not just the first letter. The first version tested a leading 0/n/f, which
+    // handled "0", "no" and "false" but NOT "off" -- so `TPV_ENABLE_DECODE_WORKER=off` ENABLED the
+    // worker. That is HANDOVER 7.25's trap recurring in a new spelling: the A/B control arm silently ran
+    // the feature under test. A gate test caught it (10 cases, 2 failures) before it shipped.
+    // Case-insensitive, and anything not explicitly off is on.
+    const auto says_off = [](const char* flag) {
+      const auto lower = [](char c) { return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c; };
+      char buf[8] = {};
+      size_t n = 0;
+      for (; flag[n] != '\0' && n < sizeof(buf) - 1; ++n) {
+        buf[n] = lower(flag[n]);
+      }
+      return n == 0 || std::strcmp(buf, "0") == 0 || std::strcmp(buf, "no") == 0 ||
+             std::strcmp(buf, "off") == 0 || std::strcmp(buf, "false") == 0 ||
+             std::strcmp(buf, "disable") == 0 || std::strcmp(buf, "disabled") == 0;
+    };
     const char* flag = std::getenv("TPV_ENABLE_DECODE_WORKER");
-    if (flag == nullptr) {
+    if (exists(kNoPath)) {
+      Log.warn("decode worker: DISABLED by {} (A/B control); decoding inline", kNoPath);
       return false;
     }
-    if (flag[0] == '\0' || flag[0] == '0' || flag[0] == 'n' || flag[0] == 'N' || flag[0] == 'f' ||
-        flag[0] == 'F') {
+    if (flag != nullptr && says_off(flag)) {
       return false;
     }
-    const char* path = "ux0:data/tpvita/no_decode_worker";
-    if (std::FILE* f = std::fopen(path, "rb")) {
-      std::fclose(f);
-      Log.warn("decode worker: DISABLED by {} (A/B control); decoding inline", path);
-      return false;
+    if (flag != nullptr) {
+      Log.warn("decode worker: ENABLED by TPV_ENABLE_DECODE_WORKER={}", flag);
+      return true;
     }
-    return true;
+    if (exists(kYesPath)) {
+      Log.warn("decode worker: ENABLED by {}", kYesPath);
+      return true;
+    }
+    return false;
   }();
   return allowed;
 }
@@ -2125,6 +2205,16 @@ void replay(Frame& frame) {
       sReleaseCalls = 0;
       sWorker.waitCalls = 0;
       sWorker.waitBlocks = 0;
+      // MEMORY (added before the first console test). `peakSlotBytes` is deliberately NOT reset in the
+      // block below with the other counters: it is a lifetime high-water mark, which is exactly the
+      // number a console run needs ("how much heap did the worker ever hold"). Resetting it per window
+      // would print 0 for every steady scene, because after warm-up no slot grows and nothing would
+      // update it. `slots` is the build-time ring depth, so a log line says which build produced it and
+      // a shallow first test (-DTPV_DECODE_SLOTS) is distinguishable from the default.
+      if (sWorker.running) {
+        Log.warn("    decode worker ring: {} slots, peak {} KiB held over the run ({} reallocations)",
+                 kDecodeSlots, sWorker.peakSlotBytes >> 10, sWorker.slotGrows);
+      }
       // One line, not two: this was printed twice, once guarded and once not, so a build with verification
       // OFF still reported a meaningless "0 compared, 0 differed".
       if (sVerifyChecks > 0) {
