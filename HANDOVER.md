@@ -2875,6 +2875,35 @@ See trap 37.
 Verified: byte-exact A/B 23,600 compared / 0 differed; e2e 91 scenes / 14,266 pixel checks / 0 failed;
 vertex 71,063 checks; texture 3,780; shader; disc 10,686; crash PASS; `tpv_vita` cross-build links.
 
+### 7.26 `submit` split: the draw call is 99.7 % of it (2026-11-17)
+
+`submit` is 85 % of the benchmark frame (§7.25), so it got the same treatment as `pass`: `TPV_SUBMIT_SPLIT`
+times the two kinds of work it contains, and counts the calls.
+
+| part of `submit` | share | of the frame |
+|---|---|---|
+| `set_vertex_pointers` (one `glVertexAttribPointer` per attribute, per draw, plus a bitmask diff) | **0.3 %** | 0.25 % |
+| `glDrawElements` / `glDrawArrays` | **99.7 %** | 84.7 % |
+
+Counted: 47,200 `set_vertex_pointers` calls and 47,200 draw calls per window, so one of each per draw, and
+the `MaxArrayVertices` split (49,152 vertices) never fires because this scene draws 1,536 vertices at a time.
+
+**What this rules out, which is the useful half.** Re-pointing attribute pointers only when the layout or
+the vertex buffer actually changed is a real idea with a real cache bug risk, and its ceiling is **0.3 % of
+the frame**. It is not worth writing. That is the same answer §7.9 gave for the vertex cache and §7.3c for
+batching: measured, small, closed.
+
+**What is left is the draw call itself**, and it is the one thing no amount of host instrumentation can
+attribute further: on this host it is llvmpipe's rasteriser, on a Vita it is vitaGL's command submission
+into GXM. Both are "the driver", and the two are not comparable. `submit` being 85 % here while §7.21's
+gameplay frame had it at 14.7 % is itself the tell: the benchmark is 400 large untextured draws, and a real
+scene is 148-272 small textured ones with a much larger decode and `pass` share.
+
+So the honest position after 7.25 and 7.26 together: **every phase of this port's replay has now been
+attributed, and the two that were large on the benchmark are either the driver (submit) or the hand-off
+(closed by 7.25).** What is left to gain is not in the replay loop. That is a reason to go to hardware and
+measure the real scene, not a reason to keep optimising this one.
+
 ## 8. Traps and gotchas
 
 1. **`tp-vita/` is a git repo** (`Yannis100/tp-vita`), but `build/` and `deps/` are gitignored, so **a
@@ -3046,6 +3075,17 @@ different point in the frame from where it was written.
     differed (0.12 %). Always wrap a timed wait in a `while` over the predicate, so a timeout means
     "check again". A relative-timing bug at this rate is invisible in a screenshot and obvious to a
     verifier -- which is why the verifier runs BEFORE the timing.
+38. **Do not pass `-c user.email=...` to `git commit`; the repo already knows the identity.** Committing
+    with an ad-hoc `-c user.name/-c user.email` override wrote a personal address that does not belong to
+    the GitHub account, and a commit made without any override fell back to `Zoo <zoo@local>` because no
+    identity was set for that path. The repo's local config is the source of truth (here
+    `Yannis100 <3008631+Yannis100@users.noreply.github.com>`); set it once with `git config user.email`
+    and never override per commit. Eight of 37 commits ended up with three different author identities
+    and had to be rewritten -- which rewrote every SHA, so it is a force-push to fix.
+39. **`git filter-branch -- --all` also rewrites `refs/remotes/origin/*`.** That ref must keep pointing at
+    what is actually on the remote, or `git status` lies about being ahead/behind and a later push can
+    look like a no-op. After a rewrite, restore it with `git update-ref refs/remotes/origin/main <sha>`
+    using the pre-rewrite remote HEAD, then `git fetch` to confirm the two agree.
 
 ## 9. Files the port owns (`tp-vita/`)
 
