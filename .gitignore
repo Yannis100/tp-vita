@@ -44,3 +44,11 @@ __pycache__/
 PSVUPDAT.PUP
 build-dev/
 build-debug/
+
+# Screenshots of the game and of other ports are kept locally, not published: they are frames of a
+# commercial title. The nine that were already pushed stay tracked (documentation refers to them).
+tests/vita3k/screenshots/*.png
+!tests/vita3k/screenshots/pr_13_m_gameplay_1.png
+!tests/vita3k/screenshots/pr_15_o_gameplay_3.png
+!tests/vita3k/screenshots/pr_16_p_end.png
+!tests/vita3k/screenshots/r1488_gameplay_ordon.png
