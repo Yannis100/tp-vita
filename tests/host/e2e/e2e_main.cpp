@@ -407,6 +407,52 @@ constexpr uint32_t kMasks[4] = {(1u << 0) | (1u << 5), 1u << 1, 1u << 3, 1u << 6
 #include "scenes_offscreen.hpp"
 #include "scenes_present.hpp"
 
+// A heavy synthetic scene for --bench ONLY, never registered as a test.
+//
+// Shape: BATCHES draws of kTris triangles, each draw ~200k triangles/frame in total, through the same
+// FIFO -> recorder -> replay path the game uses. The other scenes are single quads, so they cannot
+// exercise vertex decode at all and benchmarking one of them would have measured the harness.
+//
+// State is deliberately minimal -- POS and CLR0, no texgens, no texture -- for two reasons: every
+// attribute the shader config names must have a matching GXSetVtxDesc and a valid source, and a texgen
+// without a loaded texture indexes an unmapped XF array and aborts. Keeping it minimal makes the scene
+// about decode and nothing else.
+void bench_heavy_draw() {
+  base_state();
+  GXSetNumTexGens(0);
+  GXSetNumTevStages(1);
+  GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD_NULL, GX_TEXMAP_NULL, GX_COLOR0A0);
+  GXSetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
+  GXSetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
+  GXSetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
+  GXSetCullMode(GX_CULL_NONE);
+  // The TEV colour register is a UNIFORM, and the recorder merges adjacent draws only when the uniform
+  // BYTES are identical (see the batching survey in vita_gl_replay.cpp). Writing a per-draw value here
+  // therefore keeps the draws separate. Without it every iteration merges into ONE draw of 200k
+  // triangles, and a benchmark of that measures nothing about pipelining: there is only one decode to
+  // overlap and it must finish before the first GL call. That mistake produced a 1-draw-per-frame
+  // "benchmark" that showed no gain, correctly, for the wrong reason.
+  GXSetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_C0);
+  GXSetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_ENABLE, GX_TEVPREV);
+  constexpr int kDraws = 400;
+  constexpr int kTris = 512;
+  for (int d = 0; d < kDraws; ++d) {
+    GXColor tevCol{static_cast<u8>(d), static_cast<u8>(d * 3), static_cast<u8>(d * 7), 255};
+    GXSetTevColor(GX_TEVREG0, tevCol);
+    GXBegin(GX_TRIANGLES, GX_VTXFMT0, static_cast<u16>(kTris * 3));
+    for (int t = 0; t < kTris; ++t) {
+      for (int v = 0; v < 3; ++v) {
+        const f32 x = static_cast<f32>((d * 7 + t * 13 + v * 3) % (W - 8));
+        const f32 y = static_cast<f32>((d * 11 + t * 5 + v * 17) % (H - 8));
+        GXPosition3f32(x, y, -0.5f);
+        GXColor4u8(static_cast<u8>(d), static_cast<u8>(t), static_cast<u8>(v * 60), 255);
+      }
+    }
+    // Required, and easy to forget: GXBegin must be closed or the NEXT GXBegin aborts.
+    GXEnd();
+  }
+}
+
 std::vector<Scene> make_scenes() {
   std::vector<Scene> s;
 
@@ -1061,6 +1107,70 @@ int main(int argc, char** argv) {
   render_frame([] { base_state(); });
 
   const std::vector<Scene> scenes = make_scenes();
+
+  // PERFORMANCE MODE (--bench <scene> [frames]). Replays ONE scene many times.
+  //
+  // Why this exists: the Vita3K route could not answer the question. Game time there is wall-clock, so
+  // the frame-counted input script advances with RENDERED frames, and two runs of the same waits file
+  // ended in different scenes (one reached frame 3480, the other 9480) with draw counts differing by
+  // 2.6x. Matching on frame number, or on draw count, compares scene content and not the change. Here
+  // the recorded frame is byte-identical every iteration, so the ONLY variable is the decode worker.
+  //
+  // It is a microbenchmark on llvmpipe, not a Vita. It can say "decode left the critical path and the
+  // recorded frame got N% shorter"; it cannot say what a Cortex-A9 does.
+  {
+    const char* benchScene = nullptr;
+    int benchFrames = 300;
+    for (int i = 1; i < argc; ++i) {
+      if (std::strcmp(argv[i], "--bench") == 0) {
+        benchScene = i + 1 < argc ? argv[i + 1] : nullptr;
+        if (i + 2 < argc) {
+          benchFrames = std::atoi(argv[i + 2]);
+        }
+      }
+    }
+    if (benchScene != nullptr) {
+      Scene synthetic{"bench_heavy", "synthetic decode load (bench only)", &bench_heavy_draw, {}};
+      const Scene* picked = std::strcmp(benchScene, "bench_heavy") == 0 ? &synthetic : nullptr;
+      for (const Scene& scene : scenes) {
+        if (std::strcmp(scene.name, benchScene) == 0) {
+          picked = &scene;
+        }
+      }
+      if (picked == nullptr) {
+        std::printf("--bench: no scene named '%s'\n", benchScene);
+        return 2;
+      }
+      if (picked->warmup) {
+        render_frame(picked->warmup);
+      }
+      // Discard the first frames: the first iteration of a scene compiles programs and populates
+      // caches, and averaging that in is the same mistake the phase window made with shader compile.
+      for (int i = 0; i < 10; ++i) {
+        render_frame(picked->draw);
+      }
+      std::vector<double> wall;
+      wall.reserve(static_cast<size_t>(benchFrames));
+      for (int i = 0; i < benchFrames; ++i) {
+        const auto start = std::chrono::steady_clock::now();
+        render_frame(picked->draw);
+        wall.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+      }
+      std::sort(wall.begin(), wall.end());
+      const double median = wall[wall.size() / 2];
+      double sum = 0;
+      for (double v : wall) {
+        sum += v;
+      }
+      std::printf("bench [%s] %d frames: median %.2f ms, mean %.2f ms, p10 %.2f, p90 %.2f\n", picked->name,
+                  benchFrames, median, sum / static_cast<double>(wall.size()), wall[wall.size() / 10],
+                  wall[wall.size() * 9 / 10]);
+      aurora::gx::fifo::shutdown();
+      aurora::gfx::vita::shutdown_gl();
+      return 0;
+    }
+  }
+
   int total = 0, failedScenes = 0, ran = 0;
   for (const Scene& scene : scenes) {
     if (argc > 1) {

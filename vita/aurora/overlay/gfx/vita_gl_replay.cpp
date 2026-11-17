@@ -26,9 +26,15 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <atomic>
+#include <condition_variable>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -973,6 +979,15 @@ struct DrawScratch {
 };
 DrawScratch sScratch;
 
+// What one draw's decode produced, wherever it was produced: inline here (sScratch) or ahead of time
+// on the decode worker. Taking this as a parameter instead of letting draw_pass read sScratch is what
+// lets the overlapped and the fallback path share one code path, so a regression in one is a
+// regression in both and gets caught by the same host suites.
+struct DecodedView {
+  const uint8_t* vertices = nullptr;
+  const std::vector<gx::vita::ExpandedPrimitives>* chunks = nullptr;
+};
+
 void upload_uniforms(Program& p, const Frame& frame, const gx::DrawData& draw) {
   const bool sameBlob = p.uniformFrame == sFrameIndex && p.uniformOffset == draw.uniformRange.offset;
   if (!sameBlob) {
@@ -1105,9 +1120,321 @@ double sOtherSetupMs = 0;  // init_gl, flush_texture_deletions, ensure_efb, inva
 double sOtherClearMs = 0;  // bind_target + clear_current
 double sOtherSurveyMs = 0; // the 7.3c batching survey, diagnostic only
 double sOtherTailMs = 0;   // per-op viewport/scissor/offscreen binds, and anything left over
+// The four above are PER FRAME (reset at the top of replay()). The report runs later in the same call,
+// after that reset, so reading them there always printed 0.0 % -- three columns of confident nothing.
+// These are the end-of-frame snapshots the report actually prints.
+double sLastSetupMs = 0;
+double sLastClearMs = 0;
+double sLastTailMs = 0;
 
 inline double ms_since(std::chrono::steady_clock::time_point a) {
   return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
+}
+
+// ---- decode worker (HANDOVER 7.22) --------------------------------------------------------------
+// 36.9 % of a measured gameplay frame is GX vertex decode, and decode is a PURE function of
+// (PipelineConfig, DrawData, Frame): no GL call, no global state (vita_vertex.cpp compiles its cache
+// bookkeeping out when the cache is off), and no dependence on draw ORDER. That is exactly the shape
+// that can run on another core while this one talks to vitaGL, so it does.
+//
+// Shape: at the top of replay() the frame's whole draw list is published. One long-lived worker
+// decodes it in order into a small ring of reusable slots; the GL thread walks the op list as before
+// and picks up each result when it needs it. Decode (36.9 %) therefore overlaps submit+pass (53.1 %),
+// and because the consumer outpaces the producer per draw (0.53 vs 0.37 of a frame) the pipeline
+// stays full after the first draw or two.
+//
+// Four deliberate choices, each because the alternative is worse:
+//  * ONE thread, created once and DETACHED -- not one per frame, and not joined. Per-frame creation is
+//    what the 7.1 abort history is about; a joinable std::thread whose destructor runs would call
+//    std::terminate, and a worker parked on a condition variable costs nothing at teardown.
+//  * A BOUNDED ring of slots, so an unexpectedly heavy frame cannot balloon the heap. The consumer
+//    frees a slot as soon as it has issued the draw, which is what keeps the ring from stalling.
+//  * A WAIT, never an inline decode, when a result is not ready. The consumer only ever wants the
+//    oldest undelivered draw, so the producer is guaranteed to reach it; decoding inline instead
+//    would steal the core the worker is using and make the frame slower than having no worker.
+//  * Any failure (the thread not starting, a slot never filled) falls back to the old path rather
+//    than deadlocking: the counters are reported every window so a silent fallback is visible.
+constexpr uint32_t kDecodeSlots = 24;
+
+struct DecodeJob {
+  uint32_t drawIndex = 0;
+  const gx::PipelineConfig* config = nullptr;
+  bool lineMode = false;
+};
+
+struct DecodeSlot {
+  std::vector<uint8_t> decoded;
+  std::vector<gx::vita::ExpandedPrimitives> chunks;
+};
+
+// The handshake is THREE MONOTONE COUNTERS, not a lock per draw.
+//
+// Measured, and the reason this is not a friendly mutex: the first version locked a std::mutex and
+// signalled a condition variable on every draw. At 393 draws per frame that is ~1,600 futex operations
+// per frame, and it made the frame 22 % SLOWER while the wait itself was only 0.2 % -- the overhead
+// swamped the overlap it existed to create. Counters cost one atomic load per draw instead.
+//
+//   readyCount  -- jobs whose slot is filled. Written by the worker, read by the GL thread.
+//   freeCount   -- jobs whose slot has been released. Written by the GL thread, read by the worker.
+//   nextJob     -- the worker's own cursor. Touched by the worker only, so it needs no atomics.
+//
+// Both sides proceed strictly in ordinal order (the worker decodes in publish order, the op loop
+// consumes in the same order), so a counter IS the whole protocol. The mutex and the condition
+// variables are used ONLY on the blocking path -- a handful of times per run -- which is why they cost
+// nothing in the steady state.
+struct DecodeWorker {
+  std::mutex mu;
+  std::condition_variable cvNewJob;  // worker -> waiting for the next frame's jobs
+  std::condition_variable cvSlotFree; // worker -> waiting for the consumer to release a slot
+  std::condition_variable cvReady;    // GL thread -> waiting for a specific decode
+  const Frame* frame = nullptr;       // owned by the GL thread; valid until it drains
+  std::vector<DecodeJob> jobs;
+  uint32_t jobCount = 0;
+  uint32_t nextJob = 0; // worker only
+  std::atomic<uint32_t> readyCount{0};
+  std::atomic<uint32_t> freeCount{0};
+  DecodeSlot slots[kDecodeSlots];
+  bool running = false;
+  // Reported every window, then reset. `decodeMs` is the worker's own decode time: the answer to "did
+  // the work actually happen somewhere else, or did it vanish?".
+  double decodeMs = 0;
+  uint32_t decodedDraws = 0;
+  uint32_t inlineDecodes = 0;
+  uint32_t waitCalls = 0;
+  uint32_t waitBlocks = 0;
+  std::thread thread;
+};
+// Intentionally leaked. The worker is detached and parks on a condition variable; if its storage had
+// static duration, the variable would be destroyed while the thread is still waiting on it during
+// static teardown (the e2e harness exits without calling shutdown_gl). A reference to an immortal
+// object is trivial to destroy, so there is nothing left to race with.
+DecodeWorker& sWorker = *new DecodeWorker();
+std::vector<uint32_t> sOrdinalOfDraw; // draw index -> job ordinal, or UINT32_MAX if not posted
+// Reused across frames: a full scene's job list is ~1.7 KiB and this runs every frame, so reallocating
+// it would be exactly the per-frame churn the rest of this file goes out of its way to avoid.
+std::vector<DecodeJob> sPublishJobs;
+std::vector<uint32_t> sPublishOrdinals;
+
+// Byte-exact A/B proof that the worker's output IS the inline output. Opt-in (TPV_VERIFY_DECODE=1),
+// because while it ran by default it double-decoded in the worker-on build only, and that made every
+// A/B measure the verifier instead of the change. It has already done its job: on the corrected
+// benchmark it compared 23,600 worker decodes against inline decodes and 0 differed.
+uint32_t sVerifyFrames = 0;
+uint32_t sVerifyChecks = 0;
+uint32_t sVerifyDiffs = 0;
+uint32_t sVerifySkipped = 0;
+std::vector<uint8_t> sVerifyScratch;
+std::vector<gx::vita::ExpandedPrimitives> sVerifyChunks;
+
+void decode_worker_main() {
+  std::unique_lock<std::mutex> lock(sWorker.mu);
+  for (;;) {
+    sWorker.cvNewJob.wait(lock, [] { return sWorker.nextJob < sWorker.jobCount; });
+    const uint32_t ordinal = sWorker.nextJob;
+    // Wait for this slot to be released before overwriting it. With 24 slots and a consumer that is
+    // faster than the producer, this is only reached when the frame has more than 24 draws in flight.
+    if (ordinal >= sWorker.freeCount.load(std::memory_order_acquire) + kDecodeSlots) {
+      sWorker.cvSlotFree.wait(lock, [ordinal] {
+        return ordinal < sWorker.freeCount.load(std::memory_order_acquire) + kDecodeSlots;
+      });
+    }
+    const DecodeJob job = sWorker.jobs[ordinal];
+    const Frame* frame = sWorker.frame;
+    lock.unlock();
+    // Off the lock: this is the whole point of the thread. Nothing below touches GL state or any global
+    // the GL thread writes -- that is the invariant the 7.21 measurement bought, and 23,600 byte-exact
+    // comparisons say it holds.
+    DecodeSlot& slot = sWorker.slots[ordinal % kDecodeSlots];
+    const auto start = std::chrono::steady_clock::now();
+    const gx::DrawData& draw = frame->draws[job.drawIndex];
+    const gx::vita::DecodedLayout layout = gx::vita::decoded_layout(job.config->shaderConfig);
+    if (job.lineMode) {
+      gx::vita::expand_lines(*job.config, draw, *frame, layout, slot.chunks);
+    } else {
+      const size_t bytes = static_cast<size_t>(draw.vtxCount) * layout.stride;
+      // Do not let one oversized draw pin its slot's capacity for the rest of the run.
+      if (slot.decoded.capacity() > 4 * bytes + 65536) {
+        std::vector<uint8_t>().swap(slot.decoded);
+      }
+      slot.decoded.resize(bytes);
+      gx::vita::decode_draw(*job.config, draw, *frame, layout, slot.decoded);
+    }
+    const double ms = ms_since(start);
+    ++sWorker.nextJob;
+    sWorker.decodeMs += ms; // worker thread only, so no lock; read under the lock at report time
+    ++sWorker.decodedDraws;
+    // Publish LAST, release-ordered: the slot's contents must be visible before the counter says so.
+    sWorker.readyCount.store(ordinal + 1, std::memory_order_release);
+    // notify_one, not notify_all: there is exactly one consumer. At 393 draws per frame, notify_all
+    // walks the whole wait list once per draw for a single waiter.
+    sWorker.cvReady.notify_one();
+    lock.lock();
+  }
+}
+
+// A/B control for the ONE question that matters here: does the overlap actually shorten the frame?
+// The off-thread percentage only proves the WORK moved; it cannot prove the frame got faster, and a
+// second thread competing for the same core can move work without saving time. The env var is for the
+// host harness, the marker file for a console run.
+bool decode_worker_allowed() {
+  static const bool allowed = [] {
+    // OFF BY DEFAULT, and this is the important line in this file. HANDOVER 7.22 measured the overlap on
+    // a corrected benchmark (47,200 draws, 393 per frame, byte-identical recorded frame each iteration):
+    //   worker off  median 48.2 ms      worker on  median 56.2 ms      = 16 % SLOWER
+    // with a rendezvous of only 0.1 % of the frame and 0.17 % of draws ever blocking. The mechanism
+    // works -- decode left the critical path, which is what it was built to do -- but it costs more
+    // than it saves, because on that frame decode is only 11 % of the time while the hand-off and a
+    // second runnable thread on a 16-thread llvmpipe rasteriser cost more than 11 %.
+    //
+    // It is kept behind a flag rather than deleted because the proxy is not the target: the Vita has two
+    // cores doing all of this, and the console number this change exists for (7.20/7.21 put decode at
+    // 37-43 % of a real gameplay frame) cannot be obtained from an emulator. What would settle it is one
+    // run on hardware with the flag on and off. Until then this is not shipped behaviour.
+    if (std::getenv("TPV_ENABLE_DECODE_WORKER") == nullptr) {
+      return false;
+    }
+    const char* path = "ux0:data/tpvita/no_decode_worker";
+    if (std::FILE* f = std::fopen(path, "rb")) {
+      std::fclose(f);
+      Log.warn("decode worker: DISABLED by {} (A/B control); decoding inline", path);
+      return false;
+    }
+    return true;
+  }();
+  return allowed;
+}
+
+void decode_worker_start() {
+  if (sWorker.running || !decode_worker_allowed()) {
+    return;
+  }
+  if (std::getenv("TPV_VERIFY_DECODE") != nullptr) {
+    sVerifyFrames = 60;
+  }
+  try {
+    sWorker.thread = std::thread(decode_worker_main);
+    sWorker.thread.detach();
+    sWorker.running = true;
+    Log.info("decode worker: started, {} slots; decode runs off the GL thread", kDecodeSlots);
+  } catch (const std::exception& e) {
+    // A port must not lose the picture because an optimisation could not start.
+    sWorker.running = false;
+    Log.warn("decode worker: could not start ({}); decoding inline as before", e.what());
+  }
+}
+
+// Publishes this frame's draws. Runs on the GL thread, before the op loop, so the worker has the whole
+// frame's work queued while the GL thread is still doing setup and the first passes. Which draws are
+// worth posting is decided HERE and not on the worker, both because find_pipeline() reads a map only
+// this thread may touch and because the consumer must receive exactly the draws that draw_op() will
+// process -- a job nobody consumes would keep its slot busy for ever.
+void decode_publish(Frame& frame) {
+  decode_worker_start();
+  if (!sWorker.running) {
+    return;
+  }
+  sPublishJobs.clear();
+  sPublishOrdinals.assign(frame.draws.size(), UINT32_MAX);
+  for (const Op& op : frame.ops) {
+    if (op.kind != Op::Kind::Draw) {
+      continue;
+    }
+    const gx::DrawData& draw = frame.draws[op.index];
+    const gx::PipelineConfig* config = find_pipeline(draw.pipeline);
+    if (config == nullptr || draw.vtxCount == 0) {
+      continue;
+    }
+    const bool lineMode = config->shaderConfig.lineMode != 0;
+    if (!lineMode && draw.indexCount == 0 && draw.vtxCount < 3) {
+      continue;
+    }
+    sPublishOrdinals[op.index] = static_cast<uint32_t>(sPublishJobs.size());
+    sPublishJobs.push_back({op.index, config, lineMode});
+  }
+  {
+    std::lock_guard<std::mutex> lock(sWorker.mu);
+    sWorker.frame = &frame;
+    sWorker.jobs = sPublishJobs;
+    sWorker.jobCount = static_cast<uint32_t>(sWorker.jobs.size());
+    sWorker.nextJob = 0;
+    sWorker.readyCount.store(0, std::memory_order_release);
+    sWorker.freeCount.store(0, std::memory_order_release);
+  }
+  sOrdinalOfDraw.swap(sPublishOrdinals);
+  sWorker.cvNewJob.notify_all();
+}
+
+// Blocks until this draw's decode result exists. The time spent actually blocking is the part of decode
+// that did NOT move off the critical path, so it is booked as `decode` alongside the inline path.
+const DecodeSlot* decode_wait(uint32_t ordinal, uint32_t drawIndex) {
+  (void)drawIndex;
+  if (!sWorker.running || ordinal == UINT32_MAX) {
+    return nullptr;
+  }
+  ++sWorker.waitCalls;
+  // Fast path: one acquire load, no lock. This is the normal case (>99 % of draws, measured).
+  if (sWorker.readyCount.load(std::memory_order_acquire) <= ordinal) {
+    ++sWorker.waitBlocks;
+    const auto start = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> lock(sWorker.mu);
+    sWorker.cvReady.wait(lock, [ordinal] {
+      return sWorker.readyCount.load(std::memory_order_acquire) > ordinal;
+    });
+    sPhase.decodeMs += ms_since(start);
+  }
+  return &sWorker.slots[ordinal % kDecodeSlots];
+}
+
+void decode_release(uint32_t ordinal) {
+  // Strictly increasing: the op loop consumes ordinals in publish order, so a plain store is correct
+  // and needs no read-modify-write.
+  sWorker.freeCount.store(ordinal + 1, std::memory_order_release);
+  sWorker.cvSlotFree.notify_one();
+}
+
+// End of frame: every posted draw has been consumed and released by now, so this is a formality that
+// also makes the next frame's publish safe (the worker must not still be reading `jobs` when the next
+// frame swaps it). Counted in `other` if it ever costs anything measurable.
+// Decodes the same draw inline and compares. Called only while sVerifyFrames > 0 (TPV_VERIFY_DECODE).
+void decode_verify(const Frame& frame, const gx::DrawData& draw, const gx::PipelineConfig& config, bool lineMode,
+                   const DecodeSlot& slot) {
+  const gx::vita::DecodedLayout layout = gx::vita::decoded_layout(config.shaderConfig);
+  bool same;
+  if (lineMode) {
+    gx::vita::expand_lines(config, draw, frame, layout, sVerifyChunks);
+    same = sVerifyChunks.size() == slot.chunks.size();
+    for (size_t i = 0; same && i < sVerifyChunks.size(); ++i) {
+      same = sVerifyChunks[i].vertices == slot.chunks[i].vertices && sVerifyChunks[i].indices == slot.chunks[i].indices;
+    }
+    ++sVerifySkipped;
+  } else {
+    sVerifyScratch.resize(static_cast<size_t>(draw.vtxCount) * layout.stride);
+    gx::vita::decode_draw(config, draw, frame, layout, sVerifyScratch);
+    same = sVerifyScratch.size() == slot.decoded.size() &&
+           (sVerifyScratch.empty() ||
+            std::memcmp(sVerifyScratch.data(), slot.decoded.data(), sVerifyScratch.size()) == 0);
+  }
+  ++sVerifyChecks;
+  if (!same) {
+    ++sVerifyDiffs;
+  }
+}
+
+// End of frame: every posted draw has been consumed and released by now, so this is a formality that
+// also makes the next frame's publish safe (the worker must not still be reading `jobs` when the next
+// frame replaces it). Counted in `other` if it ever costs anything measurable.
+void decode_drain() {
+  if (!sWorker.running) {
+    return;
+  }
+  const auto start = std::chrono::steady_clock::now();
+  {
+    std::unique_lock<std::mutex> lock(sWorker.mu);
+    sWorker.cvSlotFree.wait(lock, [] {
+      return sWorker.freeCount.load(std::memory_order_acquire) >= sWorker.jobCount;
+    });
+  }
+  sOtherTailMs += ms_since(start);
 }
 
 // submit_geometry is the only place that issues glDraw*, so its time IS the submit phase.
@@ -1186,7 +1513,8 @@ void bind_fog_range(const Frame& frame, const gx::DrawData& draw, const Program&
 }
 
 // One program pass of a draw; `decoded` / `chunks` are already filled for this draw.
-void draw_pass(const Frame& frame, const gx::DrawData& draw, const gx::PipelineConfig& config, bool lineMode) {
+void draw_pass(const Frame& frame, const gx::DrawData& draw, const gx::PipelineConfig& config, bool lineMode,
+               const DecodedView& decoded) {
   const bool replace = replaces_alpha(config);
   const uint32_t lights = gx::vita::lights_in_use(light_location(config),
                                                   frame.uniforms.data() + draw.uniformRange.offset,
@@ -1204,20 +1532,22 @@ void draw_pass(const Frame& frame, const gx::DrawData& draw, const gx::PipelineC
   bind_textures(*program, draw);
   bind_fog_range(frame, draw, *program);
   if (lineMode) {
-    for (const auto& chunk : sScratch.chunks) {
-      submit_geometry(*program, chunk.vertices.data(),
-                      static_cast<uint32_t>(chunk.vertices.size() / program->layout.stride), chunk.indices.data(),
-                      static_cast<uint32_t>(chunk.indices.size()));
+    if (decoded.chunks != nullptr) {
+      for (const auto& chunk : *decoded.chunks) {
+        submit_geometry(*program, chunk.vertices.data(),
+                        static_cast<uint32_t>(chunk.vertices.size() / program->layout.stride), chunk.indices.data(),
+                        static_cast<uint32_t>(chunk.indices.size()));
+      }
     }
     return;
   }
   const bool indexed = draw.indexCount != 0;
   const auto* indices =
       indexed ? reinterpret_cast<const uint16_t*>(frame.indices.data() + draw.idxRange.offset) : nullptr;
-  submit_geometry(*program, sScratch.decoded.data(), draw.vtxCount, indices, draw.indexCount);
+  submit_geometry(*program, decoded.vertices, draw.vtxCount, indices, draw.indexCount);
 }
 
-void draw_op(const Frame& frame, const gx::DrawData& draw) {
+void draw_op(const Frame& frame, const gx::DrawData& draw, uint32_t drawIndex) {
   const gx::PipelineConfig* config = find_pipeline(draw.pipeline);
   if (config == nullptr || draw.vtxCount == 0) {
     return;
@@ -1228,18 +1558,40 @@ void draw_op(const Frame& frame, const gx::DrawData& draw) {
   }
   // The layout depends only on the shader config, so both passes (and either program variant) share it.
   const gx::vita::DecodedLayout layout = gx::vita::decoded_layout(config->shaderConfig);
-  const auto decodeStart = std::chrono::steady_clock::now();
-  if (lineMode) {
-    gx::vita::expand_lines(*config, draw, frame, layout, sScratch.chunks);
-    if (sScratch.chunks.empty()) {
-      sPhase.decodeMs += ms_since(decodeStart);
-      return;
+  // The decode itself ran on the worker while this thread was doing the previous draws' GL work
+  // (HANDOVER 7.22). What is left here is the rendezvous: normally zero, because the worker is ahead.
+  // If the worker never started, or this draw was not posted to it, decode happens inline exactly as
+  // before -- the overlapped and the fallback path differ only in WHERE the bytes came from.
+  const uint32_t ordinal =
+      drawIndex < sOrdinalOfDraw.size() ? sOrdinalOfDraw[drawIndex] : UINT32_MAX;
+  DecodedView decoded;
+  const DecodeSlot* slot = decode_wait(ordinal, drawIndex);
+  if (slot != nullptr) {
+    if (sVerifyFrames > 0) {
+      decode_verify(frame, draw, *config, lineMode, *slot);
     }
+    decoded.vertices = slot->decoded.data();
+    decoded.chunks = &slot->chunks;
   } else {
-    sScratch.decoded.resize(static_cast<size_t>(draw.vtxCount) * layout.stride);
-    gx::vita::decode_draw(*config, draw, frame, layout, sScratch.decoded);
+    const auto decodeStart = std::chrono::steady_clock::now();
+    ++sWorker.inlineDecodes;
+    if (lineMode) {
+      gx::vita::expand_lines(*config, draw, frame, layout, sScratch.chunks);
+      decoded.chunks = &sScratch.chunks;
+    } else {
+      sScratch.decoded.resize(static_cast<size_t>(draw.vtxCount) * layout.stride);
+      gx::vita::decode_draw(*config, draw, frame, layout, sScratch.decoded);
+      decoded.vertices = sScratch.decoded.data();
+    }
+    sPhase.decodeMs += ms_since(decodeStart);
   }
-  sPhase.decodeMs += ms_since(decodeStart);
+  // A line draw whose expansion produced no chunk has nothing to submit; release the slot either way.
+  if (lineMode && (decoded.chunks == nullptr || decoded.chunks->empty())) {
+    if (slot != nullptr) {
+      decode_release(ordinal);
+    }
+    return;
+  }
   ++sPhase.draws;
   // `pass` = everything draw_op spends that is not decode and not submit_geometry: program/uniform binds,
   // texture binds, the fog-range LUT upload. Taken as the enclosing span minus what the two inner timers
@@ -1262,12 +1614,15 @@ void draw_op(const Frame& frame, const gx::DrawData& draw) {
     gx::PipelineConfig alphaPass = *config;
     alphaPass.colorUpdate = false;
     alphaPass.depthUpdate = false;
-    draw_pass(frame, draw, alphaPass, lineMode);
+    draw_pass(frame, draw, alphaPass, lineMode, decoded);
     gx::PipelineConfig colorPass = *config;
     colorPass.alphaUpdate = false;
-    draw_pass(frame, draw, colorPass, lineMode);
+    draw_pass(frame, draw, colorPass, lineMode, decoded);
   } else {
-    draw_pass(frame, draw, *config, lineMode);
+    draw_pass(frame, draw, *config, lineMode, decoded);
+  }
+  if (slot != nullptr) {
+    decode_release(ordinal);
   }
 }
 
@@ -1415,8 +1770,19 @@ void set_present_size(uint32_t width, uint32_t height) noexcept {
 
 void replay(Frame& frame) {
   ++sFrameIndex;
+  if (sVerifyFrames > 0) {
+    --sVerifyFrames;
+    if (sVerifyFrames == 0) {
+      Log.warn("decode worker A/B complete: {} results compared, {} differed ({} line draws). "
+               "A non-zero difference count means the overlap is NOT safe to ship.",
+               sVerifyChecks, sVerifyDiffs, sVerifySkipped);
+    }
+  }
   // Start a fresh per-frame phase record; `other` is filled at the end as the remainder.
   sPhase = PhaseTimes{};
+  sLastSetupMs = sOtherSetupMs;
+  sLastClearMs = sOtherClearMs;
+  sLastTailMs = sOtherTailMs;
   sOtherSetupMs = sOtherClearMs = sOtherTailMs = 0;
   const auto frameStart = std::chrono::steady_clock::now();
   const auto setupStart = std::chrono::steady_clock::now();
@@ -1425,6 +1791,10 @@ void replay(Frame& frame) {
   ensure_efb();
   invalidate_cache();
   sOtherSetupMs += ms_since(setupStart);
+  // Hand the frame's whole draw list to the decode worker BEFORE the op loop starts, so 36.9 % of the
+  // frame decodes while this thread does the clear, the state changes and the GL calls. See the block
+  // above decode_worker_main() for why this is safe and what it is worth.
+  decode_publish(frame);
   // Breadcrumbs for a first run: the first frames, then a heartbeat. If the process dies, the last line in the
   // log (flushed per Info line) says which frame it was working on and how many programs it had compiled.
   // TEMPORARY TIMING PROBE (item 4). An emulator cannot give a console frame rate, but it can give the
@@ -1467,7 +1837,39 @@ void replay(Frame& frame) {
       // `other` is broken down per frame; the values shown are this window's last frame, which is
       // representative because a scene's composition is stable (measured: see HANDOVER 7.21).
       Log.warn("    other split of frame: setup {:.1f}% | clear {:.1f}% | tail {:.1f}% (survey excluded)",
-               pct(sOtherSetupMs), pct(sOtherClearMs), pct(sOtherTailMs));
+               pct(sLastSetupMs), pct(sLastClearMs), pct(sLastTailMs));
+      // The decode worker's own accounting, as a share of the same frame total. `decode` above is now
+      // only the part that could NOT be overlapped (the rendezvous plus any inline fallback), so the
+      // reading that decides whether this worked is the PAIR: if `decode` is still ~37 % the work did
+      // not move, and if it collapsed while `off-thread` is ~37 % then it did. `inline` must be 0 on
+      // any window the worker handled; anything else means the fallback ran and the change is inactive.
+      // Read and reset under the lock: the worker may be decoding the current frame right now, which is
+      // precisely the case this window boundary is measuring.
+      double offthreadMs;
+      uint32_t offthreadDraws;
+      {
+        std::lock_guard<std::mutex> lock(sWorker.mu);
+        offthreadMs = sWorker.decodeMs;
+        offthreadDraws = sWorker.decodedDraws;
+        sWorker.decodeMs = 0;
+        sWorker.decodedDraws = 0;
+      }
+      Log.warn("    decode worker: {:.1f}% of frame decoded off-thread ({} draws, {:.2f} ms), "
+               "rendezvous {:.1f}% ({:.2f} ms), {} inline fallbacks, {} slots, {} threads",
+               pct(offthreadMs), offthreadDraws, offthreadMs, pct(sPhaseWindow.decodeMs),
+               sPhaseWindow.decodeMs, sWorker.inlineDecodes, kDecodeSlots, sWorker.running ? 2 : 1);
+      Log.warn("    decode worker waits: {} calls, {} blocked ({:.2f}% of draws)", sWorker.waitCalls,
+               sWorker.waitBlocks,
+               sWorker.waitCalls ? 100.0 * static_cast<double>(sWorker.waitBlocks) / sWorker.waitCalls : 0.0);
+      sWorker.waitCalls = 0;
+      sWorker.waitBlocks = 0;
+      if (sVerifyFrames > 0 || sVerifyChecks > 0) {
+        Log.warn("    decode worker A/B: {} results compared against an inline decode, {} differed ({} line draws)",
+                 sVerifyChecks, sVerifyDiffs, sVerifySkipped);
+      }
+      Log.warn("    decode worker A/B: {} results compared against an inline decode, {} differed ({} line draws)",
+               sVerifyChecks, sVerifyDiffs, sVerifySkipped);
+      sWorker.inlineDecodes = 0;
       sPhaseWindow = PhaseTimes{};
     }
     gx::vita::vertex_cache_report("window");
@@ -1624,7 +2026,7 @@ void replay(Frame& frame) {
   for (const Op& op : frame.ops) {
     switch (op.kind) {
     case Op::Kind::Draw:
-      draw_op(frame, frame.draws[op.index]);
+      draw_op(frame, frame.draws[op.index], op.index);
       break;
     case Op::Kind::Viewport:
       sCurrent->viewport = op.viewport;
@@ -1660,6 +2062,11 @@ void replay(Frame& frame) {
     Log.warn("frame ended inside an offscreen pass");
     bind_target(*suspended);
   }
+
+  // Every posted draw has been consumed by the loop above, so this only waits when the worker could not
+  // keep up. It also guarantees the worker is not still reading this frame when the next publish swaps
+  // `jobs` -- which is the one ordering hazard the ring does not cover on its own.
+  decode_drain();
 
   // Close the frame's phase record. `other` is everything replay() spent outside the four draw phases;
   // setup and clear are timed directly, and the tail (per-op viewport/scissor/offscreen binds and any

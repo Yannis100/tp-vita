@@ -907,6 +907,12 @@ void decode_draw(const PipelineConfig& config, const DrawData& draw, const gfx::
   uint64_t key = 0;
   const bool cacheable = kVertexCacheEnabled != 0 && srcBytes != 0 && srcBytes <= kVertexCacheSourceMax &&
                          storageBytes <= kVertexCacheSourceMax;
+  // Everything below that touches the cache is compiled out when the cache is disabled. That is not an
+  // optimisation: it is what makes decode_draw PURE -- no global mutable state, no allocation beyond
+  // `out` -- which is the precondition the decode worker (vita_gl_replay.cpp, HANDOVER 7.22) runs on.
+  // While the cache was merely *bypassed*, this function still wrote gVertexCachePendingKey on every
+  // call, and a second thread decoding concurrently with the fallback path would have raced on it.
+  if constexpr (kVertexCacheEnabled != 0) {
   if (cacheable) {
     const auto hashStart = std::chrono::steady_clock::now();
     key = config_key(config, draw);
@@ -945,9 +951,14 @@ void decode_draw(const PipelineConfig& config, const DrawData& draw, const gfx::
       ++gVertexCacheStats.rejectedTooBig;
     }
   }
+  } // if constexpr (kVertexCacheEnabled)
 
   {
-    const auto decodeStart = std::chrono::steady_clock::now();
+    // Two clock reads per draw are worth paying only when something reads the result.
+    std::chrono::steady_clock::time_point decodeStart{};
+    if constexpr (kVertexCacheEnabled != 0) {
+      decodeStart = std::chrono::steady_clock::now();
+    }
     const Ctx ctx{frame.verts.data() + vertStart, vtxStride, frame.storage.data(), frame.storage.size()};
     uint32_t nrmSlice = 0;
     for (uint32_t i = 0; i < layout.count; ++i) {
@@ -956,11 +967,15 @@ void decode_draw(const PipelineConfig& config, const DrawData& draw, const gfx::
       const Plan p = make_plan(config, draw, e, slice, vtxStride);
       run_plan(p, ctx, dst, stride, n);
     }
-    gCacheNanosDecode += static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - decodeStart).count());
-    gCacheDecodedVerts += n;
+    if constexpr (kVertexCacheEnabled != 0) {
+      gCacheNanosDecode += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                      std::chrono::steady_clock::now() - decodeStart)
+                                                      .count());
+      gCacheDecodedVerts += n;
+    }
   }
 
+  if constexpr (kVertexCacheEnabled != 0)
   if (gVertexCachePendingKey != 0) {
     VertexCacheEntry& slot = *vertex_cache_victim(gVertexCachePendingKey);
     const uint32_t needed =

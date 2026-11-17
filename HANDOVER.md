@@ -2507,6 +2507,130 @@ faster than a Cortex-A9 on some paths, and the 91.6 ms/frame mean here is emulat
 the useful output and they are the best evidence available without hardware. §11's conclusion is unchanged:
 a console profile is what converts this into a work order.
 
+### 7.22 Rank 1, built and measured: the overlap works, and it is still 19 % slower (2026-11-17)
+
+§7.20 ranked a GX worker + frame overlap first and §7.21 measured 89.9 % of a gameplay frame as
+moveable (decode 36.9 %, submit 14.7 %, pass 38.4 %). This is what happened when it was built.
+
+#### What was built
+
+`vita_gl_replay.cpp` gained a long-lived detached decode thread behind `TPV_ENABLE_DECODE_WORKER`.
+Decode is the right thing to move because it is a PURE function of
+`(PipelineConfig, DrawData, Frame)`: no GL call, no dependence on draw order. Making that true in
+fact and not just in appearance required compiling `vita_vertex.cpp`'s cache bookkeeping out with
+`if constexpr (kVertexCacheEnabled != 0)` -- while the cache was merely bypassed, `decode_draw` still
+wrote `gVertexCachePendingKey` on every call, and a second thread would have raced on it.
+
+Design, each choice forced by an earlier measurement rather than taste:
+
+| choice | why |
+|---|---|
+| one thread, created once, detached | per-frame creation is what the §7.1 abort history is about; a detached thread parks on a condition variable and costs nothing at teardown |
+| 24 reusable slots, not a per-frame arena | an unexpectedly heavy frame cannot balloon the heap, and the consumer frees a slot as soon as the draw is issued |
+| a wait, never an inline decode, when a result is late | decoding inline would steal the core the worker is using |
+| the whole draw list published before the op loop | the worker has the frame's work queued while this thread does setup and the first passes |
+| three monotone atomics, not a lock per draw | see below -- this was the first of two real performance findings |
+
+**Correctness is proven, not asserted.** A byte-exact A/B mode (`TPV_VERIFY_DECODE`) decodes every
+worker result inline a second time and `memcmp`s it. On the benchmark scene it compared **23,600
+worker decodes against inline decodes and 0 differed**; every one of the 91 host scenes still passes
+(14,266 pixel checks). That mode is now opt-in, because while it ran by default it double-decoded in
+the worker-on build only -- which made the first three A/B runs measure the verifier. That mistake is
+recorded as trap 31.
+
+#### The measurement, and the result
+
+A new `--bench <scene> [frames]` mode in the e2e harness replays ONE recorded frame many times, so
+scene composition is identical by construction. This was necessary: the Vita3K route cannot answer the
+question (trap 29). The scene is a synthetic 47,200-draw frame, 393 draws per frame, and every
+iteration records the same bytes.
+
+| | median, 4 interleaved rounds |
+|---|---|
+| worker OFF (inline, the old path) | **47.7 ms** |
+| worker ON (overlapped) | **57.0 ms** |
+
+**19 % slower**, consistently, in every round. The mechanism is not in doubt; the economics are.
+
+The diagnostics say exactly why:
+
+```
+decode worker: 11.6% of frame decoded off-thread (47201 draws, 408 ms),
+               rendezvous 0.2% (6.3 ms), 0 inline fallbacks, 24 slots, 2 threads
+decode worker waits: 47200 calls, 87 blocked (0.18% of draws)
+```
+
+The overlap works perfectly: **0.18 % of draws ever block**, so virtually all decode did leave the
+critical path. And it still loses, because:
+
+1. **Decode is only 11 % of this frame**, while the hand-off plus a second runnable thread on a
+   16-thread llvmpipe rasteriser costs more than 11 %.
+2. The per-draw hand-off is 393 `notify` calls and 393 atomic publishes per frame. The first version
+   used a mutex + condition variable per draw and was **22 %** slower; switching to monotone atomics
+   and `notify_one` recovered about 3 points of that, not the rest.
+
+So the honest verdict: **the machinery is correct and the overlap is real, and on the only proxy
+available it does not pay.** It is gated OFF by default rather than deleted, because the proxy is not
+the target -- see the next section.
+
+#### What this does and does not settle
+
+What it settles: decode CAN be moved off the GL thread with byte-identical results, and the pipeline
+reaches a 0.18 % stall rate. That part of Rank 1 is done and reusable.
+
+Scope, stated plainly because Rank 1 was asked for as "multi-thread, frame overlap": what was built is
+**intra-frame** pipelining -- the worker decodes this frame's draws while the GL thread issues this
+frame's GL calls. The **cross-frame** version (start decoding frame N+1 while frame N is still issuing)
+was NOT built: it needs the recorder's four buffers double-buffered, so `begin_frame` can start
+appending while the previous frame's bytes are still being read. That is the version that would hide a
+whole phase rather than pipeline within one, and it is listed next as the version worth trying.
+
+What it does not settle: **the Vita number.** The benchmark is llvmpipe on a 16-core host with a
+rasteriser that already uses many threads. A Vita has two Cortex-A9 cores in total, and on the console
+figure this whole exercise exists for, decode is 37-43 % of the frame (§7.21, DuskOnVita's own
+profile) rather than the 11 % measured here. Twelve percent of a frame is not worth a hand-off; forty
+percent plausibly is. The one experiment that decides it is a hardware run with
+`TPV_ENABLE_DECODE_WORKER` set and unset, and that is not available here.
+
+What would make it win on the proxy too, in order of expected value:
+1. **Overlap at a coarser granularity.** Hand off whole *draw ranges* (8-32 draws) instead of single
+   draws: the same overlap with 1/32 the notifications. At 0.18 % stalls there is no benefit to
+   per-draw granularity, so this is pure overhead removal.
+2. **Overlap the frame, not the draw.** Start decoding frame N+1 while frame N is still issuing GL
+   calls. That needs the recorder's buffers to be double-buffered, which is a larger change but is the
+   version that actually hides a whole phase rather than pipelining within one.
+
+#### The lever this leaves standing, and it is bigger
+
+`pass` was 38.4 % of a gameplay frame in §7.21 and is **56-72 %** on every window of this benchmark
+(per-draw uniform upload, texture binds, program binds, fog-range LUT). It is the largest single phase
+in both measurements, it has never been attacked, and unlike decode it cannot move to another thread
+-- it is GL calls. §7.20's ranking put it third behind decode and resident geometry; on this evidence
+it should be first. That is the recommendation that follows from spending a session on Rank 1 and
+finding it negative.
+
+#### Instrumentation bug this session found (and fixed)
+
+`other split of frame: setup … | clear … | tail …` printed **0.0 % for all three columns**. The
+accumulators are reset at the top of `replay()` and the report runs later in the same call, so it
+always read zeros. §7.21's numbers were correct (they were taken before the per-frame reset was
+added); the reporting order broke afterwards. They are now snapshotted at end of frame
+(`sLastSetupMs` / `sLastClearMs` / `sLastTailMs`). Three columns of confident nothing, for the
+duration of a session, is what trap 32 is about.
+
+#### Files
+
+| file | change |
+|---|---|
+| `vita/aurora/overlay/gfx/vita_gl_replay.cpp` | decode worker, counter handshake, A/B verification, `--bench` reporting; `other`-split reporting bug fixed |
+| `vita/aurora/overlay/gx/vita_vertex.cpp` | cache bookkeeping compiled out so `decode_draw` is pure |
+| `tests/host/e2e/e2e_main.cpp` | `--bench <scene> [frames]` mode and the `bench_heavy` scene |
+| `tools/ab_decode_worker.py` | compares two Vita3K runs by WORKLOAD, and refuses to if the scenes differ |
+
+`tools/ab_decode_worker.py` exists because the obvious comparison is wrong in a way that produced a
+70 % "improvement" before it was caught: matching on frame number compares different scenes, since
+game time in this port is wall-clock. It refuses to substitute a frame-number match.
+
 ## 8. Traps and gotchas
 
 1. **`tp-vita/` is a git repo** (`Yannis100/tp-vita`), but `build/` and `deps/` are gitignored, so **a
@@ -2597,14 +2721,14 @@ a console profile is what converts this into a work order.
     uses the first flag with a different file format — so a recipe copied between linkers fails in a way
     that reads like a syntax typo. Confirm the mechanism with two `nm` calls on two links, with and
     without the flag, never by the flag being accepted.
-28. **Check WHICH frames your phase split averaged.** A first pass of §7.21 reported decode 3.3 % and
+27. **Check WHICH frames your phase split averaged.** A first pass of §7.21 reported decode 3.3 % and
     `other` 59.7 %, and on that basis Rank 2 was written off. The windows had been selected by
     `draws == modal count`, which picked a menu composition, and the real gameplay windows were excluded
     as "huge" outliers. Re-cutting by frame range gave decode 36.9 %, pass 38.4 %, other 8.3 % -- the
     opposite conclusion. A phase split is only as good as its population, so print the frame numbers, the
     draw counts and the window time alongside the percentages, and state which frames were averaged.
     (Borrowing another port's split is a separate hazard, and it happened to be roughly right here.).
-27. **An archive is not a set of leaf functions.** `*libc.a:*(.text .text.*)` looks like "put libc
+28. **An archive is not a set of leaf functions.** `*libc.a:*(.text .text.*)` looks like "put libc
     first" and actually relocates 4,921 functions, most of them stdio/locale/time/filesystem bulk, while
     the two you wanted (`memcpy`, `malloc`) do not move at all. Measured: the hot veneer count went
     58 -> 90 (§7.19b). Archive-level link ordering is too coarse to control distance; if you need to
@@ -2612,6 +2736,40 @@ a console profile is what converts this into a work order.
     layout and not the flag being accepted.
 
 ---
+
+29. **Two Vita3K runs of the same waits script are NOT in the same scene, so do not pair them by frame number.**
+Game time in this port is wall-clock (`dusk::game_clock` samples the native clock) while the
+frame-counted input script advances with RENDERED frames. Two runs of the same waits file therefore
+end at different points: measured 2026-11-17, one reached frame 3480 and the other 9480, with draw
+counts differing by 2.6x. Pairing by frame number produced a "70 % improvement" that was pure scene
+content; pairing by draw count is better but still not sufficient, and a frame-time-vs-draws fit gave
+R^2 = 0.014 (i.e. the fit describes nothing). What works: `tests/host/e2e/e2e --bench`, which replays
+one recorded frame repeatedly so composition is constant. What also works: a RATIO within a single run
+(the phase percentages), which cancels composition by construction.
+
+30. **Check that the workload you are pipelining has more than one item in it.**
+The first version of the `bench_heavy` scene issued 400 `GXBegin` calls per frame and the recorder
+merged them into ONE draw, because adjacent draws merge only when their uniform BYTES are identical
+and nothing varied. The benchmark then reported "1 draw per frame", the worker had a single decode to
+overlap, the consumer necessarily blocked on 100 % of waits, and the run "proved" that pipelining does
+not work -- correctly, for an entirely different reason than the one being tested. The fix was one
+`GXSetTevColor` per iteration. Diagnose this with a count, not a feeling: `waits: N calls, M blocked`
+with M == N means there was nothing to overlap.
+
+31. **An instrument that changes only one arm of an A/B is not an instrument, it is the experiment.**
+The byte-exact decode verification ran automatically for the first 60 frames. It double-decodes, so it
+ran only in the build where the worker exists -- meaning the worker-on arm paid for every draw twice
+while the worker-off arm did not. Three A/B rounds "showed" a 20 % regression that was mostly the
+verifier. Any instrumentation toggled by build configuration must be OFF during measurement and
+switched on deliberately to prove correctness. Same family as trap 12, different mechanism.
+
+32. **A report that reads accumulators after they are reset prints confident zeros.**
+`other split of frame: setup X% | clear Y% | tail Z%` printed 0.0 for all three for a whole session.
+The three accumulators are per-frame and were reset at the top of `replay()`, while the report runs
+later in the same call -- so it always read the reset values. The earlier numbers were right because
+they predated the reset; adding the reset silently broke the report. Snapshot per-frame values into
+`Last*` variables at end of frame. Sanity check any diagnostic that reports a per-frame value at a
+different point in the frame from where it was written.
 
 ## 9. Files the port owns (`tp-vita/`)
 
@@ -2673,6 +2831,23 @@ wants a rendering win, the honest position is that none is left that this tool c
 **Two candidates that are worth real work, in order:** (1) **hardware**, because everything about save reload,
 shader-cache write, performance and audio is unmeasurable here; (2) driving **both** ports to the same scene
 and frame, the only way to tell whether the §7.4b fixes improved the picture.
+
+**Re-ranked after §7.22 was actually built and measured (2026-11-17).** The old §7.20 order was
+decode worker first. That was built, proven byte-exact, and measured 19 % SLOWER on the only proxy
+available -- so it ships off by default and the next lever is not the one the ranking predicted:
+
+1. **`pass` -- per-draw GL state.** 38.4 % of a gameplay frame in §7.21 and 56-72 % on every window of
+   the new benchmark: uniform upload, texture binds, program binds, fog-range LUT. It is now the
+   largest phase in both measurements, it has never been attacked, and unlike decode it CANNOT move to
+   another thread because it is GL calls -- so it needs fewer calls, not a second core. §7.3c closed
+   *merging* draws at 1.17x, but that is a different question from *per-draw overhead*, which is what
+   this is. Start by attributing the phase: how much is `glUniform*`, how much `bind_texture`, how much
+   `apply_pass_state`.
+2. **Hardware**, unchanged and now more urgent: the decode worker is the second lever whose sign a
+   proxy got wrong (the vertex cache was the first, §7.9). Whether the overlap wins on a Cortex-A9 is a
+   single run with `TPV_ENABLE_DECODE_WORKER` set and unset, and nothing here can answer it.
+3. **Overlap at a coarser granularity** (draw ranges of 8-32, or the whole next frame), which is the
+   version of Rank 1 that does not pay 393 hand-offs per frame.
 
 **But scope (2) correctly, because §7.16 changed it.** The third port now runs, and it renders **960 px wide**
 while ours renders **738**. So it is not a drop-in pixel reference: a same-scene pair differs first by that
