@@ -1286,10 +1286,12 @@ bool decode_worker_allowed() {
     // than it saves, because on that frame decode is only 11 % of the time while the hand-off and a
     // second runnable thread on a 16-thread llvmpipe rasteriser cost more than 11 %.
     //
-    // It is kept behind a flag rather than deleted because the proxy is not the target: the Vita has two
-    // cores doing all of this, and the console number this change exists for (7.20/7.21 put decode at
-    // 37-43 % of a real gameplay frame) cannot be obtained from an emulator. What would settle it is one
-    // run on hardware with the flag on and off. Until then this is not shipped behaviour.
+    // It is kept behind a flag rather than deleted because the proxy is not the target. The Vita is a
+    // quad-core Cortex-A9 and a game may use three cores (the 4th is reserved for system tasks;
+    // CapUnlocker can release it), so a spare core exists here -- but it is ONE contended core, not the
+    // fifteen idle ones this host has, and the point of the console number is that decode is 37-43 % of
+    // a real frame there (7.20/7.21) rather than the 11 % measured on the benchmark. What would settle
+    // it is one run on hardware with the flag on and off. Until then this is not shipped behaviour.
     if (std::getenv("TPV_ENABLE_DECODE_WORKER") == nullptr) {
       return false;
     }

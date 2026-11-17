@@ -2586,8 +2586,10 @@ appending while the previous frame's bytes are still being read. That is the ver
 whole phase rather than pipeline within one, and it is listed next as the version worth trying.
 
 What it does not settle: **the Vita number.** The benchmark is llvmpipe on a 16-core host with a
-rasteriser that already uses many threads. A Vita has two Cortex-A9 cores in total, and on the console
-figure this whole exercise exists for, decode is 37-43 % of the frame (§7.21, DuskOnVita's own
+rasteriser that already uses many threads. A Vita is a quad-core Cortex-A9 of which a game may use
+three (the fourth is reserved for system tasks; CapUnlocker can release it), so a second thread is
+available but is a scarce, contended resource rather than one of fifteen idle ones -- and on the
+console figure this whole exercise exists for, decode is 37-43 % of the frame (§7.21, DuskOnVita's own
 profile) rather than the 11 % measured here. Twelve percent of a frame is not worth a hand-off; forty
 percent plausibly is. The one experiment that decides it is a hardware run with
 `TPV_ENABLE_DECODE_WORKER` set and unset, and that is not available here.
@@ -2630,6 +2632,88 @@ duration of a session, is what trap 32 is about.
 `tools/ab_decode_worker.py` exists because the obvious comparison is wrong in a way that produced a
 70 % "improvement" before it was caught: matching on frame number compares different scenes, since
 game time in this port is wall-clock. It refuses to substitute a frame-number match.
+
+### 7.23 Can the port use all four cores? Two different questions, and the cheap one is unanswered (2026-11-17)
+
+"Use the 4th core" conflates two things. They have different costs and only one is worth doing first.
+
+#### A. CapUnlocker (releasing the 4th core) -- possible, but not the first move
+
+A Vita is a quad-core Cortex-A9. A game may use **three** cores: `SCE_KERNEL_CPU_MASK_USER_0/1/2` =
+`0x10000/0x20000/0x40000`, `_ALL` = `0x70000`. The **4th is reserved for system tasks**, and a kernel
+plugin (CapUnlocker, as used by Halo CE Vita and mh3-wii) can release it.
+
+Verified in this tree: the port requires **no kernel plugin today** -- no `kubridge`, no CapUnlocker,
+no `SCE_KERNEL_SYSMODULE` loads. Adding one is a real distribution cost:
+
+- the user must install a `*.skprx` and edit `ur0:tai/config.txt`;
+- CapUnlocker is firmware-version sensitive, and forcing a plugin on users of a build that currently
+  runs is a downgrade in usability;
+- it gains **one** contended core, not four. On a Cortex-A9 at 444 MHz shared with the renderer,
+  audio and the emulated guest's own threads, a 4th core is not automatically worth the install.
+
+So: possible, and it belongs on the hardware-tuning list, not at the top.
+
+#### B. Actually using the cores we already have -- and this port does not, because nothing is pinned
+
+This is the more important finding, and it is about the **three** cores, not the fourth.
+
+Verified in this tree: there is **no CPU affinity control anywhere**. No
+`sceKernelChangeThreadCpuAffinityMask`, no `cpuAffinityMask` on any `sceKernelCreateThread`, no
+`pthread_attr_setaffinity_np`. Every thread inherits the mask of whichever thread created it, so in
+practice everything -- the game thread, the GL replay, the file/memcard threads (which dusklight runs
+on detached `std::thread`s), the audio mixer -- is spread across the three user cores by the
+scheduler's default. pthreads are genuinely live (CMake forces the four weak `pthread_*` symbols in
+so `__gthread_active_p()` is true), but nothing decides *where* any of it runs.
+
+That matters because the two porting references in the skill both found pinning itself to be a win,
+independent of any new thread:
+
+- **KOTOR II** pins every thread to a fixed 3-core layout and keeps a *thread census* so it can list
+  which core is busy and with what; it also ships a `THREAD_PINNING` toggle so one console session can
+  A/B pinned against unpinned.
+- **Halo CE Vita** found its render thread on core 0 was *the* limit, which is a diagnosis you cannot
+  even make without affinity control.
+
+The cheapest experiment this port could run next is therefore not "add a 4th core" and not "add
+another thread". It is: **build a `vita-cpu-census` that reports each thread's mask and which core it
+is on, then pin the two threads that matter** -- the game/GL thread to one core and everything
+streaming (file reads, memcard, audio) to another. No plugin, no new dependency, and it addresses the
+same `pass`/`submit` phases §7.22 left standing.
+
+#### C. Does any of this rescue the §7.22 decode worker?
+
+Partly, and it changes *what to fix* rather than the verdict.
+
+The 19 % loss on the host benchmark is explained by decode being only 11 % of that frame while the
+hand-off plus a second runnable thread cost more. On a Vita the arithmetic is genuinely different:
+decode is 37-43 % of a real frame there, and there is no 16-thread llvmpipe rasteriser to compete
+with -- just one GPU driver thread and the game threads. So the mechanism has a better chance on
+hardware than on the proxy.
+
+But it would still be measured against **393 hand-offs per frame**, which is the number §7.22
+identified as pure overhead. The order that follows is:
+
+1. **Estimate the upper bound before touching a console.** §7.22's arithmetic inverts on the Vita:
+   if decode is 40 % of a 154 ms frame (DuskOnVita's own figure) and can be fully hidden, the ceiling
+   is ~61 ms saved. If it is 11 %, the ceiling is ~17 ms against a hand-off cost that already lost
+   19 % on a faster CPU. Do this sum before any hardware run.
+2. **Coarsen the hand-off** (draw ranges of 8-32, or the whole next frame) so it is ~13-50 hand-offs
+   per frame instead of 393. This is a change to make *before* spending a hardware session, because it
+   is the difference between testing the mechanism and testing the overhead.
+3. **Then pin, and then measure on hardware** with `TPV_ENABLE_DECODE_WORKER` on and off. Only a
+   console run settles the sign.
+4. CapUnlocker last, if ever: it is a distribution cost for one core, and cores 1-2 are still idle.
+
+#### The honest summary
+
+- CapUnlocker: **yes, the port could use the 4th core, and it does not today.** It is not required for
+  anything this port currently does, and it should not be the first step.
+- All four cores: **no, and not because of a missing plugin -- because nothing in this port sets an
+  affinity mask at all.** Three cores are available right now and are being used by accident rather
+  than by design.
+- Whether either one buys frame time is **unverified on hardware**, and §7.22 is the record of what
+  happens when this project assumes an answer to a threading question instead of measuring it.
 
 ## 8. Traps and gotchas
 
@@ -2843,11 +2927,21 @@ available -- so it ships off by default and the next lever is not the one the ra
    *merging* draws at 1.17x, but that is a different question from *per-draw overhead*, which is what
    this is. Start by attributing the phase: how much is `glUniform*`, how much `bind_texture`, how much
    `apply_pass_state`.
-2. **Hardware**, unchanged and now more urgent: the decode worker is the second lever whose sign a
+2. **Thread placement -- the free half of "use all four cores" (§7.23).** Nothing in this port sets a
+   CPU affinity mask: no `sceKernelChangeThreadCpuAffinityMask`, no `cpuAffinityMask`, no
+   `pthread_attr_setaffinity_np`. Three user cores are available and are used by accident. KOTOR II and
+   Halo CE both treat pinning as a win in itself, and Halo CE's conclusion ("the render thread on core
+   0 was the limit") is a diagnosis this port cannot currently make. Cost: no plugin, no new thread --
+   a thread census plus two pins. Do this before asking for a 4th core.
+3. **Hardware**, unchanged and now more urgent: the decode worker is the second lever whose sign a
    proxy got wrong (the vertex cache was the first, §7.9). Whether the overlap wins on a Cortex-A9 is a
-   single run with `TPV_ENABLE_DECODE_WORKER` set and unset, and nothing here can answer it.
-3. **Overlap at a coarser granularity** (draw ranges of 8-32, or the whole next frame), which is the
-   version of Rank 1 that does not pay 393 hand-offs per frame.
+   single run with `TPV_ENABLE_DECODE_WORKER` set and unset, and nothing here can answer it. CapUnlocker
+   (the 4th core) is a distribution cost -- a user-installed kernel plugin -- for one core, and it is
+   last, not first.
+4. **Overlap at a coarser granularity** (draw ranges of 8-32, or the whole next frame), which is the
+   version of Rank 1 that does not pay 393 hand-offs per frame. Do the ceiling arithmetic in §7.23
+   first: at 40 % decode it is worth ~61 ms a frame, at 11 % it is ~17 ms against a hand-off that
+   already lost 19 % on a faster CPU.
 
 **But scope (2) correctly, because §7.16 changed it.** The third port now runs, and it renders **960 px wide**
 while ours renders **738**. So it is not a drop-in pixel reference: a same-scene pair differs first by that
