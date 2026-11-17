@@ -13,6 +13,15 @@
 //    (ProgramSource::usesExtra, uExtra.x) instead of via the blend constant.
 #include "vita_frame.hpp"
 
+// The thread census / affinity module is Vita-only: this file is also compiled for the host e2e harness,
+// where there is no psp2/ and no motherboard to place threads on. Guarding the include AND the one call
+// site keeps both builds working from one source.
+#ifdef __vita__
+#include "cpu_placement.hpp"
+
+#include <psp2/kernel/threadmgr.h>
+#endif
+
 #include "vita_gl.hpp"
 #include "vita_shader_dump.hpp"
 #include "vita_texture.hpp"
@@ -1227,6 +1236,16 @@ std::vector<uint8_t> sVerifyScratch;
 std::vector<gx::vita::ExpandedPrimitives> sVerifyChunks;
 
 void decode_worker_main() {
+#ifdef __vita__
+  // Register for the census and take the second user core. This is the one place in the port that
+  // deliberately moves work to a specific core: the GL thread owns User0, so the decode worker goes to
+  // User1 (see vita/src/cpu_placement.hpp). Nothing here is fatal if the registry is full or the mask is
+  // refused -- wanted_mask/pin_all degrade, and the thread runs wherever the scheduler puts it.
+  const int cpuHandle = tpv::cpu::register_thread("decode", tpv::cpu::Role::Decode, tpv::cpu::Core::User1);
+  if (tpv::cpu::pinned() && cpuHandle >= 0) {
+    sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), tpv::cpu::wanted_mask(cpuHandle));
+  }
+#endif
   std::unique_lock<std::mutex> lock(sWorker.mu);
   for (;;) {
     sWorker.cvNewJob.wait(lock, [] { return sWorker.nextJob < sWorker.jobCount; });

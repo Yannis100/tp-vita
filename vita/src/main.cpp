@@ -25,6 +25,7 @@
 
 #include "boot_diag.hpp"
 #include "boot_screen.hpp"
+#include "cpu_placement.hpp"
 #include "crash_record.hpp"
 #include "disc_probe.hpp"
 #include "input_script.hpp"
@@ -35,6 +36,7 @@
 
 #include <sys/stat.h>
 
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -260,6 +262,35 @@ static void log_crash_symbols(tpv::BootLog& log) {
              static_cast<unsigned>(recorded), static_cast<unsigned>(live));
 }
 
+namespace {
+// Adapter so cpu_placement.cpp needs no logging dependency: it calls this and the lines land in
+// boot.log with everything else the port decided at startup.
+tpv::BootLog* gCpuLog = nullptr;
+
+void cpu_log_line(const char* fmt, ...) {
+    if (gCpuLog == nullptr) {
+        return;
+    }
+    char buf[512];
+    va_list args;
+    va_start(args, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    gCpuLog->line("%s", buf);
+}
+
+// Pin the threads, but only when asked. A file is used rather than an env var because on a Vita there
+// is no shell: ux0:data/tpvita/pin_threads turns it on, and deleting the file turns it off, so one
+// console can A/B the layout without a rebuild. TPV_PIN_THREADS covers host/test runs.
+bool placement_requested() {
+    if (std::getenv("TPV_PIN_THREADS") != nullptr) {
+        return true;
+    }
+    struct stat st{};
+    return ::stat("ux0:data/tpvita/pin_threads", &st) == 0;
+}
+} // namespace
+
 extern "C" int main(int argc, char* argv[]) {
     // First, before anything that can abort. A silent abort is what cost two sessions here: the
     // address resolved to _kill_r, so the process chose to die, and nothing recorded why.
@@ -267,12 +298,25 @@ extern "C" int main(int argc, char* argv[]) {
 
     set_clocks();
 
+    // Thread placement: probe the 4th core, read the clocks, and register this thread. Done before the
+    // log opens so the sink can be attached immediately afterwards. Nothing is pinned here.
+    tpv::cpu::init();
+    tpv::cpu::register_thread("main", tpv::cpu::Role::Main, tpv::cpu::Core::User0);
+
     // The folder the user is told to fill: create it so that it exists after the first launch.
     tpv::make_dir(kDataDir);
     static tpv::BootLog log; // static: the log stays open while the game runs
     log.open(kDataDir);
     log_build_variant(log);
     log_environment(log, argc, argv);
+
+    // The census goes into boot.log so a hardware report can answer "which core was that on".
+    gCpuLog = &log;
+    if (placement_requested()) {
+        const int pinned = tpv::cpu::pin_all();
+        log.line("cpu: pinning REQUESTED; %d thread mask(s) accepted", pinned);
+    }
+    tpv::cpu::report(&cpu_log_line);
     log_crash_symbols(log);
     maybe_selftest_abort(log);
 

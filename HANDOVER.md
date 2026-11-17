@@ -2715,6 +2715,91 @@ identified as pure overhead. The order that follows is:
 - Whether either one buys frame time is **unverified on hardware**, and §7.22 is the record of what
   happens when this project assumes an answer to a threading question instead of measuring it.
 
+### 7.24 Thread census, affinity control, CapUnlocker and kubridge — built, and verified in Vita3K (2026-11-17)
+
+§7.23 asked two questions and answered neither. This is the implementation, and what a run proves.
+
+#### What was added
+
+`vita/src/cpu_placement.{hpp,cpp}` — one module, three things kept deliberately separate because they
+have different costs:
+
+| part | what it does | cost |
+|---|---|---|
+| **census** | every thread the port creates registers name/role/preferred-core; the report prints its thid, the mask it had, the mask it now has, and the core it prefers | free |
+| **affinity** | `sceKernelChangeThreadCpuAffinityMask` on registered threads, toggled at runtime | free, no plugin |
+| **4th core** | probes `SCE_KERNEL_CPU_MASK_SYSTEM` by *trying it* and reading the mask back | no plugin needed to probe |
+| **kubridge** | `kuPowerGet/SetSysClockFrequency` through the **weak** stub | one link entry |
+
+Wiring: [`vita/src/main.cpp`](../../vita/src/main.cpp) inits it and registers the main thread before the log opens;
+the decode worker registers itself in `decode_worker_main`; the census writes into `boot.log`; and
+`vita_gl_replay.cpp` guards its one call with `#ifdef __vita__` because that file is also compiled for the
+host harness.
+
+**kubridge is linked as `kubridge_stub_weak`, placed after `taihen_stub`.** That is the whole trick: when
+the plugin is not installed the symbols still exist, so the port boots exactly as before and the call
+returns an error instead of failing to link or aborting at startup. A required kernel plugin would be a
+regression for every user who does not have it.
+
+#### Verified in Vita3K (not on hardware)
+
+Unpinned, the shipped default:
+
+```
+cpu: 4th core: refused: the system core is not released (CapUnlocker absent or inactive) (set rc=-2147319771 readback=0x70000)
+cpu: clocks: ARM 444 MHz, kubridge UNAVAILABLE (plugin not loaded)
+cpu: placement is unpinned (scheduler decides); 1 thread(s) registered
+cpu:   main       main   thid   8 core=0 mask 0x70000 -> 0x70000
+```
+
+With `ux0:data/tpvita/pin_threads` present:
+
+```
+cpu: pinning REQUESTED; 1 thread mask(s) accepted
+cpu: placement is PINNED; 1 thread(s) registered
+cpu:   main       main   thid   8 core=0 mask 0x70000 -> 0x10000 (applied)
+```
+
+Three things this establishes, and each was a guess in §7.23:
+
+1. **The main thread really did have all three user cores** (`0x70000`) and nothing pinned it.
+2. **Pinning works**: the mask goes to `0x10000` (core 0 only) and the kernel confirms it.
+3. **The 4th-core probe is a real test, not an assumption.** `rc = -2147319771 = 0x80000025`
+   (`SCE_KERNEL_ERROR_ILLEGAL_CPU_MASK`) with `readback = 0x70000` is exactly what "no plugin" looks
+   like. If CapUnlocker is installed and active on a console, the same code should report `accepted`
+   instead — **that half is untested**, because no emulator can load a kernel plugin.
+
+The `kubridge UNAVAILABLE` line is the same kind of evidence: with the plugin present it should print a
+frequency instead. Untested for the same reason.
+
+#### Two limits, stated rather than glossed
+
+- **This is a registry, not a kernel walk.** The VitaSDK does not define `SceKernelThreadInfo` at all
+  (declared in `thread.h`, never defined) and has no thread-enumeration function, and kubridge exposes no
+  affinity or thread-list call either — its exports are `kuKernelAllocMemBlock`, `FlushCaches`,
+  `CpuUnrestrictedMemcpy`, `MemProtect`, `MemReserve/Commit/Decommit`, the exception handlers, and
+  `kuPowerGet/SetSysClockFrequency`. So threads the port did not create (SDL's, vitaGL's internals) are
+  invisible to the census. The report says "NOTHING REGISTERED ... the census cannot see threads the port
+  did not create" rather than pretending otherwise, and adding a thread to the list means registering it.
+- **Nothing is pinned by default.** The layout (main→core 0, decode→core 1, stream→core 2) is a
+  HYPOTHESIS. §7.23's point was that placement is only worth having if it is measured, and on a
+  Cortex-A9 concentrating work can hurt as easily as help. `pin_threads` (or `TPV_PIN_THREADS` on host)
+  toggles it, so one console session can A/B it — the KOTOR II pattern.
+
+#### What is still not known
+
+Whether any of it is faster. This proves the mechanism; it does not measure a gain. The three
+experiments that would, in order of cost:
+
+1. **Hardware, pinning on vs off**, same route, frame times compared at the same scene — the A/B toggle
+   exists precisely for this.
+2. **Hardware with CapUnlocker installed**, to turn `refused` into a real 4th core and see whether a
+   third worker helps at all.
+3. **The decode worker re-measured with pinning on**, because §7.22's 19 % loss was measured on a host
+   where the worker competed with a 16-thread rasteriser — the one condition a Vita does not have.
+
+Until then: the census is free and runs always; pinning and the 4th core are off.
+
 ## 8. Traps and gotchas
 
 1. **`tp-vita/` is a git repo** (`Yannis100/tp-vita`), but `build/` and `deps/` are gitignored, so **a
@@ -2854,6 +2939,23 @@ later in the same call -- so it always read the reset values. The earlier number
 they predated the reset; adding the reset silently broke the report. Snapshot per-frame values into
 `Last*` variables at end of frame. Sanity check any diagnostic that reports a per-frame value at a
 different point in the frame from where it was written.
+
+33. **A kernel plugin must not become a boot requirement.** kubridge and CapUnlocker are kernel
+    plugins the USER installs. Linking `libkubridge_stub.a` (the strong stub) makes the link succeed and
+    the process abort at startup when the plugin is absent -- so a port that used to boot now does not,
+    for everyone without the plugin. Link `libkubridge_stub_weak.a` instead: the symbols resolve to
+    stubs that return errors, the port boots exactly as before, and the code paths that need the plugin
+    detect it by the error and say so in the log (`kubridge UNAVAILABLE`). Same principle for
+    CapUnlocker: it has no userland API at all -- the only userland test is to TRY a mask containing
+    `SCE_KERNEL_CPU_MASK_SYSTEM` and read it back. Measured here: `rc = 0x80000025`
+    (`SCE_KERNEL_ERROR_ILLEGAL_CPU_MASK`), readback unchanged, which is what "no plugin" looks like.
+    Never report a plugin-dependent capability as present without that read-back.
+
+34. **A census of "all threads" is not possible from userland, so do not name it that way.** VitaSDK
+    declares `SceKernelThreadInfo` and never defines it, has no thread-enumeration function, and kubridge
+    exposes no thread-list or affinity call. A module that claims to enumerate threads will silently
+    see only its own. Register threads explicitly and have the report SAY it only sees registered ones --
+    the difference between a diagnostic and a plausible-looking blank.
 
 ## 9. Files the port owns (`tp-vita/`)
 

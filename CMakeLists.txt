@@ -279,6 +279,8 @@ set(TPV_VITA_SOURCES
   ${TPV_DIR}/vita/src/crash_symbols.cpp
   # Frame-counted input injection for automated runs (inert without ux0:data/tpvita/input_script.txt).
   ${TPV_DIR}/vita/src/input_script.cpp
+  # Thread census, CPU affinity, the 4th-core probe and the kubridge clock call (HANDOVER 7.23/7.24).
+  ${TPV_DIR}/vita/src/cpu_placement.cpp
   ${TPV_DIR}/vita/aurora/backend.cpp
   ${TPV_DIR}/vita/aurora/aurora_stubs.cpp
   ${TPV_DIR}/vita/aurora/imgui_vita.cpp
@@ -308,9 +310,16 @@ set(TPV_VITA_GL_LIBS
   # AFTER vitaGL even though it is already in TPV_VITA_SYS_LIBS (checked: removing this entry gives
   # undefined references from libvitaGL.a). SceGpuEs4_stub / libScePiglet_stub are not needed.
   SceGxm_stub)
+# kubridge: linked through its WEAK stub, and deliberately AFTER taihen_stub.
+#
+# kubridge is a KERNEL plugin the user installs (ur0:tai/kubridge.skprx). Only its userland stubs are
+# needed at link time, and the weak variant is the one that degrades: when the plugin is not loaded the
+# calls resolve to nothing rather than aborting the process at startup, which is the difference between
+# "an optional extra is unavailable" and "the port no longer boots". vita/src/cpu_placement.cpp treats a
+# negative kuPowerGetSysClockFrequency as the signal that the plugin is absent, and says so in the log.
 target_link_libraries(tpv_vita PRIVATE
   tpv_game tpv_jsystem ${TPV_GAME_LIBS} tpv_borealis tpv_aurora
-  SDL3 ${TPV_VITA_SYS_LIBS} ${TPV_VITA_GL_LIBS})
+  SDL3 ${TPV_VITA_SYS_LIBS} ${TPV_VITA_GL_LIBS} kubridge_stub_weak)
 
 # Make libstdc++'s "is threading available" probe resolve, so std::thread and std::mutex are real.
 #

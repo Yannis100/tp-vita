@@ -41,4 +41,7 @@ set(TPV_AURORA_GX_SOURCES
 )
 
 target_sources(tpv_aurora PRIVATE ${TPV_AURORA_GX_SOURCES})
-target_include_directories(tpv_aurora PRIVATE ${TPV_ALIB})
+# TPV_DIR/vita/src: the overlay tree is a COPY under build/aurora_lib, so a file there cannot reach the
+# project's own sources with a relative path. vita_gl_replay.cpp includes cpu_placement.hpp (the thread
+# census / affinity module) and needs this.
+target_include_directories(tpv_aurora PRIVATE ${TPV_ALIB} ${TPV_DIR}/vita/src)
