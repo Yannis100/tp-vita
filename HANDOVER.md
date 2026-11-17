@@ -2604,12 +2604,14 @@ What would make it win on the proxy too, in order of expected value:
 
 #### The lever this leaves standing, and it is bigger
 
-`pass` was 38.4 % of a gameplay frame in §7.21 and is **56-72 %** on every window of this benchmark
-(per-draw uniform upload, texture binds, program binds, fog-range LUT). It is the largest single phase
-in both measurements, it has never been attacked, and unlike decode it cannot move to another thread
--- it is GL calls. §7.20's ranking put it third behind decode and resident geometry; on this evidence
-it should be first. That is the recommendation that follows from spending a session on Rank 1 and
-finding it negative.
+`pass` was 38.4 % of a gameplay frame in §7.21 and read **56-72 %** on every window of this benchmark
+(per-draw uniform upload, texture binds, program binds, fog-range LUT). It looked like the largest
+single phase, never attacked, and unlike decode unable to move to another thread because it is GL calls.
+
+**That 56-72 % was wrong, and §7.25 found out why.** With the worker off, `pass` on this same benchmark
+is **2.1 %**, not 56-72 %: the larger figure was the decode hand-off being booked there, because `pass`
+is measured as an enclosing span. The corrected attribution leaves `pass` at 2 % and `submit` at 85 %,
+so the lever is `submit` -- see §11's re-ranking and §7.25.
 
 #### Instrumentation bug this session found (and fixed)
 
@@ -2800,6 +2802,79 @@ experiments that would, in order of cost:
 
 Until then: the census is free and runs always; pinning and the 4th core are off.
 
+### 7.25 `pass` attributed, and the decode worker is a 3 % WIN once the hand-off stops per-draw (2026-11-17)
+
+Two results, and the second one reverses §7.22.
+
+#### Where `pass` actually goes (worker off)
+
+`pass` was measured as one blob. Split into its five parts inside `draw_pass()` (gated behind
+`TPV_PASS_SPLIT`, because measurement.md 2.7 says an instrumented arm is not a control arm):
+
+| part of `pass` | share of `pass` | of the frame |
+|---|---|---|
+| `get_program` + `use_program` + `refresh_derived_textures` | 53 % | 1.1 % |
+| `upload_uniforms` | 37 % | 0.8 % |
+| `apply_pass_state` | 5 % | 0.1 % |
+| `bind_textures` | 2 % | 0.05 % |
+| `bind_fog_range` | 2 % | 0.05 % |
+
+`pass` is **2.1 % of the frame**, and `submit` is **85 %**. Two independent builds (with and without the
+split timers) agree to 0.1 %. So §7.22's "56-72 % on every window of this benchmark" was wrong: it was
+measured with the decode worker running, and `pass` is an ENCLOSING span (`whole draw_pass - submit`), so
+the hand-off cost was booked inside it. The real per-draw GL-state work is 2 % of the frame, and the cache
+in `GlCache` plus `upload_uniforms`' `sameBlob` test already suppress almost all of it: 118 texture binds
+reached `gl*` over 47,200 passes.
+
+**The lever moved.** Not `pass` (2 %), not decode (11 %): `submit`, at 85 %.
+
+#### The hand-off was the real cost, and coarse release fixes it
+
+Timing just the release in `draw_op` gave the attribution: **24-29 % of the frame over 47,200 calls**,
+about 0.5 us each, entirely booked inside `pass`. And 88-92 % of those releases found the worker parked and
+had to wake it, so it was 47,200 wake-ups per frame, not wasted notifications.
+
+Gating the notify on a "someone is parked" counter changed nothing (23.9 % -> 23.9 %), because the worker
+is parked almost always on this frame. The change that worked is the one the exercise kept pointing at --
+**hand off a range, not an item**. The consumer now publishes its slot every 16th draw
+(`kReleaseStride`), and the parked worker waits in a 1 ms looping `wait_for` so a missed signal costs
+latency instead of a stall.
+
+| | before | after |
+|---|---|---|
+| release cost | 23.9 % of frame | **2.9 %** |
+| releases that signalled | 91.7 % | **6.0 %** |
+| frame time, worker OFF | 46.65 / 46.67 / 47.00 / 46.65 ms | same |
+| frame time, worker ON | 45.64 / 45.30 / 44.68 / 44.66 ms | **~3 % faster** |
+
+Four interleaved rounds, and ON is faster in every one. `decode` collapses to 0.2 % (the work left the
+critical path) and `submit` rises to 92-94 % because it now contains the whole frame minus the remainder.
+
+**This reverses §7.22's sign on this proxy, and does not settle the Vita.** What changed is the hand-off
+granularity, which was the diagnosed overhead; what is unchanged is that the proxy's absolute times are
+llvmpipe's, not a Cortex-A9's.
+
+#### The bug the verifier caught, and it is the interesting part
+
+The first version of the time-bounded wait used a bare `cvSlotFree.wait_for(lock, 200us, pred)` and then
+carried on. **`wait_for` returns on timeout with the predicate still false**, so after 200 us the worker
+overwrote a slot the consumer was still reading. The frame looked great -- release 24 % -> 2.8 %, frame
+~3 % faster -- and 29 of 23,600 decoded results differed.
+
+That is the exact trade this project refuses: a speedup whose correctness is broken. The fix is a
+`while` loop around the timed wait, so a timeout means "check again", never "proceed". Back to 0 differed.
+See trap 37.
+
+#### Files
+
+| file | change |
+|---|---|
+| `vita/aurora/overlay/gfx/vita_gl_replay.cpp` | `pass` split (`TPV_PASS_SPLIT`), release probe, `kReleaseStride` coarse release, waiter-gated notify, looping timed wait, `TPV_ENABLE_DECODE_WORKER` value parsing, duplicate A/B report line removed |
+| `HANDOVER.md` | this section; §7.22's 56-72 % claim corrected in place rather than deleted |
+
+Verified: byte-exact A/B 23,600 compared / 0 differed; e2e 91 scenes / 14,266 pixel checks / 0 failed;
+vertex 71,063 checks; texture 3,780; shader; disc 10,686; crash PASS; `tpv_vita` cross-build links.
+
 ## 8. Traps and gotchas
 
 1. **`tp-vita/` is a git repo** (`Yannis100/tp-vita`), but `build/` and `deps/` are gitignored, so **a
@@ -2956,6 +3031,21 @@ different point in the frame from where it was written.
     exposes no thread-list or affinity call. A module that claims to enumerate threads will silently
     see only its own. Register threads explicitly and have the report SAY it only sees registered ones --
     the difference between a diagnostic and a plausible-looking blank.
+35. **An enclosing-span timer books other people's costs to the phase you name.** `pass` was measured as
+    `whole draw_pass - submit`, so when the decode worker's release was added inside that span, `pass`
+    went from 2.1 % to 26 % of the frame and the release alone accounted for 24 % of it. A larger figure
+    is not a slower phase: it is a phase that now contains a cost you introduced elsewhere. Before
+    concluding that a phase grew, split it, and time the individual calls inside it.
+36. **An env var whose PRESENCE enables a feature cannot be turned off by setting it to 0.**
+    `if (getenv("TPV_ENABLE_DECODE_WORKER") == nullptr) return false;` made `...=0` mean ENABLED, so an
+    A/B "control" arm ran the feature and reported "2 threads". Parse the value (`0`, `off`, `no`,
+    `false`, empty all mean disabled), or the control arm is not a control.
+37. **`condition_variable::wait_for` RETURNS ON TIMEOUT, and the predicate may still be false.** Used as a
+    bare statement it silently means "wait a bit, then do the thing anyway": the worker overwrote a
+    buffer the consumer was still reading, the frame got ~3 % faster, and 29 of 23,600 decoded results
+    differed (0.12 %). Always wrap a timed wait in a `while` over the predicate, so a timeout means
+    "check again". A relative-timing bug at this rate is invisible in a screenshot and obvious to a
+    verifier -- which is why the verifier runs BEFORE the timing.
 
 ## 9. Files the port owns (`tp-vita/`)
 
@@ -3022,13 +3112,16 @@ and frame, the only way to tell whether the §7.4b fixes improved the picture.
 decode worker first. That was built, proven byte-exact, and measured 19 % SLOWER on the only proxy
 available -- so it ships off by default and the next lever is not the one the ranking predicted:
 
-1. **`pass` -- per-draw GL state.** 38.4 % of a gameplay frame in §7.21 and 56-72 % on every window of
-   the new benchmark: uniform upload, texture binds, program binds, fog-range LUT. It is now the
-   largest phase in both measurements, it has never been attacked, and unlike decode it CANNOT move to
-   another thread because it is GL calls -- so it needs fewer calls, not a second core. §7.3c closed
-   *merging* draws at 1.17x, but that is a different question from *per-draw overhead*, which is what
-   this is. Start by attributing the phase: how much is `glUniform*`, how much `bind_texture`, how much
-   `apply_pass_state`.
+1. **`submit` -- the draw calls themselves, now that the ranking's premise has been corrected.**
+   §7.25 split `pass` and found it is **2.1 %** of this benchmark's frame, not 56-72 %: the larger
+   figure was the decode hand-off booked into it, and the per-draw GL-state work is already almost
+   entirely suppressed by `GlCache` and `upload_uniforms`' `sameBlob` test (118 texture binds reached
+   `gl*` over 47,200 passes). `submit` is **85 %** of the frame and is the only phase left that is both
+   large and unattacked. It is GL, so it cannot move to another thread; it needs fewer or cheaper draw
+   calls, and §7.3c's 1.17x batching arithmetic applies again here (though NOT via merging, which is
+   closed). Before choosing, split `submit` the way `pass` was split: how much is `set_vertex_pointers`,
+   how much `glDrawElements`/`glDrawArrays`, and how many `glDrawArrays` calls the `MaxArrayVertices`
+   split makes per draw.
 2. **Thread placement -- the free half of "use all four cores" (§7.23).** Nothing in this port sets a
    CPU affinity mask: no `sceKernelChangeThreadCpuAffinityMask`, no `cpuAffinityMask`, no
    `pthread_attr_setaffinity_np`. Three user cores are available and are used by accident. KOTOR II and

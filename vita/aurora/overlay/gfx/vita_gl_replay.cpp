@@ -181,6 +181,12 @@ struct GlCache {
 };
 GlCache sCache;
 
+// Counters for the `pass` split (HANDOVER 7.25). A cache hit is NOT work, and the whole point of asking
+// where `pass` goes is to find out how much of it is already suppressed by the caches above. So these
+// count calls that actually reached gl*, not calls that were made.
+uint64_t sTextureBindCount = 0; // glBindTexture issued by bind_texture()
+uint64_t sFogUploadCount = 0;   // glTexImage2D issued by bind_fog_range()
+
 void invalidate_cache() {
   sCache = {};
   // Attribute arrays are left as they are; enabledAttribs is reset because we disable them below.
@@ -215,6 +221,7 @@ void bind_texture(uint32_t unit, GLuint texture) {
   if (!sCache.boundTextureValid[unit] || sCache.boundTexture[unit] != texture) {
     sCache.boundTexture[unit] = texture;
     sCache.boundTextureValid[unit] = true;
+    ++sTextureBindCount;
     glBindTexture(GL_TEXTURE_2D, texture);
   }
 }
@@ -1136,6 +1143,34 @@ double sLastSetupMs = 0;
 double sLastClearMs = 0;
 double sLastTailMs = 0;
 
+// ---- `pass` split (HANDOVER 7.25) --------------------------------------------------------------
+// `pass` is the largest phase in both measurements (38.4 % of a gameplay frame in 7.21, 56-72 % on the
+// benchmark) and has never been attributed. These split it by the five things draw_pass() does per draw,
+// so the next question ("can any of it be removed?") has an answer instead of a guess.
+//
+// The expected finding is stated BEFORE measuring, so it cannot be retro-fitted: most of the underlying
+// gl* calls are already suppressed by GlCache (use_program, bind_texture, set_enabled, and
+// upload_uniforms' sameBlob check), so a large part of `pass` should be the CPU cost of the CHECKING
+// rather than of driver calls. If that is what the numbers say, the lever is fewer checks per draw
+// (fatter draws, merged state), not cheaper GL calls, and no GL micro-optimisation will move it.
+//
+// Read as a share of `pass`, not of the frame: the parts sum to `pass`, and each is named after the call
+// in draw_pass() that it wraps.
+struct PassSplit {
+  double programMs = 0; // get_program + use_program (+ refresh_derived_textures)
+  double stateMs = 0;   // apply_pass_state
+  double uniformMs = 0; // upload_uniforms
+  double textureMs = 0; // bind_textures
+  double fogMs = 0;     // bind_fog_range, including its LUT rebuild
+  uint32_t passes = 0;  // draw_pass() calls, so a 2-pass alpha draw counts 2
+};
+PassSplit sPass;       // this frame
+PassSplit sPassWindow; // this window
+PassSplit sLastPass;   // end-of-frame snapshot, same reason as sLastSetupMs
+// How many binds actually reached gl*, as opposed to being suppressed by a cache.
+uint64_t sTextureBindsWindow = 0;
+uint64_t sFogUploadsWindow = 0;
+
 inline double ms_since(std::chrono::steady_clock::time_point a) {
   return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
 }
@@ -1200,14 +1235,34 @@ struct DecodeWorker {
   std::vector<DecodeJob> jobs;
   uint32_t jobCount = 0;
   uint32_t nextJob = 0; // worker only
-  std::atomic<uint32_t> readyCount{0};
-  std::atomic<uint32_t> freeCount{0};
+  // Each hot counter owns a cache line. This did NOT fix the `pass` inflation (measured: 26 % before and
+  // after), so false sharing was not the cause -- it is kept because two threads genuinely write these
+  // and it costs nothing, but the finding it was meant to explain is recorded below under
+  // `waiters`/`cvSlotFree`, which is where the real cost was.
+  static constexpr size_t kCacheLine = 64;
+  alignas(kCacheLine) std::atomic<uint32_t> readyCount{0}; // worker writes, GL thread reads
+  char readyPad[kCacheLine - sizeof(std::atomic<uint32_t>)]{};
+  alignas(kCacheLine) std::atomic<uint32_t> freeCount{0}; // GL thread writes, worker reads
+  char freePad[kCacheLine - sizeof(std::atomic<uint32_t>)]{};
+  // THE ACTUAL COST (HANDOVER 7.25). `decode_release` called cvSlotFree.notify_one() on EVERY draw, and a
+  // notify on a condition variable with no waiter still takes the internal lock and looks at the wait
+  // list. Measured by timing just the release: 24-29 % of the whole frame over 47,200 calls, ~0.5 us
+  // each -- which is not a decode, it is the notify. The fix is to not notify when nobody is parked.
+  // `waiters` counts threads blocked in cvSlotFree; the GL thread only signals above zero. Padded
+  // because it is read by both sides on the hot path.
+  alignas(kCacheLine) std::atomic<uint32_t> waiters{0};
+  char waitersPad[kCacheLine - sizeof(std::atomic<uint32_t>)]{};
   DecodeSlot slots[kDecodeSlots];
   bool running = false;
   // Reported every window, then reset. `decodeMs` is the worker's own decode time: the answer to "did
   // the work actually happen somewhere else, or did it vanish?".
   double decodeMs = 0;
   uint32_t decodedDraws = 0;
+  // Hand-off accounting (7.25): how many releases happened and how many of them signalled the worker.
+  // `slotNotifies` far below `releaseCalls` is the point of the change; equal to it means the worker
+  // really is parking on most draws and the notify is unavoidable.
+  uint32_t releaseCalls = 0;
+  uint32_t slotNotifies = 0;
   uint32_t inlineDecodes = 0;
   uint32_t waitCalls = 0;
   uint32_t waitBlocks = 0;
@@ -1252,11 +1307,24 @@ void decode_worker_main() {
     const uint32_t ordinal = sWorker.nextJob;
     // Wait for this slot to be released before overwriting it. With 24 slots and a consumer that is
     // faster than the producer, this is only reached when the frame has more than 24 draws in flight.
-    if (ordinal >= sWorker.freeCount.load(std::memory_order_acquire) + kDecodeSlots) {
-      sWorker.cvSlotFree.wait(lock, [ordinal] {
+    //
+    // TIME-BOUNDED, and in a LOOP, and both are required. With coarse release the GL thread publishes
+    // once per kReleaseStride draws, so waiting forever on a notify would stall a whole stride if one
+    // signal were missed. But `wait_for` RETURNS ON TIMEOUT with the predicate still false -- the first
+    // version used a bare `wait_for` and simply carried on, so after a 200 us timeout the worker
+    // overwrote a slot the consumer was still reading. The verifier caught it precisely: 29 of 23,600
+    // decoded results differed, 0.12 %, the rate you would expect from an occasional timeout, while the
+    // frame looked faster (release 24 % -> 2.8 %). A timeout must mean "check again", never "proceed".
+    sWorker.waiters.fetch_add(1, std::memory_order_seq_cst);
+    while (ordinal >= sWorker.freeCount.load(std::memory_order_acquire) + kDecodeSlots) {
+      // The predicate is the one that means "a slot is free", i.e. the condition the outer `while`
+      // waits for. (The first version negated it, which made every call return immediately and
+      // busy-spin for the whole stride.)
+      sWorker.cvSlotFree.wait_for(lock, std::chrono::milliseconds(1), [ordinal] {
         return ordinal < sWorker.freeCount.load(std::memory_order_acquire) + kDecodeSlots;
       });
     }
+    sWorker.waiters.fetch_sub(1, std::memory_order_release);
     const DecodeJob job = sWorker.jobs[ordinal];
     const Frame* frame = sWorker.frame;
     lock.unlock();
@@ -1311,7 +1379,15 @@ bool decode_worker_allowed() {
     // fifteen idle ones this host has, and the point of the console number is that decode is 37-43 % of
     // a real frame there (7.20/7.21) rather than the 11 % measured on the benchmark. What would settle
     // it is one run on hardware with the flag on and off. Until then this is not shipped behaviour.
-    if (std::getenv("TPV_ENABLE_DECODE_WORKER") == nullptr) {
+    // Presence is not the question, the VALUE is. The first version tested `getenv(...) == nullptr`, so
+    // `TPV_ENABLE_DECODE_WORKER=0` ENABLED the worker: an A/B "control" arm that ran the feature under
+    // test and reported 2 threads while claiming to be off. Accept 0/off/no/false/empty as disabled.
+    const char* flag = std::getenv("TPV_ENABLE_DECODE_WORKER");
+    if (flag == nullptr) {
+      return false;
+    }
+    if (flag[0] == '\0' || flag[0] == '0' || flag[0] == 'n' || flag[0] == 'N' || flag[0] == 'f' ||
+        flag[0] == 'F') {
       return false;
     }
     const char* path = "ux0:data/tpvita/no_decode_worker";
@@ -1406,11 +1482,52 @@ const DecodeSlot* decode_wait(uint32_t ordinal, uint32_t drawIndex) {
   return &sWorker.slots[ordinal % kDecodeSlots];
 }
 
+// COARSE RELEASE (HANDOVER 7.25). The measured finding that forced this: `decode_release` was 24-29 %
+// of the whole frame over 47,200 calls, and 88-92 % of those calls found the worker PARKED and had to
+// signal it -- so it was not a wasted notify, it was 47,200 wake-ups per frame. Gating the notify on a
+// waiter counter changed nothing (23.9 % before, 23.9 % after).
+//
+// The fix is the one the whole exercise converged on: hand off a RANGE, not an item. The GL thread now
+// publishes every kReleaseStride-th release, so the worker is woken ~1/16th as often. `freeCount` here
+// means "jobs whose slot the CONSUMER has finished with", and the worker's lag bound becomes
+// kDecodeSlots - kReleaseStride, which is still a hard bound, so the ring cannot be overrun. Correctness
+// does not depend on a tight bound: the consumer releases only after it has issued the draw's GL calls,
+// and the worker never touches a slot it has not been given an ordinal for.
+constexpr uint32_t kReleaseStride = 16;
+static_assert(kReleaseStride < kDecodeSlots, "the worker must have at least one slot it can run ahead by");
+
 void decode_release(uint32_t ordinal) {
+  ++sWorker.releaseCalls;
+  // ONE store per stride, and no per-draw fallback. The first version of this had a "publish now if
+  // someone is parked" branch, and it did nothing: the worker is parked on 91 % of draws (measured), so
+  // the fallback fired on almost every call and the stride never applied. The parked worker now waits
+  // with a short timeout instead, so it re-checks on its own and the stride actually holds.
+  if (((ordinal + 1) % kReleaseStride) != 0) {
+    return;
+  }
   // Strictly increasing: the op loop consumes ordinals in publish order, so a plain store is correct
   // and needs no read-modify-write.
   sWorker.freeCount.store(ordinal + 1, std::memory_order_release);
-  sWorker.cvSlotFree.notify_one();
+  if (sWorker.waiters.load(std::memory_order_relaxed) != 0) {
+    sWorker.cvSlotFree.notify_one();
+    ++sWorker.slotNotifies;
+  }
+}
+
+// HANDOVER 7.25: `pass` is measured as an ENCLOSING span (whole draw_pass minus the submit timer), so
+// anything this thread blocks on while inside it is booked to `pass`. With a worker running, that
+// includes the hand-off. These two probes tell the two possible causes apart instead of assuming one:
+// RELEASE = time spent publishing a finished slot, WAIT_NOTIFY = time spent in the condition-variable
+// notify that wakes the worker. If neither is large, the cost is not the hand-off at all and is more
+// likely cache traffic from two threads touching neighbouring data, which no timer can attribute.
+double sReleaseMs = 0;    // per frame, inside the `pass` span
+double sNotifyMs = 0;     // per frame, inside the `pass` span
+uint32_t sReleaseCalls = 0;
+void decode_release_timed(uint32_t ordinal) {
+  const auto start = std::chrono::steady_clock::now();
+  decode_release(ordinal);
+  sReleaseMs += ms_since(start);
+  ++sReleaseCalls;
 }
 
 // End of frame: every posted draw has been consumed and released by now, so this is a formality that
@@ -1451,6 +1568,13 @@ void decode_drain() {
   const auto start = std::chrono::steady_clock::now();
   {
     std::unique_lock<std::mutex> lock(sWorker.mu);
+    // Make the predicate satisfiable: with coarse release (kReleaseStride) the last partial stride may
+    // never have published, so the wait below would sleep forever. Publishing jobCount here is safe --
+    // every draw has already been consumed by the op loop, which is the only thing that calls drain.
+    if (sWorker.freeCount.load(std::memory_order_acquire) < sWorker.jobCount) {
+      sWorker.freeCount.store(sWorker.jobCount, std::memory_order_release);
+      sWorker.cvSlotFree.notify_all();
+    }
     sWorker.cvSlotFree.wait(lock, [] {
       return sWorker.freeCount.load(std::memory_order_acquire) >= sWorker.jobCount;
     });
@@ -1522,6 +1646,7 @@ void bind_fog_range(const Frame& frame, const gx::DrawData& draw, const Program&
   }
   // Storage offsets repeat from frame to frame, so (base, width) does not identify the contents: compare them.
   if (sFogRangeRgba != sFogRangeScratch) {
+    ++sFogUploadCount;
     glBindTexture(GL_TEXTURE_2D, sFogRangeTexture);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(width), 1, 0, GL_RGBA, GL_UNSIGNED_BYTE,
                  sFogRangeScratch.data());
@@ -1536,6 +1661,12 @@ void bind_fog_range(const Frame& frame, const gx::DrawData& draw, const Program&
 // One program pass of a draw; `decoded` / `chunks` are already filled for this draw.
 void draw_pass(const Frame& frame, const gx::DrawData& draw, const gx::PipelineConfig& config, bool lineMode,
                const DecodedView& decoded) {
+#if defined(TPV_PASS_SPLIT)
+  // Five timers, two clock reads each, so `pass` can be attributed (HANDOVER 7.25). Off by default: this
+  // is diagnostic instrumentation and HANDOVER trap 31 / measurement.md 2.7 is what happens when an A/B
+  // arm contains instrumentation the other arm does not.
+  const auto tProgram = std::chrono::steady_clock::now();
+#endif
   const bool replace = replaces_alpha(config);
   const uint32_t lights = gx::vita::lights_in_use(light_location(config),
                                                   frame.uniforms.data() + draw.uniformRange.offset,
@@ -1548,10 +1679,30 @@ void draw_pass(const Frame& frame, const gx::DrawData& draw, const gx::PipelineC
   }
   refresh_derived_textures(*program, draw);
   use_program(program->program);
+#if defined(TPV_PASS_SPLIT)
+  sPass.programMs += ms_since(tProgram);
+  const auto tState = std::chrono::steady_clock::now();
+#endif
   apply_pass_state(to_pass_state(config, replace));
+#if defined(TPV_PASS_SPLIT)
+  sPass.stateMs += ms_since(tState);
+  ++sPass.passes;
+  const auto tUniform = std::chrono::steady_clock::now();
+#endif
   upload_uniforms(*program, frame, draw);
+#if defined(TPV_PASS_SPLIT)
+  sPass.uniformMs += ms_since(tUniform);
+  const auto tTexture = std::chrono::steady_clock::now();
+#endif
   bind_textures(*program, draw);
+#if defined(TPV_PASS_SPLIT)
+  sPass.textureMs += ms_since(tTexture);
+  const auto tFog = std::chrono::steady_clock::now();
+#endif
   bind_fog_range(frame, draw, *program);
+#if defined(TPV_PASS_SPLIT)
+  sPass.fogMs += ms_since(tFog);
+#endif
   if (lineMode) {
     if (decoded.chunks != nullptr) {
       for (const auto& chunk : *decoded.chunks) {
@@ -1643,7 +1794,8 @@ void draw_op(const Frame& frame, const gx::DrawData& draw, uint32_t drawIndex) {
     draw_pass(frame, draw, *config, lineMode, decoded);
   }
   if (slot != nullptr) {
-    decode_release(ordinal);
+    // Timed, because `pass` is an enclosing span and this runs inside it (HANDOVER 7.25).
+    decode_release_timed(ordinal);
   }
 }
 
@@ -1859,6 +2011,25 @@ void replay(Frame& frame) {
       // representative because a scene's composition is stable (measured: see HANDOVER 7.21).
       Log.warn("    other split of frame: setup {:.1f}% | clear {:.1f}% | tail {:.1f}% (survey excluded)",
                pct(sLastSetupMs), pct(sLastClearMs), pct(sLastTailMs));
+#if defined(TPV_PASS_SPLIT)
+      // `pass` attributed. Shares are of `pass` itself, so they sum to 100 % and each name is the call it
+      // wraps in draw_pass(). The bind counts are what actually reached gl*, i.e. what the caches did NOT
+      // suppress: if those are near zero while the milliseconds are not, the cost is the checking.
+      {
+        const double passTotal = sPassWindow.programMs + sPassWindow.stateMs + sPassWindow.uniformMs +
+                                 sPassWindow.textureMs + sPassWindow.fogMs;
+        auto ppct = [passTotal](double v) { return passTotal > 0 ? 100.0 * v / passTotal : 0.0; };
+        Log.warn("    pass split: program {:.1f}% | state {:.1f}% | uniform {:.1f}% | texture {:.1f}% | "
+                 "fog {:.1f}% of pass ({} passes, {:.2f} ms of frame)",
+                 ppct(sPassWindow.programMs), ppct(sPassWindow.stateMs), ppct(sPassWindow.uniformMs),
+                 ppct(sPassWindow.textureMs), ppct(sPassWindow.fogMs), sPassWindow.passes, passTotal);
+        Log.warn("    pass binds reaching gl*: {} texture, {} fog LUT, over {} passes ({:.2f} and {:.2f} "
+                 "per pass)",
+                 sTextureBindsWindow, sFogUploadsWindow, sPassWindow.passes,
+                 sPassWindow.passes ? static_cast<double>(sTextureBindsWindow) / sPassWindow.passes : 0.0,
+                 sPassWindow.passes ? static_cast<double>(sFogUploadsWindow) / sPassWindow.passes : 0.0);
+      }
+#endif
       // The decode worker's own accounting, as a share of the same frame total. `decode` above is now
       // only the part that could NOT be overlapped (the rendezvous plus any inline fallback), so the
       // reading that decides whether this worked is the PAIR: if `decode` is still ~37 % the work did
@@ -1882,14 +2053,27 @@ void replay(Frame& frame) {
       Log.warn("    decode worker waits: {} calls, {} blocked ({:.2f}% of draws)", sWorker.waitCalls,
                sWorker.waitBlocks,
                sWorker.waitCalls ? 100.0 * static_cast<double>(sWorker.waitBlocks) / sWorker.waitCalls : 0.0);
+      // Attribution of the `pass` inflation the worker causes (7.25). `pass` is an enclosing span, so
+      // whatever this thread blocks on inside it is booked there; these two numbers say whether the cause
+      // is the hand-off itself or something no timer here can see.
+      Log.warn("    decode worker hand-off cost: release {:.1f}% of frame ({} calls), booked inside `pass`",
+               pct(sReleaseMs), sReleaseCalls);
+      Log.warn("    decode worker slot handshake: {} releases, {} signalled the worker ({:.2f}%)",
+               sWorker.releaseCalls, sWorker.slotNotifies,
+               sWorker.releaseCalls ? 100.0 * static_cast<double>(sWorker.slotNotifies) / sWorker.releaseCalls
+                                    : 0.0);
+      sWorker.releaseCalls = 0;
+      sWorker.slotNotifies = 0;
+      sReleaseMs = 0;
+      sReleaseCalls = 0;
       sWorker.waitCalls = 0;
       sWorker.waitBlocks = 0;
-      if (sVerifyFrames > 0 || sVerifyChecks > 0) {
+      // One line, not two: this was printed twice, once guarded and once not, so a build with verification
+      // OFF still reported a meaningless "0 compared, 0 differed".
+      if (sVerifyChecks > 0) {
         Log.warn("    decode worker A/B: {} results compared against an inline decode, {} differed ({} line draws)",
                  sVerifyChecks, sVerifyDiffs, sVerifySkipped);
       }
-      Log.warn("    decode worker A/B: {} results compared against an inline decode, {} differed ({} line draws)",
-               sVerifyChecks, sVerifyDiffs, sVerifySkipped);
       sWorker.inlineDecodes = 0;
       sPhaseWindow = PhaseTimes{};
     }
@@ -2099,6 +2283,22 @@ void replay(Frame& frame) {
     const double tail = sPhase.otherMs - sOtherSetupMs - sOtherClearMs;
     sOtherTailMs += tail > 0 ? tail : 0.0;
   }
+#if defined(TPV_PASS_SPLIT)
+  // Snapshot and accumulate here, at end of frame, for the same reason as sLastSetupMs: the report runs
+  // after the next frame's reset, so reading the per-frame struct there prints zeros (HANDOVER trap 32).
+  sLastPass = sPass;
+  sPassWindow.programMs += sPass.programMs;
+  sPassWindow.stateMs += sPass.stateMs;
+  sPassWindow.uniformMs += sPass.uniformMs;
+  sPassWindow.textureMs += sPass.textureMs;
+  sPassWindow.fogMs += sPass.fogMs;
+  sPassWindow.passes += sPass.passes;
+  sTextureBindsWindow += sTextureBindCount;
+  sFogUploadsWindow += sFogUploadCount;
+  sPass = PassSplit{};
+  sTextureBindCount = 0;
+  sFogUploadCount = 0;
+#endif
   sPhaseWindow.decodeMs += sPhase.decodeMs;
   sPhaseWindow.submitMs += sPhase.submitMs;
   sPhaseWindow.passMs += sPhase.passMs;
