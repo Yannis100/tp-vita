@@ -1690,14 +1690,11 @@ you are acting on.
 
 #### Evidence — 7.13 vitaGL vs GXM vs hybrid: what the numbers actually say (2026-11-12)
 
-**This section is the evidence; §7.14 is the model built on it.** Each measurement appears once, here, and
-§7.14 cites it rather than reprinting it.
+DuskOnVita is the only port shipping **both** backends, so it is the only source of a same-scene,
+same-console A/B. Everything below is quoted from its `docs/benchmarks.csv` and `docs/PERFORMANCE.md` (clone
+at `/tmp/DuskOnVita`). **None of it was measured on this port**; §7.14 does the arithmetic.
 
-The only port that ships **both** backends is DuskOnVita, so it is the only source of a same-scene,
-same-console A/B. Everything below is quoted from its `docs/benchmarks.csv` and `docs/PERFORMANCE.md`
-(a clone at `/tmp/DuskOnVita`), not estimated. **None of it was measured on this port.**
-
-##### The direct A/B: build g2c, PS Vita 1000, 444 MHz, 23 Oct
+**The direct A/B** (build g2c, PS Vita 1000, 444 MHz, 23 Oct):
 
 | Scene | vitaGL | GXM + G2 | delta |
 |---|---:|---:|---:|
@@ -1705,20 +1702,13 @@ same-console A/B. Everything below is quoted from its `docs/benchmarks.csv` and 
 | Ordon, outside the house | 22.94 | 27.23 | **+18.7 %** |
 | Faron fight | 11.71 | 14.04 | **+19.9 %** |
 
-**It is not a constant win, and the sign flips with the scene.** Their own note says Link's house turned
-out to be *GPU-bound at full resolution* — at 100 % the GPU is the limit, so a cheaper CPU-side backend
-buys nothing and GXM's slightly different submission costs 4 %. The two scenes that gain ~19 % are the
-ones limited by the GX worker or the main thread.
+**The sign flips with the scene.** Link's house is *GPU-bound at full resolution*, so a cheaper CPU-side
+backend buys nothing and GXM's submission costs 4 %; the two scenes gaining ~19 % are limited by the GX
+worker or the main thread. **And it is not a pure backend swap:** `g2c-gxm` carries G2 (resident geometry,
+packed 8/16-bit vertex formats, native quads/strips/fans), there is **no published "GXM without G2" run**, so
+the backend's own share of that +19 % is unmeasured.
 
-**This A/B is not a pure backend swap, and that matters.** `g2c-gxm` carries G2: resident geometry
-(`--vita-gxm-resident`), packed 8/16-bit vertex formats (`--vita-gxm-compact`) and native
-quads/strips/fans (`--vita-gxm-primitives`). There is **no published "GXM without G2" run**, so the
-backend's own share of that +19 % is unmeasured. Someone reading "+19 % for switching to GXM" would
-overstate the backend by an unknown amount.
-
-##### Why the ceiling is around 20 %, from the frame itself
-
-The GX worker's 37.9 ms per frame (g2c, Link's house) decomposes as:
+**Why the ceiling is ~20 %.** The GX worker's 37.9 ms per frame (g2c, Link's house):
 
 | part | ms | share |
 |---|---:|---:|
@@ -1730,18 +1720,12 @@ The GX worker's 37.9 ms per frame (g2c, Link's house) decomposes as:
 | CP: vertex arrays | 2.3 | 6.1 % |
 | draw setup, command loop, static lists | 1.6 | 4.2 % |
 
-A backend swap can only touch the **10.9 ms** of backend draws. Even making them free cannot exceed about a
-quarter of GX worker time, which is why the measured win is ~19 % on worker-bound scenes and negative where
-the GPU binds first.
+A swap touches only the **10.9 ms** of backend draws, so even making them free cannot exceed about a quarter
+of worker time — hence ~19 % on worker-bound scenes and negative where the GPU binds first. **The backend is
+also not where the frame goes:** *vitaGL calls* are **16.2 %** of the v61 frame against 42.9 % for vertex
+preparation and 20.1 % for GX decode (§7.14 prints that profile). The renderer is the **third-order** lever.
 
-**The backend is also not where the frame goes:** *vitaGL calls* are **16.2 %** of the v61 frame, against
-42.9 % for vertex preparation and 20.1 % for GX decode. §7.14 has that profile in full and does the
-arithmetic. **So the renderer is the third-order lever, not the first** — the first-order levers move work
-off one core or remove it: threading, resident/static geometry, and the vertex path.
-
-##### What each non-renderer lever was worth (same backend)
-
-Ordon village centre, 10 Nov, one thing added at a time:
+**What each non-renderer lever was worth** (Ordon village centre, 10 Nov, one thing added at a time):
 
 | change | FPS | vs control |
 |---|---:|---:|
@@ -1750,39 +1734,31 @@ Ordon village centre, 10 Nov, one thing added at a time:
 | + direct uniforms + actor fast paths | 13.87 | +12.9 % |
 | + Performance (picture-only, opt-in) | 15.60 | +26.9 % |
 
-Frame overlap alone, console, Ordon at 75 %: **20.5 → 25.9 FPS (+26 %)**. Clocks 333 → 444 MHz is ~1.33×
-on paper. Those are larger than the backend swap and they compose.
+Frame overlap alone, console, Ordon at 75 %: **20.5 → 25.9 FPS (+26 %)**. Clocks 333 → 444 MHz is ~1.33× on
+paper. Both are larger than the backend swap, and they compose.
 
-##### Hybrid
+**Hybrid means two different things, and only one is interesting.** (1) *Both backends present, selectable at
+run time* is what DuskOnVita does: cost is one function-pointer table, value is a fallback when one backend
+cannot start (their GXM writes `gfx_init_failure` and exits if `sceGxmProgramCheck` or a pool allocation
+fails) — robustness, not performance. (2) *One scene drawn by both, split by pass* is the only hybrid with a
+performance story, and it comes out of their gap list: their GXM backend does **not** yet do off-screen
+passes or EFB copies — shadows, heat haze, the minimap — which are exactly the paths vitaGL already
+implements correctly here (§7.6: 11,338 resolve ops, ~11/frame, all reaching `draw_quad`). Such a hybrid
+would run two GL contexts' worth of state on a 128 MiB GPU budget with no measured data behind it. **No one
+has measured it.**
 
-Two different things get called "hybrid", and only one is interesting:
-
-1. **Both backends present, selectable at run time** (what DuskOnVita actually does). Cost is one
-   function-pointer table; value is a fallback when one backend cannot start — their GXM writes
-   `gfx_init_failure` and exits if `sceGxmProgramCheck` or a pool allocation fails. That is a
-   robustness argument, not a performance one.
-2. **One scene drawn by both, split by pass.** This is the only hybrid with a performance story, and it
-   comes straight out of their gap list: their GXM backend does **not** yet do off-screen passes and
-   EFB copies — shadows, heat haze, the minimap — and some indirect-texture effects. Those are exactly
-   the paths vitaGL already implements correctly here (§7.6: 11,338 resolve ops, ~11/frame, all reaching
-   `draw_quad`). A hybrid that keeps GXM for the main pass and vitaGL for EFB-copy/off-screen passes
-   would run two GL contexts' worth of state on a 128 MiB GPU budget with no measured data to justify
-   it. **No one has measured it, and this document should not imply otherwise.**
-
-##### What this predicts for `tp-vita`, labelled as a prediction
-
-**All of the above is transfer from another codebase; no hardware run of this port has ever happened.**
-The closest measured anchor is **v61: 6.34 FPS in Link's house, 7.39 outside**, at 333 MHz on one core with
-every draw — not the 12–28 FPS the other port reports, because none of the levers that got it there exist
-here. This port requests 444 MHz (`vita/src/main.cpp:68-71`), so that anchor understates our headroom. The
-151.94 ms/frame figure in §7.6 is a Vita3K number and says nothing about a Cortex-A9. §7.14 turns this into
-a lever-by-lever model.
+**What this predicts for `tp-vita`, and it is a prediction.** **All of the above transfers from another
+codebase; no hardware run of this port has ever happened.** The closest anchor is **v61: 6.34 FPS in Link's
+house, 7.39 outside**, at 333 MHz on one core with every draw — not the 12–28 FPS the other port reports,
+because none of the levers that got it there exist here. This port requests 444 MHz
+(`vita/src/main.cpp:68-71`), so the anchor understates our headroom. §7.6's 151.94 ms/frame is a Vita3K
+number and says nothing about a Cortex-A9.
 
 ##### 7.13.1 What "G2" means, and a contradiction in their own docs (2026-11-12)
 
-**"G2" is not a switch.** It is the **third build stage of the GXM backend** (`docs/ARCHITECTURE.md`):
-**G0** the backend table and per-frame draw digest; **G1** the SceGxm backend itself; **G2** the three
-optimisation switches below, all GXM-only and **all default `off`** in the options table:
+**"G2" is not a switch.** It is the **third build stage of the GXM backend** (`docs/ARCHITECTURE.md`): **G0**
+the backend table and per-frame draw digest, **G1** the SceGxm backend itself, **G2** the three optimisation
+switches below — all GXM-only, all **default `off`** in the options table:
 
 | switch | values | default | what it does |
 |---|---|---|---|
@@ -1790,17 +1766,15 @@ optimisation switches below, all GXM-only and **all default `off`** in the optio
 | `--vita-gxm-compact` | off/on/colors | **off** | integer positions, normals and texture coords keep their GX format, scaled exactly in the vertex shader; `colors` also sends RGBA8 colours as bytes |
 | `--vita-gxm-primitives` | on/off | **off** | quads, strips and fans drawn natively, without index lists (patch `aurora/0008`) |
 
-**They are not GXM-specific in spirit, only in implementation.** Each removes a copy, a conversion or an
-index list — the same three things a vitaGL port could also stop doing. That is the transferable idea;
-the flags are not portable.
+**They are GXM-specific in implementation only.** Each removes a copy, a conversion or an index list — the
+same three things a vitaGL port could stop doing. That is the transferable idea; the flags are not portable.
 
 **The contradiction resolves.** The README says "GXM + G2" while the options table defaults all three to
-`off`. Both are true in different modes: the **play profile** (`main_vita.cpp:89`) carries all three
-`on`, and a launch selecting **no** renderer option gets it implicitly (`implicitProfile`), so a normal
-launch has them **on**; selecting **any** renderer option falls back to the table defaults, **off**. So
-"G2 off" is the *explicit-option* state. The `g2c-gxm` benchmark rows do not record which case they were,
-so **the +18.7 % / +19.9 % figures may or may not include G2** — a gap in their record, not a conclusion
-here.
+`off`: the **play profile** (`main_vita.cpp:89`) carries all three `on`, and a launch selecting **no**
+renderer option gets it implicitly (`implicitProfile`), so a normal launch has them **on**; selecting **any**
+renderer option falls back to the table defaults, **off**. "G2 off" is the *explicit-option* state. The
+`g2c-gxm` rows do not record which case they were, so **the +18.7 % / +19.9 % figures may or may not include
+G2** — a gap in their record, not a conclusion here.
 
 **Where the backend's own share IS separable, and it is small.** Two later GXM additions carry console
 numbers (`main_vita.cpp:126-128`): the pipeline memo took the worker's pipeline step 10.7→5.1 ms in Ordon
@@ -1864,9 +1838,8 @@ GXM-without-G2 benchmark, which does not exist (§7.13.1); or any hardware run a
 **Trigger:** DuskOnVita's `1b6472c4` ("Crash fix: Link's own heaps are three times the original's size, not
 twenty", patch `dusklight/0077`) describes a failure mode that matches ours, and the check found it live here.
 
-##### The defect was ours too, and the guard that should have stopped it was defeated
-
-`daAlink_c::setOriginalHeap` multiplies Link's two heaps by **20** under `#if TARGET_PC`:
+**The defect, and a guard that read as "PC only" while being live on Vita.** `daAlink_c::setOriginalHeap`
+multiplies Link's two heaps by **20** under `#if TARGET_PC`:
 
 ```cpp
 u32 size = ROUND(i_size, 16);
@@ -1875,12 +1848,10 @@ u32 size = ROUND(i_size, 16);
 #endif
 ```
 
-**This tree defines `TARGET_PC=1` for the Vita build as well** (`cmake/GameABIConfig.cmake:7`), so a guard
-that reads like "PC only" was **live on Vita**. Link's archive heap became `0xA2800 * 20 + 0xA0 = 0xCB20A0` =
-**12.70 MiB**, taken in one piece from the game heap every time Link is created — a stage change, or the
-restart after a fall.
-
-Our own `dvd_trace.txt` had it recorded all along, and nobody connected the number:
+**This tree defines `TARGET_PC=1` for the Vita build as well** (`cmake/GameABIConfig.cmake:7`). Link's
+archive heap became `0xA2800 * 20 + 0xA0 = 0xCB20A0` = **12.70 MiB**, taken in one piece from the game heap
+every time Link is created — a stage change, or the restart after a fall. Our own `dvd_trace.txt` had it
+recorded all along and nobody connected the number:
 
 ```
 JKRExpHeap: create: size=0xCB20A0 aligned=0xCB20A0 parent=gameHeap parentFree=0x14385B0
@@ -1889,9 +1860,7 @@ JKRExpHeap: create: size=0xCB20A0 aligned=0xCB20A0 parent=gameHeap parentFree=0x
 The lesson is §8 trap 16's, one layer up: **a platform guard is only real if the macro is not also defined
 for your platform** — check the compile definitions, not the `#if`.
 
-##### Fix, and the proof
-
-`#if TARGET_VITA` now does `size *= 3` before the `#elif TARGET_PC`. Measured in the same run, same
+**Fix, and the proof.** `#if TARGET_VITA` now does `size *= 3` before the `#elif TARGET_PC`. Same run, same
 harness, only the multiplier changed:
 
 | | request | MiB |
@@ -1899,19 +1868,18 @@ harness, only the multiplier changed:
 | before | `0xCB20A0` | 12.70 |
 | after | `0x1E78A0` | **1.90** |
 
-Both decompose exactly as `base * N + 0xA0`: `0xA2800*20 + 0xA0` and `0xA2800*3 + 0xA0`. The shield
-heap moved the same way, `0x7D000*3 = 0x177000`. **10.79 MiB reclaimed per Link creation.** No
-`fatal.txt`, no `crash.log`, frames render normally (all five captures `738x544` at the expected bbox),
-and the host suites are unchanged: e2e 91 scenes / 14,266 checks / 0 failed, texture 3,780/0, crash
-PASS, printf clean.
+Both decompose exactly as `base * N + 0xA0`: `0xA2800*20 + 0xA0` and `0xA2800*3 + 0xA0`. The shield heap
+moved the same way, `0x7D000*3 = 0x177000`. **10.79 MiB reclaimed per Link creation.** No `fatal.txt`, no
+`crash.log`, frames render normally (all five captures `738x544` at the expected bbox), and the host suites
+are unchanged: e2e 91 scenes / 14,266 checks / 0 failed, texture 3,780/0, crash PASS, printf clean.
 
-**Not proven:** that this was the §7.1/§7.12b abort. Those runs died in the **attract loop** while
-streaming demo resources, before Link exists, and the failure carried no size. This fix removes a real
-12.70 MiB single-block request that could strand a stage change or a post-fall restart; whether it
-retires the attract-loop abort is **untested**, and the `0xBF18265F` corrupted-size case remains
-unexplained. Do not write "the heap abort is fixed".
+**Not proven:** that this was the §7.1/§7.12b abort. Those runs died in the **attract loop** while streaming
+demo resources, before Link exists, and the failure carried no size. This fix removes a real 12.70 MiB
+single-block request that could strand a stage change or a post-fall restart; whether it retires the
+attract-loop abort is **untested**, and the `0xBF18265F` corrupted-size case remains unexplained. Do not
+write "the heap abort is fixed".
 
-##### Their v0.9.0 console numbers, for the record
+**Their v0.9.0 console numbers, for the record:**
 
 PS Vita 1000, 13 Nov, default "Speed-ups: Original": Snowpeak Ruins 19 FPS, Kakariko 18–19, Ordon village
 14 standing / 16 walking, Hyrule Field enemy areas 14.5, Palace of Twilight 14, Ordon widest view 10. With
