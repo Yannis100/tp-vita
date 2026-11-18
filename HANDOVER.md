@@ -1,6 +1,6 @@
 # Handover: Twilight Princess on PS Vita
 
-**Written:** 2026-10-29. **Updated:** 2026-11-11.
+**Written:** 2026-10-29. **Updated:** 2026-11-18 (§7.27, §7.28: the console-preparation work).
 **For:** a fresh session picking up this port. Read this first, then `PLAN.md` and `README.md`.
 
 This document records state, verified facts, traps and open work. Guesses are labelled as guesses.
@@ -50,8 +50,9 @@ Consequences:
 
 **The game boots, reaches its main loop, renders, and on a driven run reaches real gameplay.**
 
-- Build is clean: `cmake --build` exits 0 and produces `build/tpv_vita-release.vpk`; text→data gap
-  20,144 bytes (checked by `tools/check_text_gap.py`).
+- Build is clean and produces two VPKs, both checked by `tools/check_text_gap.py` (§7.28):
+  `TPLG00001` instrumented, 16,679,958 B, gap **23,524 B**; `TPLG30001` timing-clean
+  (`-DTPV_NO_PHASE_TIMERS`), 16,679,430 B, gap **25,120 B**.
 - `mDoMch_Create()` returns 1. `main01()` stays in its `do { … } while (dusk::IsRunning)` loop.
 - Frames are real: 78,360–87,870 distinct colours each (before the §7.3 fix: 1,614–3,979, i.e.
   untextured), content bbox `(271,128)–(1008,671)` on a 1280×800 canvas.
@@ -71,9 +72,10 @@ Consequences:
   `ux0:data/tpvita/crash.log` with the caller resolved to a symbol (§7.10, §7.11). Proven by a
   deliberate abort recording `abort_caller=0x81009bab main`, checked against `nm`.
 
-**What this does not prove.** Vita3K is an emulator; nothing here has run on hardware. Audio is
+**What this does not prove.** Vita3K is an emulator; **nothing here has run on hardware.** Audio is
 disabled (`DUSK_AUDIO_DISABLED`). Save RELOAD, the pause menu and most of the game have never been
-exercised. The accurate claim is "boots, renders and reaches gameplay", not "playable".
+exercised. The accurate claim is "boots, renders and reaches gameplay", not "playable". A console session
+is the next step, and §11 says what to do with it.
 
 **How the picture has been checked.** Twice, both by the user by eye, both non-pixel: (1) 2026-11-05
 the title screen matched a reference frame after the §3d.3 scale fix; (2) 2026-11-09 the in-game
@@ -453,23 +455,13 @@ a rock outcrop and a mounted rider (`pr_16`). Frames change 34–39% pixel-wise,
 counts 215–376/frame. **The user validated this by eye**; it replaces the de-scoped desktop reference render.
 
 The screen is `dName_c` with a nine-entry `mSelProc` state machine (`include/d/d_name.h`):
-
-```
-proc: 0=MOJI_SELECT 1=MOJI_SEL_ANM 2=MOJI_SEL_ANM2 3=MOJI_SEL_ANM3
-      4=MENU_SELECT 5=MENU_SEL_ANM 6=MENU_SEL_ANM2 7=MENU_SEL_ANM3 8=WAIT
-menu: 0=HIRA 1=KATA 2=EIGO 3=END
-```
+`0=MOJI_SELECT 1..3=MOJI_SEL_ANM{,2,3} 4=MENU_SELECT 5..7=MENU_SEL_ANM{,2,3} 8=WAIT`, and a four-entry
+menu `0=HIRA 1=KATA 2=EIGO 3=END`.
 
 A `[name-proc]` probe in `dName_c::_move()` (one line per distinct `(proc, menu, row, col)`) plus a
-`[name-press]` probe gave, on a clean run:
-
-```
-proc=0 menu=0   cursor walking 12->11->...->0, wrapping
-[name-press] START delivered in proc=0 menu=0
-proc=2 menu=2   <- MOJI_SEL_ANM2, mSelMenu set to EIGO
-proc=4 menu=2   <- MENU_SELECT, cursor on EIGO ("ABC")
-[name-press] A delivered in proc=8 menu=2   <- PROC_WAIT
-```
+`[name-press]` probe gave, on a clean run: cursor walking 12→11→…→0 wrapping in `proc=0 menu=0`; START
+delivered there; `proc=2 menu=2` (MOJI_SEL_ANM2, `mSelMenu` set to EIGO); `proc=4 menu=2`
+(MENU_SELECT, cursor on EIGO "ABC"); A delivered at `proc=8 menu=2` (PROC_WAIT).
 
 **`proc=8` after A is the proof of success.** A in `MenuSelect()` calls `menuAbtnSelect()`, which on a
 PAL disc jumps to `pal_eigo:`, calls `nameCheck()`, and on a non-empty name sets `mSelProc = PROC_WAIT`
@@ -477,7 +469,7 @@ and `mIsInputEnd = 2`; `dFile_select_c::nameInput()` then calls `dComIfGs_setPla
 second identical screen for the horse name (`nameInput2()`).
 
 On this PAL disc `EIGO_OR_END` resolves to `MENU_EIGO` (2), **not** `MENU_END` (3), because
-`DUSK_IF_ELSE((isRegionPal() ? MENU_EIGO : MENU_END), MENU_END)`. So the menu shows `ABC` already
+`DUSK_IF_ELSE((isRegionPal() ? MENU_EIGO : MENU_END), MENU_END)`. The menu therefore shows `ABC` already
 selected and A confirms there — the highlighted `ABC` was correct, not a bug.
 
 **The exit, read from the source:**
@@ -492,16 +484,14 @@ So the exit is a **two-press pair, START then A**; neither alone leaves. There a
 (`d_file_select.cpp:1747` player, `:1845` horse), so the pair repeats. A repeating `A` cadence is a
 repeating typist: it typed five stray characters into a full field, producing the frozen `LinkJF` screen.
 
-**Two diagnoses were wrong and are recorded so they are not repeated.**
-
-1. *"A types letters, so the screen is a dead end."* A does type in `PROC_MOJI_SELECT`, but the screen
-   also moves on. The `LinkJF` text was typed by the sweep, not evidence of a trap.
-2. *"START then A is ignored, the screen is stuck at `proc=4`."* A **was** delivered and did exit.
-   The frames looked identical because of **sampling time, not game state**: three "frozen" shots were
-   taken at 6–9 minutes, before the exit at frame ~2,150–2,430. Two screenshots taken seconds apart
-   showing the same pixels are evidence about *when they were taken*. A state probe settled it, not
-   another look at the picture. The 8,260-frame run's 16 screenshots were named `g_naming_1 … o_gameplay_3`;
-   the names were **hopes**, and the pixels differed by 0.09–0.28% across eleven of them.
+**Two wrong diagnoses, kept as one rule each.** (1) *"A types letters, so the screen is a dead end"* — A
+does type in `PROC_MOJI_SELECT`, but the screen also moves on; the `LinkJF` text was typed by the sweep,
+not evidence of a trap. (2) *"START then A is ignored, stuck at `proc=4`"* — A **was** delivered and did
+exit; the frames looked identical because of **sampling time, not game state**, with three "frozen" shots
+taken at 6–9 minutes and the exit at frame ~2,150–2,430. Two screenshots seconds apart showing identical
+pixels are evidence about *when they were taken*. A state probe settled it, not another look at the
+picture — and the 16 screenshots named `g_naming_1 … o_gameplay_3` were **hopes**, differing by
+0.09–0.28 % across eleven of them.
 
 **The PLAY-scene phase chain.** `d_s_play.cpp:1660` logs one line per distinct `(phase index, returned
 cPhs state)` pair from `dScnPly_Create`, reading `field_0x1c4.id` **before** the handler runs, so a phase
@@ -563,28 +553,25 @@ same experiment expecting a player name on the file select.
    status: banner=1 anim=4 iconFormat=0155 iconSpeed=0155 iconAddr=0x0 commentAddr=0x2400
    primary @0x4000: dataVersion le=6 be=100663296 (ok)
      sector checksum: ok (big-word/little-store)
-     slot 1: checksum valid  name='' horse='' time=0 stage='F_SP108'  displays='New Quest Log'
-     slot 2: checksum valid  name='' horse='' time=0 stage='F_SP108'  displays='New Quest Log'
-     slot 3: checksum valid  name='' horse='' time=0 stage='F_SP108'  displays='New Quest Log'
+     slot 1/2/3: checksum valid  name='' horse='' time=0 stage='F_SP108'  displays='New Quest Log'
    ```
 
-   (One `primary` sector is quoted; the `backup` at `0x6000` prints the identical six lines, and both
-   are in the file. `dataVersion be=100663296` is the same four bytes read the other way — `0x06000000`
-   — and is not a defect: `mDoMemCdRWm_Restore()` copies the int without swapping it.)
-
-   `banner=1`/`anim=4` are `CARD_STAT_BANNER_C8`/`CARD_STAT_ANIM_BOUNCE`; `iconFormat=iconSpeed=0x0155`
-   is five C8 icons then three `NONE`/`END`, which is exactly what
-   [`mDoMemCdRWm_CheckCardStat()`](../dusklight/src/m_Do/m_Do_MemCardRWmng.cpp:436) requires. So the
-   `Restore()` path is not rejecting anything.
+   The `backup` sector at `0x6000` prints the identical six lines and is present.
+   `dataVersion be=100663296` is those four bytes read the other way (`0x06000000`) and is not a defect:
+   `mDoMemCdRWm_Restore()` copies the int without swapping. `banner=1`/`anim=4` are
+   `CARD_STAT_BANNER_C8`/`CARD_STAT_ANIM_BOUNCE`, and `iconFormat=iconSpeed=0x0155` is five C8 icons then
+   three `NONE`/`END`, which is exactly what
+   [`mDoMemCdRWm_CheckCardStat()`](../dusklight/src/m_Do/m_Do_MemCardRWmng.cpp:436) requires — so
+   `Restore()` is not rejecting anything.
 
 **Two endianness facts, both measured, both easy to get wrong.**
 
 - `mDoMemCdRWm_CalcCheckSum()` declares `u16 high, low`, so each accumulator wraps at 65536 before the
-  `high << 16 | low` pack. Widening them to `u32` changes the result and reports a valid file as broken.
+  `high << 16 | low` pack. Widening to `u32` changes the result and reports a valid file as broken.
 - `BE(u16)` is a no-op byte type on a little-endian host ([`endian.h:352`](../dusklight/include/helpers/endian.h:352)),
   so the sector checksum reads **big-endian words** but stores the `u32` result in **host byte order**.
-  The file matches `big-word/little-store` and nothing else. Conflating those two axes produced two
-  false "MISMATCH" reports before the pair was separated.
+  The file matches `big-word/little-store` and nothing else; conflating the two axes produced two false
+  "MISMATCH" reports before they were separated.
 
 **What this changes about §3d.2's open question.** §3d.2 says a second run "began a *new* game rather
 than continuing" and calls save RELOAD untested. Loading this GCI cannot demonstrate a reload: the slot
@@ -622,19 +609,22 @@ across that boundary conflates the whole divergence and is misleading.
 
 Done by reconstruction and **byte comparison**, since the merged tree has no history: checkout
 `pre-upgrade-3227d76`; extract the pre-upgrade merged tree from
-`.snapshot-pre-aurora-upgrade-20261029/aurora_lib-merged.tar.gz`; diff against upstream
-(`13` modified files, `12` overlay-only); rewrite `patches.py` from those diffs; drop the
-`505b5eb`-only `readback/` subsystem; restore `gx/texture.cpp`, `cmake/aurora.cmake`,
-`cmake/aurora_gx.cmake` and `vita/aurora/backend.cpp`; assemble; compare.
+`.snapshot-pre-aurora-upgrade-20261029/aurora_lib-merged.tar.gz`; diff against upstream (13 modified
+files, 12 overlay-only); rewrite `patches.py` from those diffs; drop the `505b5eb`-only `readback/`
+subsystem; restore `gx/texture.cpp`, `cmake/aurora.cmake`, `cmake/aurora_gx.cmake` and
+`vita/aurora/backend.cpp`; assemble; compare.
 
-**Result: PASS — `patches.py` + overlay reproduce the known-good tree byte-for-byte** (178 files),
-after fixing three cosmetic mismatches (a dropped `m_cv.notify_all()`, `std::lock_guard lk{m_mutex}` vs
-`lk(m_mutex)`, one lost indentation level). **Reuse this technique** for any patch-set change: rebuild,
-extract the known-good snapshot, `diff -rq`.
+**Result: PASS — `patches.py` + overlay reproduce the known-good tree byte-for-byte** (178 files), after
+three cosmetic mismatches (a dropped `m_cv.notify_all()`, `std::lock_guard lk{m_mutex}` vs `lk(m_mutex)`,
+one lost indentation level). **Reuse this technique** for any patch-set change: rebuild, extract the
+known-good snapshot, `diff -rq`.
 
 ### 4.3 Cherry-pick audit of the 7 aurora commits
 
-All seven: **Skip.**
+All seven: **Skip.** `8e356df` (`GXPeekZ`) already exists at `3227d76`; `afd4bb8`
+(`GDLoadTexObj`/`GDLoadTlut`) is called by nothing we compile; `f8347d9` (FIFO processing-mode) is
+achieved by our one-line `patches.py` substitution; `12943d1` is WebGPU-only; and `d0ace68` (the PAD API
+removal) is the breaking change of §4.1, which `7c8c611` and `505b5eb` depend on.
 
 | Commit | What it is | Verdict |
 |---|---|---|
@@ -1018,100 +1008,85 @@ aurora work is directly comparable rather than ahead of us.
 **Three correctness fixes taken, each verified against the source and against our own numbers:**
 
 1. **GX min-filter table had two entries swapped.** `kHwToGxFilter` in `overlay/gfx/texture.hpp` inverts
-   `GX2HWFiltConv = {0x00,0x04,0x01,0x05,0x02,0x06}`, so hardware bits `0x2` must decode to
-   `GX_NEAR_MIP_LIN` (4) and `0x5` to `GX_LIN_MIP_NEAR` (3). Both were swapped, so a texture set to
-   linear minification with nearest mip came back as point minification blending two mips, and
-   `gl_min_filter` sent it to `GL_NEAREST_MIPMAP_LINEAR` instead of `GL_LINEAR_MIPMAP_NEAREST`.
-   **Active in our build** — nearest sampling where the game asked for linear, i.e. shimmering in motion.
-   Same defect as upstream `26371ce` (#293).
+   `GX2HWFiltConv = {0x00,0x04,0x01,0x05,0x02,0x06}`, so hardware bit `0x2` must decode to
+   `GX_NEAR_MIP_LIN` (4) and `0x5` to `GX_LIN_MIP_NEAR` (3). Both were swapped, so linear-minification
+   textures came back as point minification blending two mips. **Active in our build** — nearest sampling
+   where the game asked for linear, i.e. shimmering in motion. Same defect as upstream `26371ce` (#293).
 2. **Light directions were not normalised.** The generated fragment shader used the raw direction in the
    diffuse terms (`vita_shader.cpp:780` `dot(mv_nrm, ldirL)`, `:771` `dot(ldir, ldirL)`) while the emboss
-   path in the same file does call `normalize`. Dusklight stores whatever the game passes to
-   `GXInitLightDir`, which is not guaranteed unit length, so intensity was scaled by the vector's
-   magnitude. **Active in our build.** Fixed by normalising each light in `gx/shader_info.cpp` before the
-   bulk append (upstream `0b39c95` cannot be taken verbatim: at our pin the whole array is appended in
-   one call, so there is no per-light site to wrap).
-3. **The save path allocates 64 KiB on an 8 KiB stack.** `copy_stream()` in aurora's `io.cpp` has a
-   `std::array<uint8_t, 64*1024>` local, and every card write goes through it (`open_atomic_file` →
-   `copy_stream`, from `CardRawFile.cpp` and `FileIO.cpp`). The thread is the memory-card thread from
-   `m_Do_MemCard.cpp`, whose `STACK_SIZE` is **`0x2000` (8 KiB)** — `0x1000` only under `PLATFORM_GCN` —
-   and dusklight's `OSCreateThread` runs the body on a detached `std::thread`, so that is the real stack.
-   The static `MemCardStack` array is bookkeeping. 64 KiB against 8 KiB is an **8× overflow on the first
-   write**: on hardware this presents as "saving crashes", with no address clue pointing at a 64 KiB
-   local. Fixed to 4 KiB chunks (the loop already handles short reads). **Vita3K cannot reproduce this** —
-   host stacks are megabytes — so no emulator run would have shown it.
+   path in the same file does call `normalize`. `GXInitLightDir` is not guaranteed unit length, so
+   intensity was scaled by the vector's magnitude. **Active in our build.** Fixed in `gx/shader_info.cpp`
+   before the bulk append (upstream `0b39c95` does not apply verbatim: our array is appended in one call,
+   so there is no per-light site to wrap).
+3. **The save path allocated 64 KiB on an 8 KiB stack.** `copy_stream()` in aurora's `io.cpp` has a
+   `std::array<uint8_t, 64*1024>` local, and every card write goes through it. The thread is the
+   memory-card thread from `m_Do_MemCard.cpp`, whose `STACK_SIZE` is **`0x2000` (8 KiB)**, and
+   dusklight's `OSCreateThread` runs the body on a detached `std::thread`, so that is the real stack; the
+   static `MemCardStack` array is bookkeeping. **An 8× overflow on the first write**, presenting on
+   hardware as "saving crashes" with no address clue pointing at a 64 KiB local. Fixed to 4 KiB chunks
+   (the loop already handles short reads). **Vita3K cannot reproduce this** — host stacks are megabytes.
 
 **One latent fix worth nothing yet:** negative LOD bias was cast float→`u8`, which ARM saturates to 0.
 Patched in `patches.py`, but **`kUseTexLodBias = false`**, so nothing consumes it and no pixels change.
 Recorded so nobody later credits it with a rendering improvement.
 
 **Verified:** clean build, VPK produced, e2e 91 scenes / 14,266 checks / 0 failed, texture 3,780/0.
-**Not verified:** no pixels were compared on a real scene, so none of the fixes is shown to improve the
-picture — only that none can regress the suites.
+**Not verified:** no pixels compared on a real scene, so none of the fixes is shown to improve the picture
+— only that none can regress the suites.
 
-**The decoding fixes now have tests, and getting that right took a correction.**
-`tests/host/e2e/scenes_texobj.hpp` adds four scenes that drive the real `GXInitTexObjLOD`,
-`GXInitTexObjFilter`, `GXInitTexObjLODBias` and `GXLoadTexObj` through the real FIFO and command
-processor, then read back `gxState().loadedTextures`. Before, `grep -rn 'min_filter|lod_bias' tests/host/`
-was empty, so both defects could have been reverted with every suite still green. Proven by reverting
-each defect: the swapped table is caught in exactly the two slots it corrupts. **The LOD-bias UB is not
-detectable at runtime on x86** — at runtime gcc emits `cvttss2si` and stores the low byte, so
-`(uint8_t)(32.0f * -4.0f)` gives `0x80` in both buggy and fixed form; only at compile time does gcc fold
-it to `0`. Same expression, two answers: the signature of UB, and the same divergence ARM's saturating
-conversion produces. So the fix is pinned by `static_assert`s over a `constexpr` encoder, where the buggy
-form is ill-formed (`overflow in constant expression`). Verified both ways. Fix 3 is not tested here — it
-is a stack-depth constraint no host run can observe.
+**Fixes 1 and 2 now have tests.** `tests/host/e2e/scenes_texobj.hpp` drives the real `GXInitTexObjLOD`,
+`GXInitTexObjFilter`, `GXInitTexObjLODBias` and `GXLoadTexObj` through the real FIFO and command processor,
+then reads back `gxState().loadedTextures`. Before it, `grep -rn 'min_filter|lod_bias' tests/host/` was
+empty, so either defect could be reverted with every suite green; proven by reverting each — the swapped
+table is caught in exactly the two slots it corrupts. **The LOD-bias UB is not detectable at runtime on
+x86**: gcc emits `cvttss2si` and stores the low byte, so `(uint8_t)(32.0f * -4.0f)` gives `0x80` in both
+buggy and fixed form, and only at compile time does gcc fold it to `0`. Same expression, two answers — the
+signature of UB, and the same divergence ARM's saturating conversion produces. So it is pinned by
+`static_assert`s over a `constexpr` encoder, where the buggy form is ill-formed (`overflow in constant
+expression`). Fix 3 has no test: it is a stack-depth constraint no host run can observe.
 
 **Audited and deliberately NOT taken** (so this is not redone). DuskOnVita carries 17 aurora patches,
 53 dusklight, 2 borealis and 5 vitaGL; most is performance work written against *their* GXM backend
-(`command_processor.cpp` register-decode fast paths, static display lists, a GX worker thread, frame
-overlap).
+(register-decode fast paths, static display lists, a GX worker, frame overlap).
 
-- **vitaGL patches (3 substantive):** we consume a prebuilt `libvitaGL.a`, not source. Adopting them
-  means building vitaGL from source — a project, not a cherry-pick.
-- **`borealis/0002` (absolute device paths):** real defect class, but it only affects `borealis::data`,
-  which we do not use for game paths.
-- **abseil patch:** byte-identical to our own `patches/abseil-vita.patch`.
-- **`aurora/0012`:** the same min-filter fix already applied here; we also took the idea for the tests.
-- **`aurora/0005`** is fix 3 above.
-- **Upstream aurora's 24 commits:** only four were candidates, all no-ops for TP. `f77492f` (truncate
-  vertex count, skip 0 draws) is ordering, not correctness — decode already clamps to
-  `availBytes / vtxStride`, `draw_op` already returns early on `vtxCount == 0`, and GL ignores incomplete
-  primitives. `6dc60dc` (`GXSetZScaleOffset`), `8aa4c09` (`GDSetTexImgPtr`) and `9873709`
-  (`GXClear`/`GXClearSubRect`) add functions the game never calls. The rest are behind the `505b5eb` wall.
+| not taken | why |
+|---|---|
+| 3 substantive vitaGL patches | we consume a prebuilt `libvitaGL.a`; adopting them means building vitaGL from source — a project, not a cherry-pick |
+| `borealis/0002` (absolute device paths) | real defect class, but it only affects `borealis::data`, which we do not use for game paths |
+| abseil patch | byte-identical to our own `patches/abseil-vita.patch` |
+| `aurora/0012` | the same min-filter fix already applied here; we took the idea for the tests too |
+| `aurora/0005` | is fix 3 above |
+| 53 dusklight patches | whole-game optimisation that assumes behaviour may be rewritten per system (see §7.5) |
+
+**Upstream aurora's 24 commits:** only four were candidates and all are no-ops for TP. `f77492f` (truncate
+vertex count, skip 0 draws) is ordering, not correctness — decode already clamps to `availBytes /
+vtxStride`, `draw_op` returns early on `vtxCount == 0`, and GL ignores incomplete primitives. `6dc60dc`
+(`GXSetZScaleOffset`), `8aa4c09` (`GDSetTexImgPtr`) and `9873709` (`GXClear`/`GXClearSubRect`) add
+functions the game never calls. The rest are behind the `505b5eb` wall (§4.1).
 
 **A third port exists, runs in Vita3K, and rendered the frame this project de-scoped.** `capitanbarbacoa`
 publishes "Dusklight PSVita" at <https://capitanbarbacoa.itch.io/duskgxm> (v1.1.0, 22 MB, built
-2026-11-03, AI-assisted, code not shared); the workspace holds a copy at `../Dusklight-1-1-0.vpk`.
+2026-11-03, code not shared); the workspace holds a copy at `../Dusklight-1-1-0.vpk`.
 
-**It was run, not just read.** The same harness, the same `GZ2P01.iso` (symlinked to
-`ux0:data/dusklight/Zelda.iso`, the path it expects). Result, saved as
-`tests/vita3k/screenshots/theirs_prelaunch_{1..4}.png`: it reaches its prelaunch/preset screen **on top of
-a fully rendered 3D scene** (the Ordon spring backdrop), consecutive frames differ by **30% of
-scene-crop pixels** (max-abs-diff 149), and it does not crash. It crashed once on a fresh firmware-less
-work dir — a setup fault: it wants `ur0:data/external/libshadccg.suprx`, and the emulator's own
-`ur0:data/libshacccg.suprx` is enough for ours.
+**It was run, not just read** — same harness, same `GZ2P01.iso` (symlinked to `ux0:data/dusklight/Zelda.iso`,
+the path it expects). Saved as `tests/vita3k/screenshots/theirs_prelaunch_{1..4}.png`: it reaches its
+prelaunch/preset screen **on top of a fully rendered 3D scene** (the Ordon spring backdrop), consecutive
+frames differ by **30 % of scene-crop pixels** (max-abs-diff 149), no crash. It needs
+`ur0:data/external/libshadccg.suprx`; the emulator's own `ur0:data/libshacccg.suprx` suffices for ours.
 
-**Two earlier claims were wrong and are retracted.** (1) *"The `eboot.bin` is encrypted (`flags
-0x100c0`), so it is not analyzable."* **False**: our own eboot carries the identical flags, which are not
-an encryption marker. The real reason `strings` finds nothing is **compression** — valid zlib streams
-start at `0x1000`, and a plaintext `\x7fELF` sits at `0xa0` in both. It **could** be unpacked (§ below).
-(2) *"`res/rml/vita.rcss` does not apply because we stub RmlUi."* True today, but it understates what
-their run proves: the Dusk UI works on this GPU in the emulator, so the gap is **ours**, not the
-hardware's or aurora's.
+**One retraction, kept because the wrong version is the intuitive one.** *"The `eboot.bin` is encrypted
+(`flags 0x100c0`), so it is not analyzable"* is **false**: our own eboot carries identical flags, which are
+not an encryption marker. `strings` finds nothing because the image is **compressed**, not encrypted.
+This is trap 45, and `tools/unpack_self.py` documents both traps it cost to learn: those flags, and that
+the program headers are **not** `Elf32_Phdr` even though `e_phentsize` is 32 (they are SCE segment
+descriptors, so walking them yields plausible nonsense). What works is scanning for zlib stream headers
+and inflating in place — 31 MB readable for ours, 32 MB for theirs. The unpacker is **validated against
+our own build first** (output must contain `Aurora (vitaGL) initializing`, `ux0:data/tpvita/shader_fail`
+and `input script: ACTIVE`) so it is trustworthy before being pointed at a foreign file.
 
-**Their eboot WAS unpacked, and it says one thing that matters.** `tools/unpack_self.py` decompresses a
-SELF in place, and it is **validated against our own build first** — the output must contain
-`Aurora (vitaGL) initializing`, `ux0:data/tpvita/shader_fail` and `input script: ACTIVE`. It does, so the
-unpacker is trustworthy before it is pointed at a foreign file. Two traps are documented in the script
-because both cost time: `SceHeader` flags `0x100c0` do **not** mean encrypted, and the program headers are
-**not** `Elf32_Phdr` even though `e_phentsize` is 32 (`p_offset`/`p_vaddr` are SCE segment descriptors, so
-walking them yields plausible nonsense: `type=0x0159a284`). What works is scanning for zlib stream headers
-and inflating each stream in place. Result: 31 MB of readable image for ours, 32 MB for theirs.
-
-**Their build is stripped**: `aurora::gx::` appears 5 times in ours and 0 in theirs, `dusk::` 26 vs 1, and
-the GXM/vitaGL entry points are imported by NID rather than named. **There is no symbol-level comparison
-to be had**; do not repeat this expecting one. What *is* readable is structural and significant:
+**Their build is stripped**: `aurora::gx::` appears 5 times in ours and 0 in theirs, `dusk::` 26 vs 1, GXM
+and vitaGL entry points imported by NID. **There is no symbol-level comparison to be had.** What is
+readable is structural:
 
 | | ours | theirs |
 |---|---|---|
@@ -1119,43 +1094,36 @@ to be had**; do not repeat this expecting one. What *is* readable is structural 
 | `textureSample` (WGSL builtin) | **0** | **15** |
 
 **They ship upstream aurora's WebGPU shaders as WGSL and translate them to GXM at runtime; we generate
-GLSL from GX state.** That explains a lot at once: why their patch set is careful edits inside aurora's
-`lib/gx/` (they keep upstream's shader path), why their filter fixes matched upstream's (they track
-upstream), and why our two fixes were needed — on our route the GX→GLSL generator is *our* code, so
-upstream's shader fixes never reach us. It is also the honest answer to "should we switch routes?"
-Theirs gets upstream fixes for free; ours avoids a WGSL→GXM translation layer on a Cortex-A9. Neither is
-obviously right, and this is not evidence to switch.
+GLSL from GX state.** That explains why their patches are careful edits inside aurora's `lib/gx/` (they
+track upstream's shader path), why their filter fixes matched upstream's, and why our two fixes were
+needed — on our route the GX→GLSL generator is *our* code, so upstream's shader fixes never reach us. It
+is also the honest answer to "should we switch routes?" Theirs gets upstream fixes free; ours avoids a
+WGSL→GXM translation layer on a Cortex-A9. Neither is obviously right, and this is **not** evidence to
+switch.
 
-**Their screenshots are NOT yet a valid pixel reference, and this is the trap.** The first frames we took
-weren't a valid reference either: they showed **a different scene at a different time of day** (their
-prelaunch backdrop vs our in-game dialogue and field). Comparing region luminance would be meaningless,
-and this project has published wrong conclusions twice by comparing unlike things (§7.8). Using their
-build as a reference needs **both** ports driven to the *same* scene, camera and frame. Until then, treat
-their frames as proof that a correct picture is reachable on this GPU.
+**Their screenshots are NOT a valid pixel reference yet.** Theirs show a different scene at a different
+time of day (prelaunch backdrop vs our in-game dialogue and field); comparing region luminance would be
+meaningless, and this project has published wrong conclusions twice by comparing unlike things (§7.8). A
+reference needs **both** ports driven to the *same* scene, camera and frame. Until then, treat their
+frames as proof that a correct picture is reachable on this GPU.
 
 #### 7.4b.1 Their UI confirms on Circle, not Cross — and the config is the other lever (2026-11-11)
 
-**The modal is clickable. The prior session pressed the wrong button.** Cross (`x`) never confirmed it —
-measured twice, with a 0.12 s tap and a 1 s hold, four later screenshots pixel-identical — but that is
-not a Vita3K defect and not a timing problem: **this UI confirms on the pad's `A` button, which on Vita
-is Circle (`c`)**. The mechanism, read from source:
+**The modal is clickable; the earlier session pressed the wrong button.** Cross (`x`) never confirmed it
+— measured twice, 0.12 s tap and 1 s hold, four later screenshots pixel-identical — but that is neither a
+Vita3K defect nor a timing problem: **this UI confirms on the pad's `A` button, which on Vita is Circle
+(`c`)**. From source: `map_pad_button()` (`dusk/ui/input.cpp:156-178`) maps `PAD_BUTTON_A -> KI_RETURN`
+and `PAD_BUTTON_B -> KI_ESCAPE`; `map_nav_event()` (`dusk/ui/ui.cpp:633-659`) maps `KI_RETURN ->
+NavCommand::Confirm`. So the *east* face button (Cross) is `B` = Cancel and the *south* (Circle) is `A` =
+Confirm — the preset window prints "A/B/X/Y" and its Play/Settings/Mods/Quit column behaves the same way.
+Navigation always worked because the D-pad maps to `KI_LEFT/RIGHT`, which is why `hold Left` moved the
+selection and made timing look like the suspect.
 
-- `dusklight/src/dusk/ui/input.cpp:156-178` `map_pad_button()`: `PAD_BUTTON_A -> KI_RETURN`,
-  `PAD_BUTTON_B -> KI_ESCAPE`.
-- `dusklight/src/dusk/ui/ui.cpp:633-659` `map_nav_event()`: `KI_RETURN -> NavCommand::Confirm`,
-  `KI_ESCAPE -> NavCommand::Cancel`.
-- So the *east* face button (Cross) is `B` = Cancel, and the *south* button (Circle) is `A` = Confirm.
-  The preset window prints "A/B/X/Y" and its Play/Settings/Mods/Quit column behaves the same way.
-- Navigation always worked because the D-pad maps to `KI_LEFT/RIGHT`, which is why `hold Left` moved the
-  selection and made the earlier session suspect timing.
-
-**Proven by run** (`cc_` prefix, 2026-11-11): `hold Left 1` → Classic highlighted gold border;
-`hold c 1` → the modal closes and PLAY takes the focus highlight, over the live disc scene. A previous
-attempt with `hold Return 1` did **not** confirm either — Vita3K translates a host Return into the pad's
-Start, not into a `KI_RETURN` keydown, so the host key that works is `c`.
-
-**Why this matters beyond the modal:** loading an existing save from their in-game menu needs a working
-Confirm, and that is the gate on the like-for-like comparison in §7.4b.2.
+**Proven by run** (`cc_`, 2026-11-11): `hold Left 1` → Classic highlighted gold border; `hold c 1` → the
+modal closes and PLAY takes the focus highlight over the live disc scene. `hold Return 1` did **not**
+confirm either: Vita3K translates host Return into the pad's Start, not into a `KI_RETURN` keydown, so
+`c` is the host key that works. This matters beyond the modal — loading an existing save from their
+in-game menu needs a working Confirm, which is the gate on the comparison in §7.4b.2.
 
 **The other lever is `config.json`, and it is exact rather than a guess.** Their build serialises every
 registered `ConfigVar` to a flat JSON object (`dusk/config.cpp:538-567`), and the preset modal's Confirm
@@ -1319,19 +1287,19 @@ belongs in the skill rather than being a local quirk. It also drains `glGetError
 keeps the enum (the rule in §8 trap 15).
 
 **Its open bug is our open bug.** "Some textures flicker", and its help request is a *matched Dolphin
-capture of the same scene* — the same missing artefact. It also notes it *"skips draws that would read an
-empty copy rather than drawing them black"*, which says the saturation we saw was an **EFB-copy read
-path**, not the texture path; both ports hit that wall and it chose to skip rather than sample.
+capture of the same scene* — the same missing artefact. It also *"skips draws that would read an empty
+copy rather than drawing them black"*, which says the saturation we saw was an **EFB-copy read path**,
+not the texture path; both ports hit that wall and it chose to skip rather than sample.
 
-**Taken from it:** the `#if !TARGET_VITA` guard on the retail arena trim (§7.1 — ours was live and removing
-24 MiB per run, theirs was guarded from the start); `NOTICE` plus `LICENSES/` recording every pin and
-licence, including the vitaGL LGPL position; the golden-fixture idea; and `--vita-exit-after` /
-`sequence.txt` for self-terminating repeatable bench runs.
+**Taken from it:** the `#if !TARGET_VITA` guard on the retail arena trim (§7.1 — ours was live, removing
+24 MiB per run); `NOTICE` plus `LICENSES/` recording every pin and licence including the vitaGL LGPL
+position; the golden-fixture idea; `--vita-exit-after` / `sequence.txt` for self-terminating repeatable
+bench runs.
 
-**Deliberately not taken:** its 53 dusklight patches. They are whole-game optimisation that assumes
-behaviour may be rewritten per system, which contradicts the "behaviour comes from the decompilation"
-posture this port holds. We cannot validate them, and importing them makes every future upstream diff
-unreadable. Read its `docs/` as a specification for what to optimise, not as code to import.
+**Deliberately not taken:** its 53 dusklight patches. They assume behaviour may be rewritten per system,
+which contradicts the "behaviour comes from the decompilation" posture this port holds; we cannot
+validate them, and importing them makes every future upstream diff unreadable. Read its `docs/` as a
+specification for **what** to optimise, not as code to import. §7.4b has the audited per-fix detail.
 
 ### 7.6 First performance baseline, and why EFB copies are *not* the missing piece (2026-11-02)
 
@@ -1523,25 +1491,17 @@ defeated it.
 
 ### 7.12 Three-port frame comparison: the pixel diff is not yet possible, and the number that would be quoted is meaningless (2026-11-12)
 
-**Status (amended by §7.12c, 2026-11-12): a same-scene pair WAS produced — the file select, reached by
-our build and measured against `sf_5_05_file_select.png` — and the two layouts agree to about one pixel.
-Our half survives in `tests/vita3k/screenshots/ours_file_select_20261112.png`; the third port's half was
-lost with its work directory, and three attempts to re-capture it did not reproduce the screen, so the
-pair is **not currently re-measurable**. Relative *rendering quality* is still not established, and could
-not be established from that pair even when both halves existed: the captures differ by an animated
-cursor and by the pad's glyphs, which is by design. Everything below about why the earlier attempt failed
-is kept because the failure mode is instructive.**
-
-Three TP→Vita ports are relevant:
+**Superseded in part by §7.12c, which produced the same-scene pair.** Read §7.12c for the outcome; this
+section is kept for the failure mode, which is the instructive part.
 
 | port | code | runnable here | frames available |
 |---|---|---|---|
-| ours (`tp-vita`) | yes | yes (`build/tpv_vita-release.vpk`) | yes, new ones captured today |
+| ours (`tp-vita`) | yes | yes (`build/tpv_vita-release.vpk`) | yes |
 | capitanbarbacoa "Dusklight PSVita" | **no** (itch.io, closed) | yes (`Dusklight-1-1-0.vpk`) | yes (`nm_`, `sf_`) |
-| DuskOnVita (`NathanKneT`) | yes | **no** — GitHub publishes **no release and no VPK**; needs a full VitaSDK source build | **none on this machine** |
+| DuskOnVita (`NathanKneT`) | yes | **no** — publishes **no release and no VPK**; needs a full VitaSDK source build | **none on this machine** |
 
-So a three-way image comparison cannot be produced today. Two of three can be run; the third cannot be
-run at all without building it.
+Two of three can be run; the third cannot be run at all without building it, so there is no three-way
+comparison.
 
 **The measurement that matters, and the trap it avoids.** Diffing frames from different scenes gives a
 number that looks like evidence and is not. Measured, on the 738x544 content region:
@@ -1551,85 +1511,57 @@ ours(r1488_gameplay_ordon) vs theirs(nm_12_gameplay_a) : 90.9% of pixels differ
 theirs(nm_12_gameplay_a)   vs theirs(nm_14_gameplay_c) : 21.0% of pixels differ   <- same run
 ```
 
-90% is the scene change, not the renderer. A fingerprint correlation over all available captures
+90 % is the scene change, not the renderer. Fingerprint correlation over every available capture
 confirms it: **every cross-port pair is below 0.5**, while known same-scene pairs score 0.88–1.00.
-There is no ours↔theirs pair showing the same screen anywhere in the archive.
 
-**Why the screens do not line up, concretely.** The two builds' scripts produce different screens and
-their shot labels are unreliable:
+**Why the screens did not line up.** The builds' scripts produce different screens and the shot labels
+lie: `nm_4_04_title.png` is **not** a title screen, it is the file select (and `nm_3_03_after_play.png`
+is the file select too) — reading a filename as evidence is the §7.8 trap again. An idle run did reach
+the true title once (`PRESS START`, `©2006 Nintendo`), but that frame was not kept and is not
+reproducible. START via the host harness does not advance the title (`Return` and `c` both left the frame
+unchanged over 10–12 s waits); the frame-counted injector works but its save-reload script lands in
+gameplay.
 
-- `nm_4_04_title.png` is **not** a title screen — it is the file select. `nm_3_03_after_play.png` is
-  the file select too. Reading a filename as evidence is the §7.8 trap again.
-- Our idle run **did** reach the true title once (`PRESS START`, `©2006 Nintendo`, logo uncropped over
-  the attract backdrop). That frame was not kept and **the capture is no longer reproducible** — see the
-  crash note below. Their archive has no title capture to compare it to either.
-- Pressing START in **our** build via the host harness does not advance the title (`Return` and `c`
-  both left the frame unchanged across 10–12 s waits), so the file select is not reachable that way.
-  The frame-counted injector does work (`input_script.log` ran to frame 2,860) but its save-reload
-  script lands in gameplay, not on the file select.
+**Geometry is NOT the blocker, and that was checked.** Both ports letterbox to the **same 738 px width**
+at the same x on the 960x544 surface, so a same-scene diff would be legitimate. DuskOnVita differs — its
+own test pins `viewport(118,0,724,544)` against our `(111,0,738,544)` — but its frames cannot be captured
+here. `tools/compare_port_frames.py` compares only the overlap and reports geometry separately, so a
+viewport difference is never smeared into an image-error percentage.
 
-**Geometry is NOT the blocker, and that was checked.** Both ports letterbox to the **same 738 px
-width** at the same x on the 960x544 surface, so a same-scene diff would be legitimate. DuskOnVita is
-the one that differs — its own test pins `viewport(118,0,724,544)` against our `(111,0,738,544)` — but
-its frames cannot be captured here anyway. `tools/compare_port_frames.py` handles this by comparing only
-the overlap and reporting the geometry separately, so a viewport difference is never smeared into an
-image-error percentage.
+**Tooling:** `tools/compare_port_frames.py` refuses a pair whose fingerprint correlation is below
+`--min-correlation` (default 0.85) and prints no diff at all — a refusal is the correct result for a
+different-scene pair. Controls verified: different scenes → refused (exit 1); same scene → measured
+(exit 0, 30.7 %); identical file → 0.0 %; a real same-screen UI pair (`sf_5` vs `nm_4_04`) → measured
+(r=0.977, 8.8 %, the residual being the animated slot highlight). `--port-status` prints the port table
+so a report never implies a three-way comparison that did not happen.
 
-**Tooling added so the next attempt does not redo this.**
-
-- `tools/compare_port_frames.py` refuses a pair whose fingerprint correlation is below `--min-correlation`
-  (default 0.85) and prints no diff at all. A refusal is the correct result for a different-scene pair.
-  Controls verified: different scenes → refused (exit 1); same scene → measured (exit 0, 30.7%);
-  identical file → 0.0%; a real same-screen UI pair (`sf_5` vs `nm_4_04`) → measured (r=0.977, 8.8%,
-  the residual being the animated slot highlight). `--port-status` prints the table above so a report
-  never implies a three-way comparison that did not happen.
-- Our captures from today, all `738x544` and healthy (8k–85k colours):
-  `our_1..6` (idle/attract, title at `our_5`), and the injector-driven gameplay frames.
-
-**The one experiment that would settle relative rendering**, in order of cost: (1) drive **our** build
-to the file select — the static UI both runnable ports provably render — and diff it against
-`sf_5_05_file_select.png`; the injector must be given a script that reaches the file select instead of
-loading a save. (2) Build DuskOnVita from source to obtain its frames. Until one of those exists, no
-claim about which port renders better is supportable.
+**The one experiment that would settle relative rendering**, in order of cost: (1) drive our build to
+the file select and diff it against `sf_5_05_file_select.png` (§7.12c did this); (2) build DuskOnVita
+from source to obtain its frames. Until one exists, no claim about which port renders better is
+supportable.
 
 **Two separate startup faults found while doing this. Both are ours, not the renderer's.**
 
-**(a) A `remove_all` that never returns.** A first idle run never got past the vitaGL splash in 90 s.
-Cause: `ux0:data/TwilitRealm/Dusklight/mods/.cache/dev.twilitrealm.luau` existed as a **directory**, and
-the emulator log showed an unbroken `remove_file ... Error code: 39 (Directory not empty)` loop.
-[`loader.cpp:363`](../dusklight/src/dusk/mods/loader/loader.cpp:363) calls
-`fs::remove_all(m_cacheDir, ec)` **once**, so `remove_all` itself is looping on Vita/Vita3K instead of
-returning the error in `ec`. Removing that directory let the app boot and render normally. Not diagnosed
-further, and **not** the blank-frame symptom: only short runs (≤90 s) then produced the documented
-263-byte blanks.
+**(a) A `remove_all` that never returns.** An idle run never got past the vitaGL splash in 90 s:
+`ux0:data/TwilitRealm/Dusklight/mods/.cache/dev.twilitrealm.luau` existed as a **directory**, and the log
+showed an unbroken `remove_file ... Error code: 39 (Directory not empty)` loop.
+[`loader.cpp:363`](../dusklight/src/dusk/mods/loader/loader.cpp:363) calls `fs::remove_all(m_cacheDir, ec)`
+**once**, so `remove_all` itself loops on Vita/Vita3K instead of returning the error in `ec`. Removing the
+directory let the app boot. **Not** the blank-frame symptom: only runs ≤90 s produced the 263-byte blanks.
 
-**(b) A reproducible `JKRExpHeap` allocation abort at the attract loop — new evidence for §7.1.**
-Two consecutive idle runs aborted with `Trace/breakpoint trap (core dumped)`, and the recorders named it:
+**(b) A reproducible `JKRExpHeap` allocation abort at the attract loop — see §7.1.** Two consecutive idle
+runs aborted, both recorders fresh and `symbols: table matches this build`:
+`fatal.txt: JKRExpHeap.cpp:281 Aborting due to allocation failure!`,
+`crash.log: abort_caller=0x81c81b0d borealis::log::detail::write_fatal`. The guest log stops mid-write
+(`Loading Resource: demo38_wl_cut00_gp_1_o.bmd (`), so it dies while the attract loop streams demo
+resources (`demo38_wl_cut01_gp_1_o.bck`, `_l.bck`, then that `.bmd`).
 
-```
-fatal.txt : [/home/yanserm1/psvita/dusklight/libs/JSystem/src/JKernel/JKRExpHeap.cpp:281]
-            Aborting due to allocation failure!
-crash.log : abort_caller=0x81c81b0d  borealis::log::detail::write_fatal(...)
-```
-
-`fatal.txt` and `crash.log` are both fresh, and `symbols: table matches this build`. The guest log stops
-mid-write — the last line is a truncated `Loading Resource: demo38_wl_cut00_gp_1_o.bmd (` — so the
-allocation failure happens while the attract loop streams demo resources
-(`demo38_wl_cut01_gp_1_o.bck`, `_l.bck`, then that `.bmd`).
-
-What this changes about §7.1: the `0xBF18265F` corruption was recorded there as "the allocation is still
-unexplained" and the rate as "one run in seven … 14 consecutive release runs produced no fatal". Here it
-is **2 out of 2** on the current release VPK, at the title/attract stage. That is not a rate estimate
-(n=2), but it is the first time this failure has been **reproduced on demand with a named caller** rather
-than inferred, and it contradicts "retired". The earlier "14 clean runs" were idle runs too, so the
-difference is likely tree state rather than scenario — `build/tpv_vita-release.vpk` is dated 2026-11-11
-11:56, newer than those runs. Next step is §7.1's own: symbolise the allocation site and print the
-failing size and heap figures, which `JKRExpHeap.cpp:281` does not currently log.
-
-**One earlier capture of the title does exist from before these crashes** and shows the logo, `PRESS
-START` and `©2006 Nintendo` over the attract backdrop at `738x544`. It was transient and is not in the
-archive; re-capturing it is blocked until (b) is understood. Do not claim a title screen from this build
-until then.
+§7.1 called this "unexplained" at "one run in seven" with "14 consecutive clean runs"; here it is **2 of
+2** on the current VPK at the title/attract stage. Not a rate estimate (n=2), but the first time it was
+**reproduced on demand with a named caller** — and those 14 were idle runs too, so the difference is
+likely tree state (`build/tpv_vita-release.vpk` is dated 2026-11-11 11:56, newer than them). **Do not
+claim a title screen from this build** until the allocation site is symbolised and its failing size
+printed, which `JKRExpHeap.cpp:281` does not log.
 
 ### 7.12c The file select WAS reached, and it is a valid same-screen pair with the third port (2026-11-12)
 
@@ -1661,47 +1593,31 @@ Both halves of that were true and the fix was two changes, not one:
 frame on slot 1, and the `B` / `Confirm A` bar — the GameCube prompt glyphs, on the parchment board.
 
 > **The reference frame has since been lost, and re-capturing it did NOT succeed (2026-11-12).** Our
-> capture survives (it was copied into `tests/vita3k/screenshots/`), but `sf_5_05_file_select.png` lived
-> only in `/home/yanserm1/psvita/tooling/vita3k-work/out/`, a transient emulator work directory that was
-> reset by a later run. Three re-capture attempts were then made and **none reproduced the screen**:
+> capture survives (copied into `tests/vita3k/screenshots/`), but `sf_5_05_file_select.png` lived only in
+> a transient emulator work directory that a later run reset. Five re-capture attempts over two configs
+> did not reproduce the screen: with `skipPreLaunchUI:true` (both `cardFileType` values) the build runs
+> live 3D only, never a menu; `hold Return` and `hold c` did not open the slot list; `th3_` reached a
+> **prelaunch PLAY screen at 736 px wide** (the prelaunch UI resizes the surface) but not the slot list.
 >
-> | attempt | their config | result |
-> |---|---|---|
-> | `th_` | `skipPreLaunchUI:true`, `cardFileType:1` | 8 shots, all live 3D — no menu |
-> | `th2_` | same, `cardFileType:0` (GCIFOLDER) | 8 shots, all live 3D — no menu |
-> | `th3_` | 11-Nov 89-byte config (no `wasPresetChosen`) + `hold c` | reached the **prelaunch PLAY screen**, then 736x544 UI frames — not the file select |
-> | `th4_` | `skipPreLaunchUI:true` + `cardFileType:0` + `hold Return` (Start) | 8 shots, all live 3D (60-74% deltas) — no menu |
-> | `th5_` | `skipPreLaunchUI` **removed** (launch UI left up), `cardFileType:0`, `hold Return` | reaches their **launch UI at 736x544** and sits there (deltas 1.9-5.9%); not the slot list |
+> **`th5_` is the only attempt that changed the variable the others held constant** — `skipPreLaunchUI`
+> removed — and it did move the picture: the build stops in a static 736x544 launch UI instead of running
+> 3D (saved as `tests/vita3k/screenshots/theirs_launchui_20261112.png`). That screen is **not** "Choose a
+> Quest Log" — no three-row slot list, no parchment board. So the launch UI is on the path, and
+> `hold Return` there still did not produce the slot list.
 >
-> `th5_` is the only attempt that changed the variable the others held constant, and it did move the
-> picture: with `skipPreLaunchUI` removed the build stops in a static 736x544 launch screen instead of
-> running 3D. That screen is **not** "Choose a Quest Log" — it has no three-row slot list and no
-> parchment board (captured as `tests/vita3k/screenshots/theirs_launchui_20261112.png`). So the launch
-> UI is on the path, but `hold Return` there did not produce the slot list either.
+> **The plausible reading is a hypothesis, not a finding:** with a save on the card and
+> `skipPreLaunchUI`, their build continues into the game without ever offering the slot list, and the
+> original `sf_` capture came from a run whose config left the prelaunch UI up. Untested.
 >
-> **The cause of the first, second and fourth attempts is NOT established, and one wrong explanation was
-> written here and then retracted within the same session.** It said `m_Do_main.cpp:914` gates the
-> prelaunch flow behind `if (!dvd_opened)` and that this harness passes `--dvd`. That is false:
-> `in_container_script.sh:32` launches `./Vita3K -c ... --frontend sdl -w /vpk/app.vpk` and passes
-> **no `--dvd`**, so `dvd_opened` stays false (it is only set inside the `parsed_arg_options.count("dvd")`
-> branch at `m_Do_main.cpp:811`) and the block at :914 **does** run. A source claim that fits the symptom
-> is not a verified cause — the flag had to be grepped for in the launcher, and it was not.
+> **One wrong explanation was written here and retracted within the same session** (trap 21): it claimed
+> `m_Do_main.cpp:914` gates the prelaunch flow behind `if (!dvd_opened)` and that the harness passes
+> `--dvd`. False — `in_container_script.sh:32` passes **no `--dvd`**, so `dvd_opened` stays false and the
+> block at :914 does run.
 >
-> What IS verified about those runs: they render live 3D continuously, i.e. their build is past the
-> menus and in the game. The plausible reading — not tested — is that with a save on the card and
-> `skipPreLaunchUI`, their build continues into the game without ever offering the slot list, and that
-> the original `sf_` capture came from a run whose config left the prelaunch UI up. That is a
-> hypothesis for the next session, not a finding.
->
-> The `th3_` run did reach their UI, but the surface came back **736 px wide** (the prelaunch UI resizes
-> it) and the frames show the PLAY screen, not the save-slot list.
->
-> So the measurement below stands on the capture taken while the file existed, and it is recorded in
-> full so it can be checked; **it is not currently reproducible.** The productive next step is to copy
-> `sf_5_05_file_select.png` out the moment it exists, and to reproduce the original session's config
-> rather than guessing at it. **Rule: a frame cited as evidence must be copied into
-> `tests/vita3k/screenshots/` in the same session it is captured.** §7.12's own "capture is no longer
-> reproducible" note is the same failure, one month earlier.
+> The measurement below stands on the capture taken while the file existed; **it is not reproducible
+> now.** **Rule: a frame cited as evidence must be copied into `tests/vita3k/screenshots/` in the same
+> session it is captured.** §7.12's "capture is no longer reproducible" note is the same failure a month
+> earlier.
 
 **Same screen as `sf_5_05_file_select.png`, measured.** Comparison of the centre-column dark-run
 structure, which is where a menu's layout lives:
@@ -1725,9 +1641,8 @@ animated highlighted row plus sub-pixel text edges: on a 2D screen of ~50k colou
 re-lights most glyph edges and the comparison counts each as an error. The structural measurement
 above is the evidence; the percentage is not.
 
-**The detector was wrong, and it was not "fixed" by loosening it.** `compare_port_frames.py` refused
-this pair at correlation +0.538 against its 0.85 bar. Lowering the bar would have been wrong, and the
-numbers say why:
+**The detector was right to refuse, and it was not "fixed" by loosening it.** `compare_port_frames.py`
+refused this pair at correlation +0.538 against its 0.85 bar:
 
 ```
 verified SAME screen  ours(file select) vs sf_5_05(file select)   +0.538
@@ -1735,31 +1650,23 @@ verified SAME screen  ours(name screen) vs nm_5(name screen)      +0.372  (nm_5 
 KNOWN DIFFERENT       ours(attract loop) vs sf_5_05(file select)  +0.533
 ```
 
-A same-screen pair at 0.538 and a different-scene pair at 0.533 means **no threshold separates them**.
-The 32x32 global luminance fingerprint is dominated by the shared parchment board and the letterbox
+A same-screen pair at 0.538 and a different-scene pair at 0.533 means **no threshold separates them**:
+the 32x32 global luminance fingerprint is dominated by the shared parchment board and the letterbox
 edges, so every 2D menu in this game fingerprints alike. Gradient, high-pass, row-profile and
-bright-fraction fingerprints were each tried and each ranked a *title screen* above the true file
-select; none was shipped. Instead the tool keeps its strict bar and gains an explicit escape hatch:
-
-```sh
-tools/compare_port_frames.py ours.png theirs.png \
-  --assert-same-screen "Choose a Quest Log board, slots 1/2/3 all New Quest Log"
-```
-
-The reason is required, echoed into the output and into `--json` as `asserted_same_screen`, and the
-result is labelled `scene identity asserted` — the pixels are computed, the identity is the operator's
-claim. A refusal without the flag is unchanged (exit 1), so the guard still catches the accident it was
-built for.
+bright-fraction fingerprints were each tried, and each ranked a *title screen* above the true file
+select; none shipped. The tool keeps its strict bar and gains a required escape hatch instead:
+`--assert-same-screen "<reason>"`, echoed into the output and `--json` as `asserted_same_screen`, with the
+result labelled `scene identity asserted` — the pixels are computed, the identity is the operator's claim.
+A refusal without the flag is unchanged (exit 1), so the guard still catches the accident it was built for.
 
 **What this does and does not establish.**
 
-- **Established:** both ports render this screen, and their menu layouts agree to about one pixel.
-  That is the geometry half of §7.12's open question, and it needed no renderer change.
-- **NOT established:** which port renders *better*. The pair differs in the animated highlight and in
-  the button glyphs, which is by design, so there is no like-for-like pixel claim to make here. The
-  §7.4b fixes (min-filter table, light normalisation) still have no pixel evidence attached.
-- **Still missing:** DuskOnVita's frames. It publishes no VPK, so the three-way comparison remains two
-  ports until it is built from source.
+- **Established:** both ports render this screen and their menu layouts agree to about one pixel — the
+  geometry half of §7.12's open question, and it needed no renderer change.
+- **NOT established:** which port renders *better*. The pair differs in the animated highlight and the
+  button glyphs by design, so there is no like-for-like pixel claim here. The §7.4b fixes (min-filter
+  table, light normalisation) still have no pixel evidence attached.
+- **Still missing:** DuskOnVita's frames — it publishes no VPK, so the comparison stays two ports.
 
 ### 7.13 vitaGL vs GXM vs hybrid: what the numbers actually say (2026-11-12)
 
@@ -1843,28 +1750,20 @@ Two different things get called "hybrid", and only one is interesting:
 
 #### What this predicts for `tp-vita`, labelled as a prediction
 
-This port is **vitaGL only, single-threaded, no GX worker, no frame overlap, no resident geometry, no
-static display lists**, and it does not request a clock change. The closest measured point is
-**v61: 6.34 FPS in Link's house and 7.39 outside at 333 MHz on one core with every draw**. That is the
-band to expect from the current build on hardware — not the 12–28 FPS the other port reports, because
-none of the levers that got it there exist here.
-
-**What is NOT claimed:** no hardware run of this port has ever happened, so all of the above is
-transfer from a different codebase. The 151.94 ms/frame figure in §7.6 is a Vita3K number and says
-nothing about a Cortex-A9.
+The closest measured point is **v61: 6.34 FPS in Link's house, 7.39 outside, at 333 MHz on one core with
+every draw** — the band to expect from the current build on hardware, not the 12–28 FPS the other port
+reports, because none of the levers that got it there exist here. This port does request 444 MHz
+(`vita/src/main.cpp:68-71`), so that anchor **understates** our headroom. **What is NOT claimed:** no
+hardware run of this port has ever happened, so all of the above is transfer from a different codebase.
+The 151.94 ms/frame figure in §7.6 is a Vita3K number and says nothing about a Cortex-A9. §7.14 carries
+the lever-by-lever version of this argument.
 
 #### 7.13.1 What "G2" means, and a contradiction in their own docs (2026-11-12)
 
-**"G2" is not a switch.** It is the **third build stage of the GXM backend**, and their
-`docs/ARCHITECTURE.md` names the three stages explicitly:
-
-| stage | what it added |
-|---|---|
-| **G0** | the backend table and the per-frame draw digest — the interface, no drawing |
-| **G1** | the backend itself on SceGxm: display buffers, CDRAM texture pool, uncached vertex ring, shader patcher, GXP cache, state |
-| **G2** | the three optimisation switches below |
-
-They are independent, GXM-only, and **all default `off`** in the options table
+**"G2" is not a switch.** It is the **third build stage of the GXM backend** (`docs/ARCHITECTURE.md`):
+**G0** the backend table and per-frame draw digest; **G1** the SceGxm backend itself (display buffers,
+CDRAM texture pool, uncached vertex ring, shader patcher, GXP cache, state); **G2** the three
+optimisation switches below, all GXM-only and **all default `off`** in the options table
 (`docs/PERFORMANCE.md:107-109`):
 
 | switch | values | default | what it does |
@@ -1875,46 +1774,37 @@ They are independent, GXM-only, and **all default `off`** in the options table
 
 **They are not GXM-specific in spirit, only in implementation.** Each removes a copy, a conversion or an
 index list — the same three things a vitaGL port could also stop doing. That is the transferable idea;
-the flags themselves are not portable.
+the flags are not portable.
 
-**The contradiction, and how it resolves.** The README's A/B table says "GXM + G2" and its caption says
-g2c is "the native renderer with resident geometry, packed vertex formats and native primitives", while
-the options table gives all three a default of `off`. Both are true in different modes, and
-`platform/vita/main_vita.cpp` says which:
-
-- the **play profile** (`PlayProfile[]`, line 89) contains `--vita-gpu=gxm --vita-gxm-resident=on
-  --vita-gxm-compact=colors --vita-gxm-primitives=on`. A launch that selects **no** renderer option gets
-  this implicitly (`implicitProfile`), so on a normal launch all three are **on**.
-- selecting **any** renderer option own-chooses them, and then each falls back to its table default,
-  **off**. `--vita-profile=off` turns every path off.
+**The contradiction, and how it resolves.** The README says "GXM + G2" while the options table defaults
+all three to `off`. Both are true in different modes, and `platform/vita/main_vita.cpp` says which: the
+**play profile** (`PlayProfile[]`, line 89) carries `--vita-gpu=gxm --vita-gxm-resident=on
+--vita-gxm-compact=colors --vita-gxm-primitives=on`, and a launch selecting **no** renderer option gets
+it implicitly (`implicitProfile`), so a normal launch has all three **on**. Selecting **any** renderer
+option makes them fall back to their table defaults, **off**; `--vita-profile=off` turns every path off.
 
 So "G2 off" is the *explicit-option* state, not the shipped default. The `g2c-gxm` benchmark rows carry
-the bare note `--vita-gpu=gxm`; whether the profile added G2 on top depends on whether that run counted
-as `implicitProfile` or `explicitRenderer`, which the CSV row does not record. **That is a gap in their
-record, not a conclusion here: the +18.7 % / +19.9 % figures may or may not include G2.**
+the bare note `--vita-gpu=gxm`, and whether the profile added G2 depends on whether that run counted as
+`implicitProfile` or `explicitRenderer` — which the CSV does not record. **A gap in their record, not a
+conclusion here: the +18.7 % / +19.9 % figures may or may not include G2.**
 
-**Where the backend's own share IS separable, and it is small.** Their play profile carries two later
-GXM additions with console numbers attached (`main_vita.cpp:126-128`): the pipeline memo, which took
-the worker's pipeline step from 10.7 to 5.1 ms in Ordon centre and 13.6 to 3.7 ms in Hyrule Field, and
-direct default-uniform writes, which took the **backend step from 24.0 to 23.1 ms — about 1 ms/frame**.
-A ~1 ms change on a 24 ms backend step is the resolution a pure backend optimisation actually has, which
-is consistent with §7.13's ceiling argument: backend draws are 10.9 ms of a 37.9 ms GX worker.
+**Where the backend's own share IS separable, and it is small.** Two later GXM additions carry console
+numbers (`main_vita.cpp:126-128`): the pipeline memo took the worker's pipeline step from 10.7→5.1 ms in
+Ordon centre and 13.6→3.7 ms in Hyrule Field, and direct default-uniform writes took the **backend step
+from 24.0→23.1 ms — about 1 ms/frame**. That ~1 ms on a 24 ms step is the resolution a pure backend
+optimisation actually has, consistent with §7.13's ceiling: backend draws are 10.9 ms of a 37.9 ms GX
+worker.
 
 ### 7.14 Which backend would theoretically be faster, and how much (2026-11-12)
 
-**This is a model, not a measurement. Every number is tagged with whether it was measured, and every
-assumption is named so it can be attacked.** The question "which backend is faster" has a short answer
-and a useful answer, and they differ.
+**A model, not a measurement.** Every number is tagged as measured or assumed so it can be attacked.
 
-#### Short answer
-
-**Direct GXM, by roughly 1.1x** — and only on scenes whose bottleneck is the GX worker. It is *slower*
-where the GPU binds first. Switching backend is the **third-largest** lever available, behind threading
+**Short answer: direct GXM, by roughly 1.1x** — only on scenes whose bottleneck is the GX worker, and
+*slower* where the GPU binds first. Switching backend is the **third-largest** lever, behind threading
 and the vertex path.
 
-#### Why: the frame does not spend its time in the backend
-
-Measured, v61 on the console, one core, 333 MHz, 154 ms/frame (`DuskOnVita docs/PERFORMANCE.md`):
+**Why: the frame does not spend its time in the backend.** Measured, v61 on the console, one core,
+333 MHz, 154 ms/frame (`DuskOnVita docs/PERFORMANCE.md`):
 
 | component | ms | share | what a backend swap can do |
 |---|---:|---:|---|
@@ -1924,71 +1814,48 @@ Measured, v61 on the console, one core, 333 MHz, 154 ms/frame (`DuskOnVita docs/
 | J3D draw building | 20 | 13.0 % | **nothing** |
 | game simulation | 12 | 7.8 % | **nothing** |
 
-The GL layer is 25 ms of 154 ms. Even making it **free** caps the win at 1.19x. Removing 60 % of it —
-which is roughly what shedding GL's state machine, error checks and redundant bind validation gets you,
-**and that 60 % is an estimate, not a measurement** — gives:
+Even making the GL layer **free** caps the win at 1.19x. The Amdahl rows below use measured components
+with **assumed** removal fractions — only the 154 ms total and the split are measured:
 
 | change | frame | speedup |
 |---|---:|---:|
-| backend only (vitaGL calls −60 %) | 139.0 ms | **1.11x** |
-| + resident/packed geometry (vertex prep −75 %) | 89.5 ms | **1.72x** |
+| backend only (vitaGL calls −60 %, an **estimate**) | 139.0 ms | **1.11x** |
+| + resident/packed geometry (vertex prep −75 %, assumed) | 89.5 ms | **1.72x** |
 | + GX thread and frame overlap (2 cores busy) | ~54 ms critical path | **~2.9x** |
 
-Those rows are **Amdahl arithmetic on measured components with assumed removal fractions**; only the
-154 ms total and the per-component split are measured. The ordering, however, does not depend on the
-assumptions: a layer that is 16 % of the frame cannot beat changes that address 43 % and 20 % of it.
+The ordering does not depend on the assumptions: a layer that is 16 % of the frame cannot beat changes
+that address 43 % and 20 % of it. **A second, independent ceiling agrees** — in g2c's GX worker (37.9 ms
+total) backend draws are 10.9 ms (28.8 %), so a completely free backend buys at most **~22 % of frame
+time** if the worker is ~76 % of the frame.
 
-**A second, independent ceiling agrees.** In g2c's GX worker, 37.9 ms total, **backend draws are 10.9 ms
-(28.8 %)**. If the worker is ~76 % of that frame, a completely free backend buys at most **~22 % of frame
-time** — and that is the optimistic bound for a backend that does nothing.
+**Where direct GXM wins, and where it loses.** The measured A/B is the table in §7.13: −3.9 % on a
+GPU-bound scene, +18.7 % and +19.9 % on worker-bound ones. "Which is faster" is therefore
+**scene-dependent by sign**, not merely by magnitude — the gain appears only when the CPU side is the
+limit, and GXM's fixed submission cost is not free, so on a GPU-bound scene the cheaper-looking path
+comes out slightly behind.
 
-#### Where direct GXM wins, and where it loses
+**Which backend for `tp-vita`.** This port is **vitaGL only, single-threaded, no GX worker, no frame
+overlap, no resident geometry, no static display lists**, and it **does** request 444 MHz —
+`vita/src/main.cpp:68-71` sets ARM 444, bus 222, GPU 222, xbar 166. (An earlier revision said "requests
+no clock change"; that was wrong, and the v61 comparison below is taken at stock 333 MHz, so it
+**understates** our headroom rather than overstating it. The ranked lever order is unaffected — §7.20.)
 
-Measured, g2c, 444 MHz, same build, same scenes:
+1. **Its GL layer is a smaller share than 16 %.** The 25 ms is the *whole* GL call cost inside an already
+   optimised pipeline; our replay path also does decode, state caching (`sCache`), fog-range LUT rebuilds
+   (§7.3b) and shadow-list work in the same thread. Moving to GXM deletes none of that.
+2. **The lever that dominates here is not the backend.** Our nearest anchor is v61 — 6.34 FPS in the
+   house, 7.39 outside — *exactly* the single-core, stock-clock, every-draw configuration this port ships
+   in. The gap to the other port's 12–28 FPS is almost entirely **threading, resident/static geometry and
+   the vertex path**, i.e. the 1.7x and 2.9x rows.
 
-| Scene | vitaGL | GXM + G2 | sign |
-|---|---:|---:|---|
-| Link's house (GPU-bound at 100 %) | 20.24 | 19.45 | **−3.9 %** |
-| Ordon, outside (worker/main-thread-bound) | 22.94 | 27.23 | **+18.7 %** |
-| Faron fight | 11.71 | 14.04 | **+19.9 %** |
-
-So "which is faster" is **scene-dependent by sign**, not merely by magnitude. Two mechanisms explain it:
-the gain appears only when the CPU side is the limit, and GXM's fixed submission cost is not free, so on
-a GPU-bound scene the cheaper-looking path can come out slightly behind.
-
-#### Which backend for `tp-vita` specifically
-
-`tp-vita` is **vitaGL only, single-threaded, no GX worker, no frame overlap, no resident geometry, no
-static display lists**, and **does** request 444 MHz (see the correction below). Two consequences:
-
-**CORRECTION (2026-11-16):** the sentence above said this port "requests no clock change". It does:
-`vita/src/main.cpp:68-71` sets ARM 444 MHz, bus 222, GPU 222, xbar 166. The comparison to v61 -- which
-was taken at stock 333 MHz -- therefore **understates** our headroom rather than overstating it, and the
-444-vs-333 factor is already banked. The ranked lever order is unaffected; see §7.20.
-
-1. **Its GL layer is a smaller share than 16 %.** The 25 ms in that table is the *whole* GL call cost
-   inside a pipeline that had already been optimised; our replay path also does decode, state caching
-   (`sCache`), fog-range LUT rebuilds (§7.3b) and shadow-list work in the same thread. Moving to GXM
-   would not delete any of that.
-2. **The lever that dominates here is not the backend at all.** Our nearest measured anchor is v61 —
-   6.34 FPS in the house, 7.39 outside — which is *exactly* the single-core, stock-clock,
-   every-draw configuration this port ships in. The gap between that and the other port's 12–28 FPS is
-   almost entirely **threading, resident/static geometry and the vertex path**, i.e. the 1.7x and 2.9x
-   rows, not the 1.11x row.
-
-**Theoretical answer, stated plainly:** a direct-GXM rewrite of this port's renderer is worth roughly
-**1.1x**, and it is the most expensive of the three levers because it means reimplementing the GL
-surface the replay path uses. A GX worker plus frame overlap is worth **more** and touches far less code.
-Resident/static geometry is worth more again. If the goal is frames, **the backend is the wrong thing to
+**Stated plainly:** a direct-GXM rewrite is worth ~**1.1x** and is the most expensive of the three levers,
+because it means reimplementing the GL surface the replay path uses. A GX worker plus frame overlap is
+worth **more** and touches far less code. If the goal is frames, **the backend is the wrong thing to
 rewrite first**.
 
-#### What would falsify this
-
-- A run showing our per-frame `vitaGL` time is a much larger share than 16 %. Instrument the replay's GL
-  calls the way §7.9 instrumented decode, and the model is checkable without a console.
-- A GXM-without-G2 benchmark, which does not exist in their repository (§7.13.1) — that is the number
-  that would separate the backend from the G2 switches.
-- Any hardware run at all, which this port has never had.
+**What would falsify this:** a run showing our per-frame `vitaGL` time is a much larger share than 16 %
+(instrument the replay's GL calls the way §7.9 instrumented decode — checkable without a console); a
+GXM-without-G2 benchmark, which does not exist (§7.13.1); or any hardware run at all.
 
 ### 7.15 The x20 Link heap was live on Vita, and is now x3 — 10.79 MiB back (2026-11-16)
 
@@ -2424,12 +2291,10 @@ EFB-copy/off-screen passes. **Nobody has measured that, including them.** Do not
 
 ### What is genuinely free, and worth doing before any of the above
 
-- **A CPU profile of our own route.** Every percentage above is borrowed from another port. We have no
-  profile at all: nothing in `tests/vita3k/` captures one. Vita3K writes one when its profiler is enabled,
-  and `scripts/vita_hot_order.py` can already read the format. **Without our own split we cannot tell
-  which of Rank 1 or Rank 2 to do first** -- we are borrowing a Wii/PS2 port's shape and guessing it fits.
-- **Fix §7.14's stale claim.** It says this port "requests no clock change"; `main.cpp:68` does. The
-  numbers are still valid, but the sentence is wrong and would mislead someone looking for a quick win.
+- **A CPU profile of our own route.** Every percentage in §7.20 is borrowed from another port. **Both**
+  items that were free and listed here are now done: the port has its own phase split (§7.21, refined by
+  §7.25), and §7.14's stale "requests no clock change" sentence is corrected (`main.cpp:68` sets 444 MHz).
+  What remains free is the one thing a profile cannot supply — a **console** frame time.
 
 ### The uncomfortable half of the answer
 
@@ -2487,28 +2352,32 @@ overhead hiding the truth -- it is genuinely small, and the four draw phases rea
    attacks the single largest individual phase. Our §7.9 vertex cache already halves it at 74 % hit rate,
    so the next step is keeping decoded meshes, not building a new decoder.
 3. **`pass` at 38.4 % is the largest phase and was not in the plan at all.** It is binds and the fog-range
-   LUT -- per-draw GL state work. That is a *third* lever the ranking in §7.20 missed: reduce state
-   changes per draw. It is also exactly what the §7.3c batching survey was measuring from a different
-   angle, so its evidence is reusable even though batching itself is closed.
+   LUT — per-draw GL state work — a *third* lever §7.20's ranking missed: reduce state changes per draw.
+   It is also what the §7.3c batching survey measured from another angle, so its evidence is reusable even
+   though batching itself is closed. **Caveat added after §7.25: this is gameplay with the worker off.**
+   On the synthetic 393-draw benchmark `pass` is 2.1 % and `submit` is 85 %. The two are different scenes,
+   and the 56–72 % §7.22 attributed to `pass` was the decode hand-off booked into an enclosing span.
 
 #### The mistake that produced a wrong answer first, recorded deliberately
 
-An earlier pass of this measurement reported **decode 3.3 %, other 59.7 %** and I wrote a section saying
-Rank 2 was dead. That was measured on the **wrong scene**: the modal frame in that run had 240 draws but
-was a *menu/loading* composition, and the run's gameplay windows were classified as "huge" outliers and
-excluded. Re-cutting the same log by frame range instead of by a draw-count heuristic gave the table above.
-
-**The lesson is the one §7.8 already records, committed again**: a population chosen by one threshold
-(`draws == mode`) is not the population you meant (playable gameplay). When a phase split decides a work
-order, state *which frames* were averaged and check the split against the frame count and draw count
-before drawing a conclusion from it.
+An earlier pass reported **decode 3.3 %, other 59.7 %**, on which a whole section declared Rank 2 dead. It
+was the **wrong scene**: the modal frame had 240 draws but was a *menu/loading* composition, and the
+run's gameplay windows were classified as "huge" outliers and excluded. Re-cutting the same log by frame
+*range* instead of a draw-count heuristic gave the table above. This is §7.8's lesson committed again: a
+population chosen by one threshold (`draws == mode`) is not the population you meant (playable gameplay).
+When a phase split decides a work order, state **which frames** were averaged and check the split against
+the frame and draw counts first.
 
 **What is still not claimed:** these are emulator ratios, not console ratios. Vita3K runs guest ARM far
 faster than a Cortex-A9 on some paths, and the 91.6 ms/frame mean here is emulator-paced. The *shares* are
 the useful output and they are the best evidence available without hardware. §11's conclusion is unchanged:
 a console profile is what converts this into a work order.
 
-### 7.22 Rank 1, built and measured: the overlap works, and it is still 19 % slower (2026-11-17)
+### 7.22 Rank 1, built and measured: the overlap worked, but per-draw hand-off made it 19 % slower (2026-11-17 — superseded by §7.25)
+
+**Read §7.25 before acting on this section.** The headline number below (19 % *slower*) was caused by
+the per-draw hand-off, not by the idea; with a coarse release the same worker is a **3 % WIN**. This
+section is kept because the design reasons and the correctness proof still hold.
 
 §7.20 ranked a GX worker + frame overlap first and §7.21 measured 89.9 % of a gameplay frame as
 moveable (decode 36.9 %, submit 14.7 %, pass 38.4 %). This is what happened when it was built.
@@ -2576,52 +2445,40 @@ the target -- see the next section.
 
 #### What this does and does not settle
 
-What it settles: decode CAN be moved off the GL thread with byte-identical results, and the pipeline
-reaches a 0.18 % stall rate. That part of Rank 1 is done and reusable.
+**Settled:** decode CAN be moved off the GL thread with byte-identical results, at a 0.18 % stall rate.
+That part of Rank 1 is done and reusable.
 
-Scope, stated plainly because Rank 1 was asked for as "multi-thread, frame overlap": what was built is
-**intra-frame** pipelining -- the worker decodes this frame's draws while the GL thread issues this
-frame's GL calls. The **cross-frame** version (start decoding frame N+1 while frame N is still issuing)
-was NOT built: it needs the recorder's four buffers double-buffered, so `begin_frame` can start
-appending while the previous frame's bytes are still being read. That is the version that would hide a
-whole phase rather than pipeline within one, and it is listed next as the version worth trying.
+**Scope, stated plainly** because Rank 1 was asked for as "multi-thread, frame overlap": what was built
+is **intra-frame** pipelining — the worker decodes this frame's draws while the GL thread issues this
+frame's GL calls. The **cross-frame** version (decode frame N+1 while frame N still issues) was NOT
+built: it needs the recorder's four buffers double-buffered so `begin_frame` can append while the
+previous frame's bytes are still being read. That is the version that hides a whole phase.
 
-What it does not settle: **the Vita number.** The benchmark is llvmpipe on a 16-core host with a
-rasteriser that already uses many threads. A Vita is a quad-core Cortex-A9 of which a game may use
-three (the fourth is reserved for system tasks; CapUnlocker can release it), so a second thread is
-available but is a scarce, contended resource rather than one of fifteen idle ones -- and on the
-console figure this whole exercise exists for, decode is 37-43 % of the frame (§7.21, DuskOnVita's own
-profile) rather than the 11 % measured here. Twelve percent of a frame is not worth a hand-off; forty
-percent plausibly is. The one experiment that decides it is a hardware run with
-`TPV_ENABLE_DECODE_WORKER` set and unset, and that is not available here.
+**Not settled: the Vita number.** The benchmark is llvmpipe on 16 host cores; a Vita is a quad-core
+Cortex-A9 of which a game may use three, so a second thread is a scarce contended resource, not one of
+fifteen idle ones. And decode is 37–43 % of a *console* frame (§7.21, DuskOnVita's profile) rather than
+the 11 % measured here — 12 % of a frame is not worth a hand-off, 40 % plausibly is.
 
-What would make it win on the proxy too, in order of expected value:
-1. **Overlap at a coarser granularity.** Hand off whole *draw ranges* (8-32 draws) instead of single
-   draws: the same overlap with 1/32 the notifications. At 0.18 % stalls there is no benefit to
-   per-draw granularity, so this is pure overhead removal.
-2. **Overlap the frame, not the draw.** Start decoding frame N+1 while frame N is still issuing GL
-   calls. That needs the recorder's buffers to be double-buffered, which is a larger change but is the
-   version that actually hides a whole phase rather than pipelining within one.
+Two ways it would win on the proxy too, and both were since shown to matter less than attribution:
+coarser hand-off (whole draw *ranges*, 8–32 draws, 1/32 the notifications — at 0.18 % stalls per-draw
+granularity buys nothing) and cross-frame overlap. **§7.25 ran the first and got a 3 % win**; the 19 %
+loss above was the per-draw hand-off, not the idea.
 
-#### The lever this leaves standing, and it is bigger
+#### The lever this section thought it had found, and why it was wrong
 
-`pass` was 38.4 % of a gameplay frame in §7.21 and read **56-72 %** on every window of this benchmark
-(per-draw uniform upload, texture binds, program binds, fog-range LUT). It looked like the largest
-single phase, never attacked, and unlike decode unable to move to another thread because it is GL calls.
-
-**That 56-72 % was wrong, and §7.25 found out why.** With the worker off, `pass` on this same benchmark
-is **2.1 %**, not 56-72 %: the larger figure was the decode hand-off being booked there, because `pass`
-is measured as an enclosing span. The corrected attribution leaves `pass` at 2 % and `submit` at 85 %,
-so the lever is `submit` -- see §11's re-ranking and §7.25.
+`pass` read **56–72 %** on every window of this benchmark, so it looked like the largest single phase —
+and, being GL calls, one that cannot move to another thread. **That figure was an artefact.** With the
+worker off, `pass` on the same benchmark is **2.1 %**: the larger number was the decode hand-off being
+booked there, because `pass` is measured as an enclosing span (§7.25, and trap 33 in the skill's
+measurement reference). Corrected attribution leaves `pass` at 2 % and `submit` at 85 %.
 
 #### Instrumentation bug this session found (and fixed)
 
-`other split of frame: setup … | clear … | tail …` printed **0.0 % for all three columns**. The
-accumulators are reset at the top of `replay()` and the report runs later in the same call, so it
-always read zeros. §7.21's numbers were correct (they were taken before the per-frame reset was
-added); the reporting order broke afterwards. They are now snapshotted at end of frame
-(`sLastSetupMs` / `sLastClearMs` / `sLastTailMs`). Three columns of confident nothing, for the
-duration of a session, is what trap 32 is about.
+`other split of frame: setup … | clear … | tail …` printed **0.0 % for all three columns**: the
+accumulators are reset at the top of `replay()` and the report runs later in the same call. §7.21's
+numbers were correct (taken before the per-frame reset was added); the reporting order broke afterwards.
+Now snapshotted at end of frame (`sLastSetupMs` / `sLastClearMs` / `sLastTailMs`). Three columns of
+confident nothing for a whole session is trap 32.
 
 #### Files
 
@@ -2778,31 +2635,22 @@ frequency instead. Untested for the same reason.
 
 #### Two limits, stated rather than glossed
 
-- **This is a registry, not a kernel walk.** The VitaSDK does not define `SceKernelThreadInfo` at all
-  (declared in `thread.h`, never defined) and has no thread-enumeration function, and kubridge exposes no
-  affinity or thread-list call either — its exports are `kuKernelAllocMemBlock`, `FlushCaches`,
-  `CpuUnrestrictedMemcpy`, `MemProtect`, `MemReserve/Commit/Decommit`, the exception handlers, and
-  `kuPowerGet/SetSysClockFrequency`. So threads the port did not create (SDL's, vitaGL's internals) are
-  invisible to the census. The report says "NOTHING REGISTERED ... the census cannot see threads the port
-  did not create" rather than pretending otherwise, and adding a thread to the list means registering it.
+- **This is a registry, not a kernel walk.** VitaSDK does not define `SceKernelThreadInfo` (declared in
+  `thread.h`, never defined) and has no thread-enumeration function; kubridge exposes no affinity or
+  thread-list call either (its exports are `kuKernelAllocMemBlock`, `FlushCaches`, `CpuUnrestrictedMemcpy`,
+  `MemProtect`, `MemReserve/Commit/Decommit`, the exception handlers, `kuPowerGet/SetSysClockFrequency`).
+  Threads the port did not create (SDL's, vitaGL's internals) are therefore **invisible** to the census.
+  The report says so explicitly rather than pretending otherwise.
 - **Nothing is pinned by default.** The layout (main→core 0, decode→core 1, stream→core 2) is a
-  HYPOTHESIS. §7.23's point was that placement is only worth having if it is measured, and on a
-  Cortex-A9 concentrating work can hurt as easily as help. `pin_threads` (or `TPV_PIN_THREADS` on host)
-  toggles it, so one console session can A/B it — the KOTOR II pattern.
+  HYPOTHESIS: on a Cortex-A9, concentrating work can hurt as easily as help. `pin_threads` (or
+  `TPV_PIN_THREADS` on host) toggles it — a file on the console as of §7.27 — so one session can A/B it.
 
 #### What is still not known
 
-Whether any of it is faster. This proves the mechanism; it does not measure a gain. The three
-experiments that would, in order of cost:
-
-1. **Hardware, pinning on vs off**, same route, frame times compared at the same scene — the A/B toggle
-   exists precisely for this.
-2. **Hardware with CapUnlocker installed**, to turn `refused` into a real 4th core and see whether a
-   third worker helps at all.
-3. **The decode worker re-measured with pinning on**, because §7.22's 19 % loss was measured on a host
-   where the worker competed with a 16-thread rasteriser — the one condition a Vita does not have.
-
-Until then: the census is free and runs always; pinning and the 4th core are off.
+Whether any of it is faster. This proves the mechanism, not a gain. Three experiments would settle it, in
+order of cost: hardware with pinning on vs off at the same scene; hardware with CapUnlocker installed, to
+turn `refused` into a real 4th core; and the decode worker re-measured with pinning on. Until then the
+census runs always, and pinning and the 4th core are off.
 
 ### 7.25 `pass` attributed, and the decode worker is a 3 % WIN once the hand-off stops per-draw (2026-11-17)
 
@@ -3276,11 +3124,17 @@ different point in the frame from where it was written.
     edit.** The SCE-data gap depends on text size **modulo 64 KiB**, so adding ~7 KiB of code (§7.28)
     can land the segment boundary badly and produce `gap 7140 < 8192 bytes; vita-elf-create will fail
     to place its SCE data` on a change that has nothing to do with linking. `tools/check_text_gap.py`
-    prints the gap and names the padding variable; raising `TPV_TEXT_PAD_KIB` (32 -> 16 here, which
+    prints the gap and names the padding variable; changing `TPV_TEXT_PAD_KIB` (32 -> 16 here, which
     moved the boundary the other way) restored a 23,524-byte gap. When a link fails this way, change
     the padding, not the code. And check the VPK's timestamp afterwards -- a build that failed can
     still leave the previous VPK in place, so a stale artifact passes a "did it build" eyeball test.
-
+45. **SELF flag `0x100c0` is not an encryption marker, and an eboot with no `strings` is compressed, not
+    opaque.** A `SELF` is a header plus zlib streams; finding none of your symbols means you are reading
+    compressed bytes, not that the image is protected. Two more facts that cost time in
+    `tools/unpack_self.py`: the program headers are **not** `Elf32_Phdr` even though `e_phentsize` is 32
+    (they are SCE segment descriptors, so walking them yields plausible nonsense such as
+    `type=0x0159a284`), and the working method is to scan for zlib stream headers and inflate each in
+    place. Validate the unpacker on **your own** build first, against tokens you know are present.
 ## 9. Files the port owns (`tp-vita/`)
 
 ```
@@ -3342,36 +3196,34 @@ wants a rendering win, the honest position is that none is left that this tool c
 shader-cache write, performance and audio is unmeasurable here; (2) driving **both** ports to the same scene
 and frame, the only way to tell whether the §7.4b fixes improved the picture.
 
-**Re-ranked after §7.22 was actually built and measured (2026-11-17).** The old §7.20 order was
-decode worker first. That was built, proven byte-exact, and measured 19 % SLOWER on the only proxy
-available -- so it ships off by default and the next lever is not the one the ranking predicted:
+**Re-ranked twice: once when the decode worker was measured (2026-11-17), once when it was found to be
+a WIN at coarse granularity (§7.25).** The order below is the current one.
 
-1. **`submit` -- the draw calls themselves, now that the ranking's premise has been corrected.**
-   §7.25 split `pass` and found it is **2.1 %** of this benchmark's frame, not 56-72 %: the larger
-   figure was the decode hand-off booked into it, and the per-draw GL-state work is already almost
-   entirely suppressed by `GlCache` and `upload_uniforms`' `sameBlob` test (118 texture binds reached
-   `gl*` over 47,200 passes). `submit` is **85 %** of the frame and is the only phase left that is both
-   large and unattacked. It is GL, so it cannot move to another thread; it needs fewer or cheaper draw
-   calls, and §7.3c's 1.17x batching arithmetic applies again here (though NOT via merging, which is
-   closed). Before choosing, split `submit` the way `pass` was split: how much is `set_vertex_pointers`,
-   how much `glDrawElements`/`glDrawArrays`, and how many `glDrawArrays` calls the `MaxArrayVertices`
-   split makes per draw.
-2. **Thread placement -- the free half of "use all four cores" (§7.23).** Nothing in this port sets a
-   CPU affinity mask: no `sceKernelChangeThreadCpuAffinityMask`, no `cpuAffinityMask`, no
-   `pthread_attr_setaffinity_np`. Three user cores are available and are used by accident. KOTOR II and
-   Halo CE both treat pinning as a win in itself, and Halo CE's conclusion ("the render thread on core
-   0 was the limit") is a diagnosis this port cannot currently make. Cost: no plugin, no new thread --
-   a thread census plus two pins. Do this before asking for a 4th core.
-3. **Hardware**, unchanged and now *unblocked*: §7.27 fixed the fact that the decode worker could not
-   be switched on from a console at all, so the A/B is finally runnable. Run three arms -- worker off,
-   worker on (`ux0:data/tpvita/decode_worker`), and the vertex cache on (§7.9) -- on the same scene.
-   The worker is the second lever whose sign a proxy got wrong (the vertex cache was the first), and
-   nothing here can answer it. CapUnlocker (the 4th core) is a distribution cost -- a user-installed
-   kernel plugin -- for one core, and it is last, not first.
-4. **Overlap at a coarser granularity** (draw ranges of 8-32, or the whole next frame), which is the
-   version of Rank 1 that does not pay 393 hand-offs per frame. Do the ceiling arithmetic in §7.23
-   first: at 40 % decode it is worth ~61 ms a frame, at 11 % it is ~17 ms against a hand-off that
-   already lost 19 % on a faster CPU.
+1. **Hardware — a console profile, now that it is runnable and instrumented honestly.** This is first
+   because everything downstream is a guess without it, and because it is the only way to settle the two
+   levers a proxy has already got wrong in **both** directions: the vertex cache (§7.9) and the decode
+   worker (19 % loss per-draw in §7.22, **3 % win** once the release went coarse in §7.25). §7.27 made
+   the worker reachable from a console (`ux0:data/tpvita/decode_worker`) and §7.28 produced a build whose
+   timers do not measure themselves (`TPLG30001`). Arms to run on one scene: worker off / worker on /
+   vertex cache on. Take **ms/frame from the timing-clean VPK** and the phase split from the instrumented
+   one — never compare a number across the two. CapUnlocker (the 4th core) is a distribution cost, a
+   user-installed kernel plugin, for one core: last, not first.
+2. **`submit` -- the draw calls themselves, once the ranking's premise was corrected.** §7.25 split
+   `pass` and found it is **2.1 %** of the benchmark frame, not 56-72 %: the larger figure was the
+   decode hand-off booked into an enclosing span, and per-draw GL-state work is already almost entirely
+   suppressed by `GlCache` and `upload_uniforms`' `sameBlob` test (118 texture binds reached `gl*` over
+   47,200 passes). `submit` is **85 %** and is the only phase left that is both large and unattacked. It
+   is GL, so it cannot move to another thread; it needs fewer or cheaper draw calls, and §7.3c's 1.17x
+   batching arithmetic applies again (but NOT via merging, which is closed). Split `submit` the way
+   `pass` was split before choosing: how much is `set_vertex_pointers`, how much
+   `glDrawElements`/`glDrawArrays`, and how many `glDrawArrays` calls the `MaxArrayVertices` split makes.
+3. **Thread placement -- the free half of "use all four cores" (§7.23).** Nothing in this port sets a
+   CPU affinity mask; three user cores are available and used by accident. `pin_threads` now exists
+   (§7.24) so a console session can A/B it. KOTOR II and Halo CE both treat pinning as a win in itself.
+   Do this before asking for a 4th core.
+4. **Cross-frame overlap** (or draw ranges of 8–32, if §7.25's `kReleaseStride=16` is not coarse
+   enough) — the version of Rank 1 that hides a whole phase instead of pipelining within one. Do the
+   ceiling arithmetic in §7.23 first: at 40 % decode it is worth ~61 ms a frame; at 11 % it is ~17 ms.
 
 **But scope (2) correctly, because §7.16 changed it.** The third port now runs, and it renders **960 px wide**
 while ours renders **738**. So it is not a drop-in pixel reference: a same-scene pair differs first by that
@@ -3381,9 +3233,11 @@ reference — is the HUD where it should be, is the minimap drawn (§7.15 says t
 pixel oracle. Stating which of the two is being attempted is part of the job.
 
 **If a run dies:** §7.1's arithmetic is now sane (24 MiB more arena), so watch whether the `0xBF18265F` rate
-changes before doing anything else; the failure path already records `caller=%p`.
+changes before doing anything else; the failure path already records `caller=%p`, and now also carries the
+last window's phase split (§7.28).
 
 **The honest position as of this revision:** the port boots, reaches the main loop, renders correctly shaped
 and correctly coloured frames, and reaches gameplay in an emulator. A separate port does the same on real
-hardware at 12–28 FPS with working saves (§7.5), so feasibility is settled. Still unproven here: save reload,
-performance, audio, and all hardware behaviour.
+hardware at 12–28 FPS with working saves (§7.5), so feasibility is settled. Both console switches and both
+builds now exist (§7.27, §7.28), so the next session's job is to **run them on a Vita and report ms/frame** —
+not to add another lever. Still unproven here: save reload, performance, audio, and all hardware behaviour.
