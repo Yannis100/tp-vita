@@ -1842,11 +1842,9 @@ address 43 % and 20 % of it. **A second, independent ceiling agrees** (§7.13's 
 backend draws are 10.9 ms of a 37.9 ms worker = 28.8 %, so a completely free backend buys at most **~22 % of
 frame time** if the worker is ~76 % of the frame.
 
-**Which backend for `tp-vita`.** §7.13's A/B is the answer: −3.9 % on a GPU-bound scene, +18.7 % and
-+19.9 % on worker-bound ones, so "which is faster" is **scene-dependent by sign**. This port is **vitaGL
-only, single-threaded, no GX worker, no frame overlap, no resident geometry, no static display lists**, at
-ARM 444 / bus 222 / GPU 222 / xbar 166 (`vita/src/main.cpp:68-71`), where v61 was taken at stock 333 MHz —
-so that anchor **understates** our headroom. Two reasons it is not the first lever: our GL layer is a
+**Which backend for `tp-vita`.** §7.13's A/B decides it: −3.9 % on a GPU-bound scene, +18.7 % and +19.9 % on
+worker-bound ones, so "which is faster" is **scene-dependent by sign**, and §7.13's prediction section covers
+what that means for this port's build. Two further reasons it is not the first lever: our GL layer is a
 *smaller* share than 16 % (the 25 ms is the whole GL cost inside an already optimised pipeline, while our
 replay thread also does decode, state caching, fog-range LUT rebuilds and shadow-list work), and our nearest
 anchor — 6.34 FPS in the house, 7.39 outside — is *exactly* the single-core, stock-clock, every-draw
@@ -1854,9 +1852,8 @@ configuration this port ships in, so the gap to the other port's 12–28 FPS is 
 2.9x rows.
 
 **Stated plainly:** a direct-GXM rewrite is worth ~**1.1x** and is the most expensive of the three levers,
-because it means reimplementing the GL surface the replay path uses. A GX worker plus frame overlap is
-worth **more** and touches far less code. If the goal is frames, **the backend is the wrong thing to
-rewrite first**.
+because it means reimplementing the GL surface the replay path uses. A GX worker plus frame overlap is worth
+**more** and touches far less code. If the goal is frames, **the backend is the wrong thing to rewrite first**.
 
 **What would falsify this:** a run showing our per-frame `vitaGL` time is a much larger share than 16 %
 (instrument the replay's GL calls the way §7.9 instrumented decode — checkable without a console); a
@@ -1864,9 +1861,8 @@ GXM-without-G2 benchmark, which does not exist (§7.13.1); or any hardware run a
 
 #### Evidence — 7.15 The x20 Link heap was live on Vita, and is now x3 — 10.79 MiB back (2026-11-16)
 
-**Trigger:** DuskOnVita published **v0.9.0 on 2026-11-14, the first release with a VPK**. Its commit
-`1b6472c4` ("Crash fix: Link's own heaps are three times the original's size, not twenty", patch
-`dusklight/0077`) describes a failure mode that matches ours, and the check found it live here.
+**Trigger:** DuskOnVita's `1b6472c4` ("Crash fix: Link's own heaps are three times the original's size, not
+twenty", patch `dusklight/0077`) describes a failure mode that matches ours, and the check found it live here.
 
 ##### The defect was ours too, and the guard that should have stopped it was defeated
 
@@ -1879,20 +1875,19 @@ u32 size = ROUND(i_size, 16);
 #endif
 ```
 
-**This tree defines `TARGET_PC=1` for the Vita build as well**
-(`cmake/GameABIConfig.cmake:7`), so a guard that reads like "PC only" was **live on Vita**. Link's
-archive heap became `0xA2800 * 20 + 0xA0 = 0xCB20A0` = **12.70 MiB**, taken in one piece from the game
-heap every time Link is created — a stage change, or the restart after a fall.
+**This tree defines `TARGET_PC=1` for the Vita build as well** (`cmake/GameABIConfig.cmake:7`), so a guard
+that reads like "PC only" was **live on Vita**. Link's archive heap became `0xA2800 * 20 + 0xA0 = 0xCB20A0` =
+**12.70 MiB**, taken in one piece from the game heap every time Link is created — a stage change, or the
+restart after a fall.
 
-Our own `dvd_trace.txt` had this recorded all along:
+Our own `dvd_trace.txt` had it recorded all along, and nobody connected the number:
 
 ```
 JKRExpHeap: create: size=0xCB20A0 aligned=0xCB20A0 parent=gameHeap parentFree=0x14385B0
 ```
 
-Nobody connected `0xCB20A0` to `0xA2800 * 20`. The lesson is §8 trap 16's, one layer up: **a
-platform guard is only real if the macro is not also defined for your platform** — check the compile
-definitions, not the `#if`.
+The lesson is §8 trap 16's, one layer up: **a platform guard is only real if the macro is not also defined
+for your platform** — check the compile definitions, not the `#if`.
 
 ##### Fix, and the proof
 
@@ -1918,9 +1913,9 @@ unexplained. Do not write "the heap abort is fixed".
 
 ##### Their v0.9.0 console numbers, for the record
 
-PS Vita 1000, 13 Nov, default "Speed-ups: Original": Snowpeak Ruins 19 FPS, Kakariko 18–19, Ordon
-village 14 standing / 16 walking, Hyrule Field enemy areas 14.5, Palace of Twilight 14, Ordon widest
-view 10. With "Performance": Ordon village mostly 30, centre 22.6–24.4, Forest Temple 17.5–26.2.
+PS Vita 1000, 13 Nov, default "Speed-ups: Original": Snowpeak Ruins 19 FPS, Kakariko 18–19, Ordon village
+14 standing / 16 walking, Hyrule Field enemy areas 14.5, Palace of Twilight 14, Ordon widest view 10. With
+"Performance": Ordon village mostly 30, centre 22.6–24.4, Forest Temple 17.5–26.2.
 
 Also recorded by them and relevant here: **the minimap is not drawn in play**, and neither are Link's
 real-time shadow, water, bloom, depth of field or heat haze — the same class of gaps as §7.4b's list.
@@ -2135,14 +2130,12 @@ remaining option is function-granular: `-ffunction-sections` plus a CPU profile 
 
 #### Evidence — 7.19b Experiment 1 was run and it FAILED: moving libc first made the hot veneers worse (2026-11-16)
 
-**A failed experiment, kept so it is not repeated.** The A/B is real and the numbers are the point; do not
-re-derive it.
+**A failed experiment, kept so it is not repeated.** §7.19 predicted that moving the hot
+libc/libgcc/new-delete code to the front of `.text` would remove roughly 47 veneers **without any profile**.
+Tested on the real binary; it is **wrong** (trap 28).
 
-§7.19 predicted that moving the hot libc/libgcc/new-delete code to the front of `.text` would remove
-roughly 47 veneers **without any profile**. Tested on the real binary; it is **wrong** (trap 28).
-
-**Method, a controlled A/B.** The baseline ELF was saved, then relinked from the *identical* object files
-by replaying `build/CMakeFiles/tpv_vita.dir/link.txt` with one fragment inserted:
+**Method, a controlled A/B.** The baseline ELF was saved, then relinked from the *identical* object files by
+replaying `build/CMakeFiles/tpv_vita.dir/link.txt` with one fragment inserted:
 
     SECTIONS { .text.hotlibs : {
         *libc.a:*(.text .text.*)  *libgcc.a:*(.text .text.*)
@@ -2150,9 +2143,9 @@ by replaying `build/CMakeFiles/tpv_vita.dir/link.txt` with one fragment inserted
     } }
     INSERT BEFORE .text;
 
-`INSERT BEFORE` was chosen over §7.18's plain `-T` fragment because it merges with the default script
-instead of replacing it, and it worked: `.text.hotlibs` appeared at `0x81000010`, before `.text` at
-`0x81099580`, with 4,921 functions moved into it.
+`INSERT BEFORE` was chosen over §7.18's plain `-T` fragment because it merges with the default script instead
+of replacing it, and it worked: `.text.hotlibs` appeared at `0x81000010`, before `.text` at `0x81099580`,
+with 4,921 functions moved into it.
 
 **Result: worse.**
 
@@ -2165,26 +2158,22 @@ The total fell by 6 but the number that matters **rose by 32**. Only `_ZdlPv` an
 removed; `_ZnwjRKSt9nothrow_t`, `__aeabi_d2lz`, `__aeabi_f2lz`, `__aeabi_uidiv`, `calloc`, `realloc`,
 `sprintf` and `strcpy` were added.
 
-**Why: `libc.a` is not a pile of leaf functions.** It is mostly stdio, locale, time and filesystem code,
-so moving the whole archive forward put that bulk *between* the game code and where `memcpy`/`malloc` had
-been — and those two did not move at all (still ~18.4 MiB out, still out of range of the first 2.4 MiB).
+**Why: `libc.a` is not a pile of leaf functions.** It is mostly stdio, locale, time and filesystem code, so
+moving the whole archive forward put that bulk *between* the game code and where `memcpy`/`malloc` had been —
+and those two did not move at all (still ~18.4 MiB out, still out of range of the first 2.4 MiB).
 
-**Killed:** §7.19's claim that this needs no profile and no `-ffunction-sections`; it moves 4,921
-functions to reach perhaps 40. **Not killed:** the constraint (`.text` 18.55 MiB against a 16.00 MiB
-reach). The next step is function-granular: `-ffunction-sections`, a CPU profile, and
-`vita_hot_order.py` naming the ~40 targets individually. **No source change was made** — the build was
-restored and verified (316 veneers, `memcpy` back at `0x82273cb9`).
+**Killed:** §7.19's claim that this needs no profile and no `-ffunction-sections`; it moves 4,921 functions to
+reach perhaps 40. **Not killed:** the constraint (`.text` 18.55 MiB against a 16.00 MiB reach). The next step
+is function-granular: `-ffunction-sections`, a CPU profile, and `vita_hot_order.py` naming the ~40 targets
+individually. **No source change was made** — the build was restored and verified (316 veneers, `memcpy` back
+at `0x82273cb9`).
 
 #### Evidence — 7.19c Is any of this worth a frame? No — the arithmetic says ~0.05 % (2026-11-16)
 
-**The verdict, and the end of this thread.** If a future session is tempted by code layout, read this table
-first and stop.
-
-The constraint is real (`.text` 18.55 MiB vs a 16.00 MiB reach) and the cheap fix failed. This prices the
-remaining idea so nobody spends a day on it for nothing.
-
-A veneer costs **one extra branch** (caller `BL` -> stub -> `B` -> target) plus one extra instruction
-fetch. At 444 MHz a cycle is **2.25 ns**, and a 30 Hz frame is **33,333 us**:
+**The verdict, and the end of this thread.** The constraint is real and the cheap fix failed (§7.19b). This
+prices what remains, so nobody spends a day on it. A veneer costs **one extra branch** (caller `BL` -> stub
+-> `B` -> target) plus one extra instruction fetch. At 444 MHz a cycle is **2.25 ns**, and a 30 Hz frame is
+**33,333 us**:
 
 | cost/call | 1,000 calls/frame | 10,000 | 100,000 |
 |---|---:|---:|---:|
@@ -2192,19 +2181,15 @@ fetch. At 444 MHz a cycle is **2.25 ns**, and a 30 Hz frame is **33,333 us**:
 | 4 cycles (9.0 ns) | 9.0 us (0.03 %) | 90 us (0.27 %) | 901 us (2.70 %) |
 | 10 cycles (22.5 ns) | 22.5 us (0.07 %) | 225 us (0.68 %) | 2,252 us (6.76 %) |
 
-**A realistic estimate.** ~40 hot veneers, each hit ~50 times a frame, at ~4 cycles: **18 us, i.e. 0.05 % of
-the frame.** Even the absurd ceiling — 100,000 veneered calls every frame at 10 cycles — is 6.8 %.
+~40 hot veneers, each hit ~50 times a frame, at ~4 cycles: **18 us, i.e. 0.05 % of the frame.** Even the
+absurd ceiling — 100,000 veneered calls every frame at 10 cycles — is 6.8 %.
 
-**Verdict: hot-ordering has no measurable performance value on this port.** The sibling port's measured
-levers were 18–20 % for the backend and up to 40 % for non-renderer work; 0.05 % is not in the same
-conversation, and it sits far below the ~20 % noise floor here — which is why Vita3K could never have
-shown it (§7.8).
-
-**What it was worth, and neither is frame time:** (1) a **verified mechanism** for a port that needs it —
-`vita_hot_order.py` and the `-T`/`INSERT BEFORE` behaviour are confirmed on this toolchain (§7.18), and it
-pays where a hot set is far from its dependencies, which is not our situation (258 of 316 veneers are cold
-C++ runtime); (2) a **closed question with evidence**, so a future session reading §7.17's enthusiasm does
-not retry it.
+**So hot-ordering has no measurable value here.** The sibling port's levers were 18–20 % for the backend and
+up to 40 % for non-renderer work; 0.05 % is not in that conversation, and it sits far below the ~20 % noise
+floor — which is why Vita3K could never have shown it (§7.8). What it was worth instead: a **verified
+mechanism** for a port that needs it (§7.18), since it pays where a hot set is far from its dependencies —
+not our case, with 258 of 316 veneers cold C++ runtime — and a **closed question with evidence**, so a future
+session reading §7.17's enthusiasm does not retry it.
 
 **Do not spend more time on code layout here.** If the frame budget matters, §11's answer stands: hardware.
 
