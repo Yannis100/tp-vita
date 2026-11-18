@@ -213,86 +213,88 @@ frame 7,200–7,500), with no `crash.log`, no `fatal.txt` and no guest exception
 it (§7.1's arena fix is the plausible candidate) or the rate is low enough that 14 runs prove nothing.
 **Both readings fit the data; neither is proven.**
 
-### 3d. The idle runs never left the attract loop — and the game stopped at a memory-card prompt
+### 3d. The route to gameplay: what was blocking, and what it took
 
-Idle runs do not play the game. Their twilight-sky frames are the **title/attract loop**, so new scene
-data is never loaded, and the data-dependent fatal sites cannot fire:
+Idle runs never play the game. Their twilight-sky frames are the **title/attract loop**, so new scene data
+is never loaded and the data-dependent fatal sites cannot fire: `gx.cpp:161` calls `comp_cnt_count()`,
+which `fatal()`s on an unsupported `GXAttr`/`GXCompCnt` pair, reached per display list from `dl.cpp:62` and
+`command_processor.cpp:366`. New geometry with new vertex attribute formats is what moving through the game
+produces, and 7,500 idle frames on one screen cannot produce it — so "14 clean runs" is weaker evidence
+than it looks.
 
-- `gx.cpp:161` calls `comp_cnt_count()`, which `fatal()`s on an unsupported `GXAttr`/`GXCompCnt` pair;
-- reached per display list from `dl.cpp:62` and `command_processor.cpp:366`.
+Driving the game needs input. `tests/vita3k/in_container_script.sh` replays a fixed action script
+(`run.sh script <file> [prefix]`), and its honest limit is that the **key sequence is fixed, the timing is
+not** — presses are wall-clock, so a press can land on a different frame each run. That is a reproducible
+sequence, not a reproducible run. Frame-counted injection wants a hook inside the app (§3d.5).
 
-New geometry with new vertex attribute formats is what moving through the game produces, and 7,500
-idle frames on one screen cannot produce it. "14 clean runs" is therefore weaker evidence than it looks.
+Input did reach the game: a tap moved "No Memory Card found in Slot A" to "Continue without saving?" with a
+cursor, so SDL3 → `aurora::input` → `PADRead` worked. But every route returned to the same check — a
+**self-perpetuating loop** where `mDoMemCd_Ctrl_c::getStatus` returned `CARD_STATE_NO_CARD_e`,
+`MemCardStatCheck` showed `ERRMSG_WAIT_KEY` then `NO_SAVE_SEL_DISP`, and answering it re-ran the check. The
+"Checking Memory Card in Slot A…" header is permanent chrome on that screen, not a status. Creating
+`ux0:data/tpvita/EUR/Card A` by hand changed nothing — same shots, same md5, directory still empty — so the
+card path was not the cause.
 
-To drive the game, `tests/vita3k/in_container_script.sh` replays a fixed action script (`run.sh script
-<file> [prefix]`). Its honest limit: the **key sequence is fixed, the timing is not** — presses are
-wall-clock, so a press can land on a different frame each run. That is a reproducible sequence, not a
-reproducible run. Frame-counted injection needs a hook inside the app (§3d.5).
+**What it took, in order, and where each defect is recorded.** These four are the whole route from "boots to
+the attract loop" to "renders gameplay"; the sections below are the diagnoses, and this table is the result.
 
-Input does reach the game: a tap moved the screen from "No Memory Card found in Slot A" to "Continue
-without saving?" with a cursor, so SDL3 → `aurora::input` → `PADRead` works. But every route returned
-to the same check, a **self-perpetuating loop**: `mDoMemCd_Ctrl_c::getStatus` returned
-`CARD_STATE_NO_CARD_e`, `MemCardStatCheck` showed `ERRMSG_WAIT_KEY` then `NO_SAVE_SEL_DISP`, and
-answering it re-ran the same check. The "Checking Memory Card in Slot A…" header is permanent chrome
-on that screen, not a status.
-
-Ruled out by test: that the card path's parent was the disc image. Creating `ux0:data/tpvita/EUR/Card A`
-by hand changed nothing — same shots, same md5, directory still empty. **The cause was elsewhere (§3d.1).**
+| # | Blocker | Root cause | Fixed in |
+|---|---|---|---|
+| 1 | card channel reported `NOCARD` forever | a dangling path, not card logic | §3d.1 |
+| 2 | card directory could never be created | `SDL_CreateDirectory` is a bare `mkdir` on Vita | §3d.1 |
+| 3 | title screen cropped — logo filled the frame, "PRESS START" missing | the 75 % EFB scale was applied to nothing | §3d.3 |
+| 4 | input could not be scripted reproducibly | wall-clock presses; needs a frame-counted hook | §3d.5 |
 
 ### 3d.1 The cause was a dangling path, not card logic (2026-11-05)
 
-`AuroraConfig`'s path strings are borrowed pointers that upstream copies with `strdup()`; the Vita
-backend (`vita/aurora/backend.cpp`) stored them raw. Dusklight builds them from `std::string`
-temporaries inside a block of `game_main()`, the block ends, and the buffers are freed and reused.
-`g_config.userPath` was read later by `CARDInit()` and had become the **disc image path**, so the card
-folder resolved to `ux0:data/tpvita/GZ2P01.iso/EUR/Card A`. Creating a directory under a regular file
-fails with ENOENT, `CardGciFolder::open()` left `m_error = NOCARD`, `CARDCheck()` reported `NOCARD`,
-and `MemCardStatCheck` looped forever — from a place nowhere near the card code. The evidence is the
-emulator log: before the fix `Missing file at .../tpvita/GZ2P01.iso/EUR/Card A`, after it
-`.../TwilitRealm/Dusklight/EUR/Card A`.
+**Defect 1.** `AuroraConfig`'s path strings are borrowed pointers that upstream copies with `strdup()`; the
+Vita backend (`vita/aurora/backend.cpp`) stored them raw. Dusklight builds them from `std::string` temporaries
+inside a block of `game_main()`, the block ends, and the buffers are freed and reused. `g_config.userPath` was
+read later by `CARDInit()` and had become the **disc image path**, so the card folder resolved to
+`ux0:data/tpvita/GZ2P01.iso/EUR/Card A`. Creating a directory under a regular file fails with ENOENT,
+`CardGciFolder::open()` left `m_error = NOCARD`, `CARDCheck()` reported `NOCARD`, and `MemCardStatCheck`
+looped forever — from a place nowhere near the card code. The emulator log is the evidence: before the fix
+`Missing file at .../tpvita/GZ2P01.iso/EUR/Card A`, after it `.../TwilitRealm/Dusklight/EUR/Card A`.
 
-**Fix.** `copy_string()` in `vita/aurora/backend.cpp` takes owned copies into static storage, refuses
-a path over 512 bytes rather than truncating it into a *different* directory, and logs the resolved
-paths on every boot:
+`copy_string()` in `vita/aurora/backend.cpp` now takes owned copies into static storage, refuses a path over
+512 bytes rather than truncating it into a *different* directory, and logs the resolved paths on every boot:
 
 ```
 paths: user 'ux0:/data/TwilitRealm/Dusklight/', cache '...', resources 'app0:/', app 'Dusklight'
 ```
 
-**A second, independent cause.** Even with the path fixed the card directory was never created:
-`_sceIoMkdir` on `.../Dusklight/EUR/Card A` returned `0x80010002` (ENOENT) because the parent `EUR`
-did not exist. `aurora::io::create_directories()` calls `SDL_CreateDirectory()`, *documented* as
-creating missing parents — but that is per-platform. The shipped library settles it:
-`SDL_SYS_CreateDirectory` in `SDL_sysfsops.c.obj` is a bare `mkdir` (compare `SDL_SYS_GetPrefPath`,
-which does walk and create each component). On Vita the header's promise is not kept.
+**Defect 2, independent of the first.** Even with the path fixed the card directory was never created:
+`_sceIoMkdir` on `.../Dusklight/EUR/Card A` returned `0x80010002` (ENOENT) because the parent `EUR` did not
+exist. `aurora::io::create_directories()` calls `SDL_CreateDirectory()`, *documented* as creating missing
+parents — but that is per-platform. The shipped library settles it: `SDL_SYS_CreateDirectory` in
+`SDL_sysfsops.c.obj` is a bare `mkdir` (compare `SDL_SYS_GetPrefPath`, which does walk and create each
+component). On Vita the header's promise is not kept.
 
-`create_directories()` now builds the path component by component and **skips a component ending in
-`:`** — `SDL_CreateDirectory("ux0:")` fails and cannot even be stat'd (`Failed to translate path:
-ux0:`), turning the whole call into a failure on its first iteration. The skip is required, not an
-optimisation.
+`create_directories()` now builds the path component by component and **skips a component ending in `:`** —
+`SDL_CreateDirectory("ux0:")` fails and cannot even be stat'd (`Failed to translate path: ux0:`), turning the
+whole call into a failure on its first iteration. The skip is required, not an optimisation.
 
 **Verified in Vita3K.** With `…/Dusklight/EUR` deleted first, a completed run leaves
-`TwilitRealm/Dusklight/EUR/Card A` created by the game, so `CARDInit` formats the GCI folder and the
-card channel comes up: the first live memory card this port has had.
+`TwilitRealm/Dusklight/EUR/Card A` created by the game, so `CARDInit` formats the GCI folder and the card
+channel comes up: the first live memory card this port had.
 
-**The lesson.** The first attempt edited `extern/aurora/lib/io.cpp` directly — upstream source. It
-compiled, produced a VPK and changed nothing; two emulator runs concluded "the fix did not work". The
-missing half of the §8 rule is that editing *upstream* `extern/aurora/lib` is as ineffective as
-editing `build/aurora_lib`.
+**The lesson, which extends §8's rule.** The first attempt edited `extern/aurora/lib/io.cpp` directly —
+upstream source. It compiled, produced a VPK and changed nothing; two emulator runs concluded "the fix did
+not work". Editing *upstream* `extern/aurora/lib` is as ineffective as editing `build/aurora_lib`.
 
 ### 3d.2 The memory-card prompt no longer blocks play, and saves are written (2026-11-05)
 
-`shot_5` of the scripted run showed an in-game scene while the card channel still reported `NOCARD`,
-so "cannot be played past file select" was a consequence of the §3d.3 scale bug (which drew the dialog
+`shot_5` of the scripted run showed an in-game scene while the card channel still reported `NOCARD`, so
+"cannot be played past file select" was a consequence of the §3d.3 scale bug (which drew the dialog
 off-screen), not of the card state.
 
-**Correction:** that shot was described here as "a lit stone bridge over a dark cavern" — a reading of
-a picture nobody compared to anything. What is defensible is narrower: the prompt was answered, a GCI
-was written, and the game advanced **into the save-creation sequence**, where it stayed on the name
-grid for eleven screenshots. Only the pixels count.
+**One correction worth keeping.** That shot was once described here as "a lit stone bridge over a dark
+cavern" — a reading of a picture nobody compared to anything. What is defensible is narrower: the prompt was
+answered, a GCI was written, and the game advanced **into the save-creation sequence**, where it stayed on
+the name grid for eleven screenshots. Only the pixels count.
 
-**Saves work, write path.** A frame-counted run answered "Yes" to "Would you like to create a save
-file … in Slot A?" and the game wrote a real GCI:
+**Saves work, write path.** A frame-counted run answered "Yes" to "Would you like to create a save file … in
+Slot A?" and the game wrote a real GCI:
 
 ```
 TwilitRealm/Dusklight/EUR/Card A/01-GZ2P-gczelda2.gci   32,832 bytes
@@ -300,27 +302,19 @@ header: 47 5a 32 50 30 31 00 05 "gczelda2"      (GZ2P01, 5 blocks, filename fiel
 10,497 non-zero bytes — real data, not a zero-filled stub
 ```
 
-The run continued into the new-game intro ("Enter horse name" → "Epona") and "Enter name" → "Link".
-**Save RELOAD is untested**: a second run with the GCI in place was driven the same way and began a
-*new* game rather than continuing. Whether that is intended for a card never loaded in that session,
-or a defect in the load path, is not determined — the file-select screen itself was never captured.
-
-**Amended 2026-11-11 (§3d.7).** The GCI left on disk by that run has an **empty** `mPlayerName`, because
-`initdata_to_card()` clears it by design. So the second run could not have shown a continuing game from
-that file: an unnamed slot is what the file select draws as "New Quest Log". The "began a new game"
-observation therefore carries no information about the load path, and §3d.7 explains how the file select
-actually labels a slot. Reload stays untested until a save written after both name screens is loaded.
+The run continued into the new-game intro ("Enter horse name" → "Epona", "Enter name" → "Link"). **Save
+RELOAD is untested**, and §3d.7 explains why the second run's "began a new game" result carried no
+information: the GCI it loaded had an **empty** `mPlayerName` by design, and an unnamed slot is what the file
+select draws as "New Quest Log". Reload stays untested until a save written after both name screens is loaded.
 
 ### 3d.3 Why the title screen was cut, and the rects to measure next time (2026-11-05)
 
-The reported symptom: the logo filled the frame and "PRESS START" plus the copyright line were
-missing. That is a **render-scale bug**, not a scene bug.
-
-`ensure_efb()` allocated the EFB at 75% (608×448 → 456×336), but `main_target_size()` returned the
-**logical** size and `get_render_target_size()` returned `main_target_size()` for the main target, so
-`gx::map_logical_viewport()` computed `target / logical` = `608/608` = **1.0**. The 75% was applied to
-nothing, so every full-screen 608×448 viewport was issued against a 456×336 FBO: the picture was
-magnified by 1/0.75 and cropped.
+**Defect 3.** The logo filled the frame and "PRESS START" plus the copyright line were missing. That is a
+**render-scale bug**, not a scene bug. `ensure_efb()` allocated the EFB at 75 % (608×448 → 456×336), but
+`main_target_size()` returned the **logical** size and `get_render_target_size()` returned
+`main_target_size()` for the main target, so `gx::map_logical_viewport()` computed `target / logical` =
+`608/608` = **1.0**. The 75 % was applied to nothing, so every full-screen 608×448 viewport was issued
+against a 456×336 FBO: the picture was magnified by 1/0.75 and cropped.
 
 Measured before the fix:
 
@@ -329,17 +323,17 @@ EFB target: logical 608x448 -> 456x336 (75%), present 960x544
 rect on 456x336: viewport (0.0,0.0) 608.0x448.0  scissor (0,0) 608x448
 ```
 
-**Fix.** `efb_target_size()` (in `vita_frame.hpp`, defined in `vita_gl_replay.cpp`) returns the scaled
-size; `get_render_target_size()` reports it for the main target; `ensure_efb()` allocates from the same
-function so the two cannot drift. After:
+`efb_target_size()` (in `vita_frame.hpp`, defined in `vita_gl_replay.cpp`) now returns the scaled size;
+`get_render_target_size()` reports it for the main target; `ensure_efb()` allocates from the same function so
+the two cannot drift. After:
 
 ```
 rect on 456x336: viewport (0.0,0.0) 456.0x336.0  scissor (0,0) 456x336
 ```
 
-**Keep the instrumentation.** `apply_viewport()` logs each distinct (target size, viewport, scissor)
-once per process and `ensure_efb()` logs the logical → EFB conversion. Two log lines settled in minutes
-what prose had guessed wrong.
+**Keep the instrumentation.** `apply_viewport()` logs each distinct (target size, viewport, scissor) once per
+process and `ensure_efb()` logs the logical → EFB conversion. Two log lines settled in minutes what prose had
+guessed wrong.
 
 ### 3d.4 What the 2026-11-05 changes were tested against, and what was not
 
@@ -351,27 +345,28 @@ what prose had guessed wrong.
 | `vertex` | **71,063 checks, 0 failures** |
 | `e2e` | **0 scenes failed** (87 scenes then, 91 now) |
 
-Both suites had been **broken**, and both breaks removed tests silently:
+Two suites had been **broken**, and both breaks removed tests silently — the failure mode that matters more
+than either fix:
 
-- `vertex` could not link: `undefined reference to aurora::log_internal`, then `aurora::g_config`. The
-  decoder reports through `aurora::Module`, which needs `logging.cpp` plus a `g_config` definition.
-  Fixed by adding `logging.cpp` and `tests/host/vertex/stubs.cpp` to `run.sh`.
-- `e2e` could not compile: `SDL3/SDL_events.h: No such file or directory`. The header **was** present,
-  in `$VITASDK/arm-vita-eabi/include/SDL3`; the header-symlink lists in `tests/host/build.sh` and
+- `vertex` could not link: `undefined reference to aurora::log_internal`, then `aurora::g_config`. The decoder
+  reports through `aurora::Module`, which needs `logging.cpp` plus a `g_config` definition. Fixed by adding
+  `logging.cpp` and `tests/host/vertex/stubs.cpp` to `run.sh`.
+- `e2e` could not compile: `SDL3/SDL_events.h: No such file or directory`. The header **was** present, in
+  `$VITASDK/arm-vita-eabi/include/SDL3`; the header-symlink lists in `tests/host/build.sh` and
   `tests/host/e2e/run.sh` named only `GLES2 KHR EGL fmt`. The merged tree reaches it through
   `aurora/event.h`. Adding `SDL3` to both lists fixed it. "This machine has no SDL3" was wrong.
 
-**`e2e` had in fact been red since the 75% scale was introduced (§7.7).** Measured: with the four
-viewport/scale files stashed, **84 of 87 scenes failed**; with them applied, 30; after the scale fix,
-**0**. Nothing was run in between, so the suite that exists to catch this class of error was not
-consulted when the error was added.
+**`e2e` had in fact been red since the 75 % scale was introduced (§7.7).** Measured: with the four
+viewport/scale files stashed, **84 of 87 scenes failed**; with them applied, 30; after the scale fix, **0**.
+Nothing was run in between, so the suite that exists to catch this class of error was not consulted when the
+error was added.
 
-The remaining 30 were one cause: the suite asserts exact pixels (a 1-px line, an 8-px point, a scissor
-edge, a TEV colour), and at 75% those are filtered — a full-intensity line came back `(15,210,15)`
-instead of `(0,255,0)`. Rendering the **host** suite at 100% removes the mismatch at its source instead
-of loosening tolerances, which would hide real regressions. `kEfbScalePercent` is `75` on `__vita__`
-and `100` elsewhere; the device still logs `logical 608x448 -> 456x336 (75%)` with viewport
-`456.0x336.0`, so the scaled path is what hardware runs and the unscaled one is its reference.
+The remaining 30 were one cause: the suite asserts exact pixels (a 1-px line, an 8-px point, a scissor edge, a
+TEV colour), and at 75 % those are filtered — a full-intensity line came back `(15,210,15)` instead of
+`(0,255,0)`. Rendering the **host** suite at 100 % removes the mismatch at its source instead of loosening
+tolerances, which would hide real regressions. `kEfbScalePercent` is `75` on `__vita__` and `100` elsewhere;
+the device still logs `logical 608x448 -> 456x336 (75%)` with viewport `456.0x336.0`, so the scaled path is
+what hardware runs and the unscaled one is its reference.
 
 Not verified on any target: a save written and reloaded, audio, performance, anything on hardware.
 
