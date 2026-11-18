@@ -1606,526 +1606,6 @@ unchanged (exit 1), so the guard still catches the accident it was built for.
   table, light normalisation) still have no pixel evidence attached.
 - **Still missing:** DuskOnVita's frames — it publishes no VPK, so the comparison stays two ports.
 
-### 7.13 vitaGL vs GXM vs hybrid: what the numbers actually say (2026-11-12)
-
-**This section is the evidence; §7.14 is the model built on it.** Each measurement appears once, here, and
-§7.14 cites it rather than reprinting it.
-
-The only port that ships **both** backends is DuskOnVita, so it is the only source of a same-scene,
-same-console A/B. Everything below is quoted from its `docs/benchmarks.csv` and `docs/PERFORMANCE.md`
-(a clone at `/tmp/DuskOnVita`), not estimated. **None of it was measured on this port.**
-
-#### The direct A/B: build g2c, PS Vita 1000, 444 MHz, 23 Oct
-
-| Scene | vitaGL | GXM + G2 | delta |
-|---|---:|---:|---:|
-| Link's house | 20.24 | 19.45 | **−3.9 %** |
-| Ordon, outside the house | 22.94 | 27.23 | **+18.7 %** |
-| Faron fight | 11.71 | 14.04 | **+19.9 %** |
-
-**It is not a constant win, and the sign flips with the scene.** Their own note says Link's house turned
-out to be *GPU-bound at full resolution* — at 100 % the GPU is the limit, so a cheaper CPU-side backend
-buys nothing and GXM's slightly different submission costs 4 %. The two scenes that gain ~19 % are the
-ones limited by the GX worker or the main thread.
-
-**This A/B is not a pure backend swap, and that matters.** `g2c-gxm` carries G2: resident geometry
-(`--vita-gxm-resident`), packed 8/16-bit vertex formats (`--vita-gxm-compact`) and native
-quads/strips/fans (`--vita-gxm-primitives`). There is **no published "GXM without G2" run**, so the
-backend's own share of that +19 % is unmeasured. Someone reading "+19 % for switching to GXM" would
-overstate the backend by an unknown amount.
-
-#### Why the ceiling is around 20 %, from the frame itself
-
-The GX worker's 37.9 ms per frame (g2c, Link's house) decomposes as:
-
-| part | ms | share |
-|---|---:|---:|
-| **backend draws** | **10.9** | **28.8 %** |
-| pipeline lookup | 8.2 | 21.6 % |
-| XF: matrices, lights | 6.0 | 15.8 % |
-| BP: TEV, blend, textures | 6.0 | 15.8 % |
-| draw parsing | 2.9 | 7.7 % |
-| CP: vertex arrays | 2.3 | 6.1 % |
-| draw setup, command loop, static lists | 1.6 | 4.2 % |
-
-A backend swap can only touch the **10.9 ms** of backend draws. Even making them free cannot exceed about a
-quarter of GX worker time, which is why the measured win is ~19 % on worker-bound scenes and negative where
-the GPU binds first.
-
-**The backend is also not where the frame goes:** *vitaGL calls* are **16.2 %** of the v61 frame, against
-42.9 % for vertex preparation and 20.1 % for GX decode. §7.14 has that profile in full and does the
-arithmetic. **So the renderer is the third-order lever, not the first** — the first-order levers move work
-off one core or remove it: threading, resident/static geometry, and the vertex path.
-
-#### What each non-renderer lever was worth (same backend)
-
-Ordon village centre, 10 Nov, one thing added at a time:
-
-| change | FPS | vs control |
-|---|---:|---:|
-| control (every new speed-up off) | 12.29 | — |
-| GX worker speed-ups only | 13.05 | +6.2 % |
-| + direct uniforms + actor fast paths | 13.87 | +12.9 % |
-| + Performance (picture-only, opt-in) | 15.60 | +26.9 % |
-
-Frame overlap alone, console, Ordon at 75 %: **20.5 → 25.9 FPS (+26 %)**. Clocks 333 → 444 MHz is ~1.33×
-on paper. Those are larger than the backend swap and they compose.
-
-#### Hybrid
-
-Two different things get called "hybrid", and only one is interesting:
-
-1. **Both backends present, selectable at run time** (what DuskOnVita actually does). Cost is one
-   function-pointer table; value is a fallback when one backend cannot start — their GXM writes
-   `gfx_init_failure` and exits if `sceGxmProgramCheck` or a pool allocation fails. That is a
-   robustness argument, not a performance one.
-2. **One scene drawn by both, split by pass.** This is the only hybrid with a performance story, and it
-   comes straight out of their gap list: their GXM backend does **not** yet do off-screen passes and
-   EFB copies — shadows, heat haze, the minimap — and some indirect-texture effects. Those are exactly
-   the paths vitaGL already implements correctly here (§7.6: 11,338 resolve ops, ~11/frame, all reaching
-   `draw_quad`). A hybrid that keeps GXM for the main pass and vitaGL for EFB-copy/off-screen passes
-   would run two GL contexts' worth of state on a 128 MiB GPU budget with no measured data to justify
-   it. **No one has measured it, and this document should not imply otherwise.**
-
-#### What this predicts for `tp-vita`, labelled as a prediction
-
-**All of the above is transfer from another codebase; no hardware run of this port has ever happened.**
-The closest measured anchor is **v61: 6.34 FPS in Link's house, 7.39 outside**, at 333 MHz on one core with
-every draw — not the 12–28 FPS the other port reports, because none of the levers that got it there exist
-here. This port requests 444 MHz (`vita/src/main.cpp:68-71`), so that anchor understates our headroom. The
-151.94 ms/frame figure in §7.6 is a Vita3K number and says nothing about a Cortex-A9. §7.14 turns this into
-a lever-by-lever model.
-
-#### 7.13.1 What "G2" means, and a contradiction in their own docs (2026-11-12)
-
-**"G2" is not a switch.** It is the **third build stage of the GXM backend** (`docs/ARCHITECTURE.md`):
-**G0** the backend table and per-frame draw digest; **G1** the SceGxm backend itself; **G2** the three
-optimisation switches below, all GXM-only and **all default `off`** in the options table:
-
-| switch | values | default | what it does |
-|---|---|---|---|
-| `--vita-gxm-resident` | on/off | **off** | certified geometry and static-list indices stay in a GPU arena instead of being copied every frame |
-| `--vita-gxm-compact` | off/on/colors | **off** | integer positions, normals and texture coords keep their GX format, scaled exactly in the vertex shader; `colors` also sends RGBA8 colours as bytes |
-| `--vita-gxm-primitives` | on/off | **off** | quads, strips and fans drawn natively, without index lists (patch `aurora/0008`) |
-
-**They are not GXM-specific in spirit, only in implementation.** Each removes a copy, a conversion or an
-index list — the same three things a vitaGL port could also stop doing. That is the transferable idea;
-the flags are not portable.
-
-**The contradiction resolves.** The README says "GXM + G2" while the options table defaults all three to
-`off`. Both are true in different modes: the **play profile** (`main_vita.cpp:89`) carries all three
-`on`, and a launch selecting **no** renderer option gets it implicitly (`implicitProfile`), so a normal
-launch has them **on**; selecting **any** renderer option falls back to the table defaults, **off**. So
-"G2 off" is the *explicit-option* state. The `g2c-gxm` benchmark rows do not record which case they were,
-so **the +18.7 % / +19.9 % figures may or may not include G2** — a gap in their record, not a conclusion
-here.
-
-**Where the backend's own share IS separable, and it is small.** Two later GXM additions carry console
-numbers (`main_vita.cpp:126-128`): the pipeline memo took the worker's pipeline step 10.7→5.1 ms in Ordon
-centre and 13.6→3.7 ms in Hyrule Field, and direct default-uniform writes took the **backend step
-24.0→23.1 ms — about 1 ms/frame**. That ~1 ms on a 24 ms step is the resolution a pure backend
-optimisation has, consistent with §7.13's ceiling.
-
-### 7.14 Which backend would theoretically be faster, and how much (2026-11-12)
-
-**A model, not a measurement.** Every number is tagged as measured or assumed so it can be attacked. The
-measurements it uses live in §7.13 and are printed there; this section only does arithmetic with them.
-
-**Short answer: direct GXM, by roughly 1.1x** — only on scenes whose bottleneck is the GX worker, and
-*slower* where the GPU binds first. Switching backend is the **third-largest** lever, behind threading
-and the vertex path.
-
-**Why: the frame does not spend its time in the backend.** Measured, v61 on the console, one core,
-333 MHz, 154 ms/frame (`DuskOnVita docs/PERFORMANCE.md`) — the canonical copy of this table:
-
-| component | ms | share | what a backend swap can do |
-|---|---:|---:|---|
-| vertex preparation | 66 | 42.9 % | **nothing** — happens before the backend |
-| GX command decode | 31 | 20.1 % | **nothing** — happens before the backend |
-| **vitaGL calls** | **25** | **16.2 %** | this is the whole target |
-| J3D draw building | 20 | 13.0 % | **nothing** |
-| game simulation | 12 | 7.8 % | **nothing** |
-
-Even making the GL layer **free** caps the win at 1.19x. The Amdahl rows below use measured components
-with **assumed** removal fractions — only the 154 ms total and the split are measured:
-
-| change | frame | speedup |
-|---|---:|---:|
-| backend only (vitaGL calls −60 %, an **estimate**) | 139.0 ms | **1.11x** |
-| + resident/packed geometry (vertex prep −75 %, assumed) | 89.5 ms | **1.72x** |
-| + GX thread and frame overlap (2 cores busy) | ~54 ms critical path | **~2.9x** |
-
-The ordering does not depend on the assumptions: a layer that is 16 % of the frame cannot beat changes that
-address 43 % and 20 % of it. **A second, independent ceiling agrees** (§7.13's GX-worker decomposition):
-backend draws are 10.9 ms of a 37.9 ms worker = 28.8 %, so a completely free backend buys at most **~22 % of
-frame time** if the worker is ~76 % of the frame.
-
-**Which backend for `tp-vita`.** §7.13's A/B is the answer: −3.9 % on a GPU-bound scene, +18.7 % and
-+19.9 % on worker-bound ones, so "which is faster" is **scene-dependent by sign**. This port is **vitaGL
-only, single-threaded, no GX worker, no frame overlap, no resident geometry, no static display lists**, at
-ARM 444 / bus 222 / GPU 222 / xbar 166 (`vita/src/main.cpp:68-71`), where v61 was taken at stock 333 MHz —
-so that anchor **understates** our headroom. Two reasons it is not the first lever: our GL layer is a
-*smaller* share than 16 % (the 25 ms is the whole GL cost inside an already optimised pipeline, while our
-replay thread also does decode, state caching, fog-range LUT rebuilds and shadow-list work), and our nearest
-anchor — 6.34 FPS in the house, 7.39 outside — is *exactly* the single-core, stock-clock, every-draw
-configuration this port ships in, so the gap to the other port's 12–28 FPS is almost entirely the 1.7x and
-2.9x rows.
-
-**Stated plainly:** a direct-GXM rewrite is worth ~**1.1x** and is the most expensive of the three levers,
-because it means reimplementing the GL surface the replay path uses. A GX worker plus frame overlap is
-worth **more** and touches far less code. If the goal is frames, **the backend is the wrong thing to
-rewrite first**.
-
-**What would falsify this:** a run showing our per-frame `vitaGL` time is a much larger share than 16 %
-(instrument the replay's GL calls the way §7.9 instrumented decode — checkable without a console); a
-GXM-without-G2 benchmark, which does not exist (§7.13.1); or any hardware run at all.
-
-### 7.15 The x20 Link heap was live on Vita, and is now x3 — 10.79 MiB back (2026-11-16)
-
-**Trigger:** DuskOnVita published **v0.9.0 on 2026-11-14, the first release with a VPK**. Its commit
-`1b6472c4` ("Crash fix: Link's own heaps are three times the original's size, not twenty", patch
-`dusklight/0077`) describes a failure mode that matches ours, and the check found it live here.
-
-#### The defect was ours too, and the guard that should have stopped it was defeated
-
-`daAlink_c::setOriginalHeap` multiplies Link's two heaps by **20** under `#if TARGET_PC`:
-
-```cpp
-u32 size = ROUND(i_size, 16);
-#if TARGET_PC
-    size *= 20;   // "prevent mods from crashing with higher-quality models"
-#endif
-```
-
-**This tree defines `TARGET_PC=1` for the Vita build as well**
-(`cmake/GameABIConfig.cmake:7`), so a guard that reads like "PC only" was **live on Vita**. Link's
-archive heap became `0xA2800 * 20 + 0xA0 = 0xCB20A0` = **12.70 MiB**, taken in one piece from the game
-heap every time Link is created — a stage change, or the restart after a fall.
-
-Our own `dvd_trace.txt` had this recorded all along:
-
-```
-JKRExpHeap: create: size=0xCB20A0 aligned=0xCB20A0 parent=gameHeap parentFree=0x14385B0
-```
-
-Nobody connected `0xCB20A0` to `0xA2800 * 20`. The lesson is §8 trap 16's, one layer up: **a
-platform guard is only real if the macro is not also defined for your platform** — check the compile
-definitions, not the `#if`.
-
-#### Fix, and the proof
-
-`#if TARGET_VITA` now does `size *= 3` before the `#elif TARGET_PC`. Measured in the same run, same
-harness, only the multiplier changed:
-
-| | request | MiB |
-|---|---:|---:|
-| before | `0xCB20A0` | 12.70 |
-| after | `0x1E78A0` | **1.90** |
-
-Both decompose exactly as `base * N + 0xA0`: `0xA2800*20 + 0xA0` and `0xA2800*3 + 0xA0`. The shield
-heap moved the same way, `0x7D000*3 = 0x177000`. **10.79 MiB reclaimed per Link creation.** No
-`fatal.txt`, no `crash.log`, frames render normally (all five captures `738x544` at the expected bbox),
-and the host suites are unchanged: e2e 91 scenes / 14,266 checks / 0 failed, texture 3,780/0, crash
-PASS, printf clean.
-
-**Not proven:** that this was the §7.1/§7.12b abort. Those runs died in the **attract loop** while
-streaming demo resources, before Link exists, and the failure carried no size. This fix removes a real
-12.70 MiB single-block request that could strand a stage change or a post-fall restart; whether it
-retires the attract-loop abort is **untested**, and the `0xBF18265F` corrupted-size case remains
-unexplained. Do not write "the heap abort is fixed".
-
-#### Their v0.9.0 console numbers, for the record
-
-PS Vita 1000, 13 Nov, default "Speed-ups: Original": Snowpeak Ruins 19 FPS, Kakariko 18–19, Ordon
-village 14 standing / 16 walking, Hyrule Field enemy areas 14.5, Palace of Twilight 14, Ordon widest
-view 10. With "Performance": Ordon village mostly 30, centre 22.6–24.4, Forest Temple 17.5–26.2.
-
-Also recorded by them and relevant here: **the minimap is not drawn in play**, and neither are Link's
-real-time shadow, water, bloom, depth of field or heat haze — the same class of gaps as §7.4b's list.
-Their known issue "some textures flicker" is still open, and Shader compilation stalls ~0.4 s per new
-stage with no warm-up bundle shipped.
-
-#### The §7.12 blocker is closed, and one class of comparison is now possible
-
-§7.12 said a three-way image comparison could not be produced because DuskOnVita "publishes no release
-and no VPK". That is no longer true: `DuskOnVita.vpk` (11,867,758 bytes, SHA-256
-`14c67742…8ed6b3`, verified against the published digest) is downloadable. **It does not make the
-perf comparison possible** — Vita3K cannot resolve frame rate (§7.8) — but it does make the
-**same-scene pixel comparison** possible, which is the one §7.12 was blocked on.
-
-**§7.16 narrows the last sentence**: the capture is now possible and has been done, but the two ports
-render at different widths (theirs 960, ours 738), so a same-scene pair is a comparison of two render
-resolutions, not a like-for-like quality check. What the release does give is a runnable third port
-whose structure can be inspected.
-
----
-
-### 7.16 DuskOnVita 0.9.0 runs here, and it does NOT letterbox — §7.12's geometry claim was wrong (2026-11-16)
-
-v0.9.0 (2026-11-14) is their first release with a VPK, so the third port is runnable here at last. It
-installs, boots and reaches live 3D gameplay in Vita3K. Receipts: `build_version: DuskOnVita 00.90 build
-72d8bc7d (2026-11-14)`, `arm_mhz: 444`, `gpu_mhz: 222`, `game_main_enter`.
-
-Setup, and three things that each cost a run:
-
-- **Verify the VPK first.** 11,867,758 B, SHA-256 `14c67742…8ed6b3`, checked against the digest in the
-  release notes before use.
-- **A symlink at their disc path does not work.** They read `ux0:data/twilight-vita/`, and a symlink there
-  gives `disc_search: ux0:data/twilight-vita/game.iso=no_image` because Vita3K does not resolve symlinks
-  through the guest filesystem. Use a real copy of the ISO (1.4 GB, reflinked).
-- `libshacccg.suprx` must be at `ur0:data/external/`, not only `ur0:data/` — same as §7.4b.
-- The first run died with `Unhandled SIGSEGV at rip 0x0000708900aeb38d` / `Unhandled access to
-  0x460000000`. That RIP is a **host** address, i.e. a Vita3K fault during their GXM start-up, and the
-  next run with identical inputs went through. Per-run emulator flake, not a defect.
-
-#### The measured finding: their picture is 960 wide, ours is 738
-
-Content box from the captures, non-black span inside the 1280x800 window:
-
-| port | content box (window coords) | width | height |
-|---|---|---:|---:|
-| DuskOnVita 0.9.0 | `(160,128)-(1119,671)` | **960** | 544 |
-| tp-vita | `(271,128)-(1008,671)` | **738** | 544 |
-
-Both start at the same `y` and both fill the Vita surface vertically. **Theirs fills the full 960 px;
-ours is pillarboxed to 738 with 111 px bars each side** (271 = 160 + 111). Three of their four captures
-agree on `960x544`; `dov090_4_04.png` reports `960x408` at `y=205`, which is a cutscene or a dark scene —
-**this detector cannot tell a black bar from a black picture**, so no conclusion rests on that frame.
-
-Quote `tools/compare_port_frames.py`'s own `_content_box` ("any non-zero channel"), never a re-measured
-guess: an ad-hoc harness at a `max > 8` threshold reported `960x391` at `y=206` for the same frame,
-because a louder threshold clips the near-black edge rows. If this document quotes a different box than
-the tool computes, a later session cannot reproduce it.
-
-**This corrects §7.12**, which said the geometry was "NOT the blocker, and that was checked" because
-"both ports letterbox to the same 738 px width at the same x". That came from *source*
-(`tests/gxm_state_test.cpp`'s `viewport(118,0,724,544)`) and from other ports' captures — never from a
-DuskOnVita frame, because none existed then. **The shipped build does not use the viewport its own test
-file states.** `KNOWN_GEOMETRY` now holds the measured box, and the `--port-status` note that they "ship
-no VPK" is corrected.
-
-**For any future diff:** our 738 px is genuinely *inside* their 960 px, so the intersection is
-legitimately 738 px wide — but a viewport difference that large means the pictures are **scaled
-differently**, not just offset. A pixel difference between them measures the resolution mismatch before
-it measures either port.
-
-#### What this does and does not unblock
-
-- **Unblocked:** three of three ports produce frames here, and structural questions about their UI can be
-  answered by looking at it.
-- **NOT unblocked:** a relative-quality claim. The widths differ, so a same-scene pair differs first by
-  that, and the scene must match too — they reach gameplay on their own schedule, ours needs the
-  frame-counted injector (§7.12c).
-- **Still not measurable:** performance. Vita3K's noise exceeds the differences (§7.8), and their
-  `prof_frame_p50_us` of 33.257 ms is the emulator pacing to the 30 Hz tick, **not** a hardware frame time.
-
-### 7.17 Celosia: a second Vita port with a patched vitaGL, and what is actually liftable (2026-11-16)
-
-**A survey of someone else's numbers, none of them verified here.** Read it for the ideas worth lifting and
-the tree you must not copy, not as evidence about this port.
-
-[`HenryKun55/celosia`](https://github.com/HenryKun55/celosia) — GPL-3.0, 76 stars, created 2026-10-02,
-last push 2026-11-15 — is *Shadow of the Colossus* (PS2) statically recompiled to C++ with PS2Recomp,
-rendering through Metal on Apple Silicon and **OpenGL ES / vitaGL on the Vita**. It is a second worked
-precedent for the static-recompilation route and the most detailed public record this project has found
-of vitaGL behaviour on real hardware.
-
-#### It patches vitaGL, and the base is verifiably our pin's child
-
-`PS2Recomp/ps2xRuntime/platform/vita/vitagl/celosia.patch`: **2,131 lines, 16 files, 107 hunks**, its
-additions prefixed `vglCelo*`. The base is not a comment — the patch's blob hash for `source/buffers.c`
-(`9ef4257`) resolves to vitaGL **`92888a7e`, 2026-09-24**, and our `vdpm` pin is **`2bdbe89`,
-2026-09-23**:
-
-    git merge-base --is-ancestor 2bdbe89 92888a7e  ->  true
-    git rev-list --count 2bdbe89..92888a7e          ->  1
-
-**Our installed r1488 is the direct parent of their patch base.** Best possible alignment, and the patch
-still does not apply: with `--fuzz=0` on a pristine `2bdbe89`, `buffers.c` fails outright and `gxm.c`
-loses 2 of 12 hunks; on **its own declared base** `92888a7e` it still fails 3 hunks and reports "patch
-unexpectedly ends in middle of line". **It is a published diff, not an applicable patch series** — read
-it as a *reference for what to change and why*, not as a vendor drop.
-
-#### Their measured wins, which are the part worth reading
-
-Theirs, measured on their port, none verified here:
-
-| Their switch / patch | What it fixes | Their number |
-|---|---|---|
-| `SOTC_VGL_CIRCULAR_KB=3072`, `_IMMEDIATE_KB=64` (from 32768/4096) | the defaults are grossly oversized; immediate mode is unused but was 4 MiB | **29 MB** of main-RAM + phycont pools back |
-| `vglCeloOwnMips` (`SOTC_GL_OWN_MIPS`) | vitaGL **ignored** the texels of mip levels >= 1 and downscaled level 0 with `sceGxmTransferDownscale`, an async GPU transfer | correctness |
-| `vglCeloTexImageSwizzled` | uploads in GXM Morton order instead of rows | texel locality |
-| `SOTC_GL_KEEP_LAYOUT` (`vglCeloLeanDraw` bit 2) | every mesh-pool switch re-patched the vertex program | **~170 re-patches/frame** avoided |
-| `celo_unif_copy` (`vglCeloLeanDraw` bit 0) | default uniform buffers copied via the faster path instead of `sceClibMemcpy` | 0.3–3 KB × ~1,500 draws/frame |
-| `vglCeloDepthTiled` | depth/stencil in GXM's tiled layout | **26.2 → 10.1 MB** depth traffic/frame |
-| `vglCeloUniformPool` | the uniform pool could come round onto uniforms the GPU had not read | ring hazard |
-| `SOTC_GL_KEEP_TARGETS` | **Vita3K** looks textures up in its colour-surface cache by address + stride and keeps a freed surface, so a later texture put there drew the old picture | emulator-only |
-| `SOTC_VGL_POOLS=console` | sizes vitaGL's pools as on a console inside Vita3K instead of from the emulator's larger free memory | testing honesty |
-| `SOTC_GL_INFLIGHT87` | GXM's **16 MB parameter buffer** holds every scene in flight; 2–3 frames in flight can overflow it into partial renders | they measured "matched, GPU idle between frames", so it **stays off** |
-
-**The 16 MB GXM parameter buffer is a hard structural bound on frames in flight**, independent of
-anything §7.13–7.14 counted. It is a third renderer constraint beside bandwidth and draw calls, and
-§7.14's model does not include it.
-
-**Their most valuable result is a negative:** they built the vitaGL-to-GXM **hybrid** by patching vitaGL
-itself, not by bolting a second backend beside it, and still do not ship it as the default. That agrees
-with §7.13 (the backend is not where the frame goes) and §7.14 (the levers' order).
-
-#### Tooling worth adopting, which does not depend on their patch
-
-`tools/vita_hot_order.py` + `vita_hot_order.ld` (hottest functions first in `.text`, from Vita3K profiles);
-`game/pgo/vita-pgo.tar.xz` (PGO profile data — we have never tried PGO); `vita_profile.py` / `vita3k.sh`
-(their harness, same shape as ours); and `-DPS2X_VITA_FUNCTION_SECTIONS=OFF`, i.e. they kept the A/B control.
-
-#### Do not copy their tree: it contains Sony binaries
-
-`PS2Recomp/ps2xRuntime/vita/module/` holds **real Sony modules**, not stubs — `libGL.suprx` 1,325,945 B,
-`libGLESv2.suprx` 1,995,561 B, `libIMGEGL.suprx` 97,629 B, `libgpu_es4_ext.suprx` 39,821 B,
-`libpvrPSP2_WSEGL.suprx` 17,869 B. Redistributing those is the same class of problem as shipping
-`libshacccg.suprx`. Take their **patch, tools and numbers**; take nothing from that directory, and do not
-vendor the repo wholesale.
-
-### 7.18 `vita_hot_order.py` exists now, and the flag that makes it work is not the obvious one (2026-11-16)
-
-**A tool, with a verified mechanism and no measured win.** §7.19 asks whether it is worth running here, and
-the answer is no; read this for the flag that works and the caveat about `-T` fragments.
-
-Celosia's hot-code idea is worth having and does not need their patch, so it is now a skill tool:
-`~/.roo/skills/vita-port/scripts/vita_hot_order.py`. It reads `<profile>:<elf>` pairs (Vita3K's
-`<thread> <pc> <lr> <weight>` samples), attributes each PC with `nm -n -S`, normalises each profile so a
-long run cannot outvote a short one, and writes a linker-script fragment listing the hottest functions
-first.
-
-**Verified here, not assumed:** the generator resolves PCs and orders by weight (a four-function fixture
-heavy-to-light emitted `main, fn_b, fn_c, fn_a`, reproduced twice); `-Wl,-T,<fragment>` works, with the
-symbols at offsets 0/4/8 in the requested order and `.rodata`/`.data`/`.bss` intact (36 sections);
-`-Wl,--section-ordering-file` **does not** work — `output section '.text.<name>' must already exist` —
-because GNU ld orders *output* sections, not per-function input sections (trap 26); and
-`-Wl,--sort-section,name` reorders alphabetically, not by heat.
-
-**Caveat before use on `tp-vita`:** a `-T` fragment can displace the default script's entry-point and
-segment handling (on a bare test link the entry point came out `0x0`). Our VPK goes through
-`vita-elf-create` and `vita-make-fself`, so the fragment must be checked against the whole packaging
-chain, not just the ELF.
-
-**What we still lack** to apply it here: `-ffunction-sections` is **not** enabled (our ELF has one
-`.text` and zero `.text.*` sections), and nothing in `tests/vita3k/` captures a CPU profile. So this is a
-prepared tool with a verified mechanism, not a measured win. Two prerequisites, both small: add
-`-ffunction-sections` behind an option, and run Vita3K with its profiler on for a scripted route.
-
-### 7.19 Whether hot-ordering buys anything HERE: the veneers are real, but only 47 are hot (2026-11-16)
-
-§7.18 prepared the tool. This measures whether it is worth running, and the answer is narrower than the
-premise. **Our `.text` is 18.55 MiB against a 16.00 MiB Thumb-2 `BL` reach**, so the constraint is real
-and the binary is 2.55 MiB over it. `arm-vita-eabi-nm` finds **316 `_veneer` symbols**, i.e. the linker
-genuinely had to stub 316 call sites.
-
-**But a veneer is not evidence that a hot call is paying for it.** Classifying all 316 by resolved target:
-
-| Class | Count | Hot? |
-|---|---:|---|
-| C++ runtime: exceptions, iostream, locale, chrono, filesystem | **156** | no |
-| other libc (`rename`, `vsnprintf`, `atan`, `remainderf`, `__init_vita_heap`, `__sinit`) | 72 | mostly no |
-| **libc inner loops** (`memcpy`, `memset`, `malloc`, `fwrite`, `strtol`, `fflush`, `fgets`) | **31** | **yes** |
-| **libgcc** (`__aeabi_idiv`, `__aeabi_ldivmod`, `__aeabi_l2d`, `__aeabi_ul2d`, `__aeabi_d2ulz`) | **11** | **yes** |
-| **`operator new` / `delete`** (`_Znwj`, `_ZdlPv`, `_Znaj`, `_ZdaPv`) | **5** | **yes** |
-
-**So roughly 47 of 316 are on hot paths**, and they are the ones that hurt: allocation, `memcpy`, integer
-division and float conversion are called from inside inner loops.
-
-**The mechanism is not "hot code is far from libc".** Measured: `memcpy` is at `0x82273cb8`, i.e. **18.45
-MiB into `.text`** — the very end. Every call site in the **first 2.45 MiB** is out of range of it. The
-veneers cluster around `0x813f8xxx` (≈4.0 MiB in), where code crossing the limit begins.
-
-**So the suspected fix was narrower than a profile-driven hot set:** move the ~47 hot libc/libgcc/
-new-delete targets from the end of `.text` to the **start**, put them in reach of the whole 18.55 MiB
-(18.55 < 2 × 16), and drop those veneers with no profile at all — a link-order fix for a few known
-libraries, not a hot-code problem.
-
-**What is NOT claimed:** that removing a veneer is worth a measurable frame time. A veneer is one extra
-branch through a stub plus an extra instruction fetch — plausibly a few cycles per call on a Cortex-A9
-with a small BTB, so 47 sites in inner loops is a real but small effect. **Vita3K cannot resolve it**
-(§7.8), so measure it on hardware or do not claim it.
-
-**Cheapest experiment:** ~~order the hot libraries first~~ — **DONE AND IT FAILED, §7.19b**. The only
-remaining option is function-granular: `-ffunction-sections` plus a CPU profile through
-`vita_hot_order.py` (§7.18).
-
-### 7.19b Experiment 1 was run and it FAILED: moving libc first made the hot veneers worse (2026-11-16)
-
-**A failed experiment, kept so it is not repeated.** The A/B is real and the numbers are the point; do not
-re-derive it.
-
-§7.19 predicted that moving the hot libc/libgcc/new-delete code to the front of `.text` would remove
-roughly 47 veneers **without any profile**. Tested on the real binary; it is **wrong** (trap 28).
-
-**Method, a controlled A/B.** The baseline ELF was saved, then relinked from the *identical* object files
-by replaying `build/CMakeFiles/tpv_vita.dir/link.txt` with one fragment inserted:
-
-    SECTIONS { .text.hotlibs : {
-        *libc.a:*(.text .text.*)  *libgcc.a:*(.text .text.*)
-        *libsupc++.a:*(.text .text.*)  *libstdc++.a:*(.text .text.*)  *libm.a:*(.text .text.*)
-    } }
-    INSERT BEFORE .text;
-
-`INSERT BEFORE` was chosen over §7.18's plain `-T` fragment because it merges with the default script
-instead of replacing it, and it worked: `.text.hotlibs` appeared at `0x81000010`, before `.text` at
-`0x81099580`, with 4,921 functions moved into it.
-
-**Result: worse.**
-
-| | total `_veneer` | **hot** veneers | cold veneers |
-|---|---:|---:|---:|
-| baseline | 316 | **58** | 258 |
-| libc-first | 310 | **90** | 220 |
-
-The total fell by 6 but the number that matters **rose by 32**. Only `_ZdlPv` and `__aeabi_d2ulz` were
-removed; `_ZnwjRKSt9nothrow_t`, `__aeabi_d2lz`, `__aeabi_f2lz`, `__aeabi_uidiv`, `calloc`, `realloc`,
-`sprintf` and `strcpy` were added.
-
-**Why: `libc.a` is not a pile of leaf functions.** It is mostly stdio, locale, time and filesystem code,
-so moving the whole archive forward put that bulk *between* the game code and where `memcpy`/`malloc` had
-been — and those two did not move at all (still ~18.4 MiB out, still out of range of the first 2.4 MiB).
-
-**Killed:** §7.19's claim that this needs no profile and no `-ffunction-sections`; it moves 4,921
-functions to reach perhaps 40. **Not killed:** the constraint (`.text` 18.55 MiB against a 16.00 MiB
-reach). The next step is function-granular: `-ffunction-sections`, a CPU profile, and
-`vita_hot_order.py` naming the ~40 targets individually. **No source change was made** — the build was
-restored and verified (316 veneers, `memcpy` back at `0x82273cb9`).
-
-### 7.19c Is any of this worth a frame? No — the arithmetic says ~0.05 % (2026-11-16)
-
-**The verdict, and the end of this thread.** If a future session is tempted by code layout, read this table
-first and stop.
-
-The constraint is real (`.text` 18.55 MiB vs a 16.00 MiB reach) and the cheap fix failed. This prices the
-remaining idea so nobody spends a day on it for nothing.
-
-A veneer costs **one extra branch** (caller `BL` -> stub -> `B` -> target) plus one extra instruction
-fetch. At 444 MHz a cycle is **2.25 ns**, and a 30 Hz frame is **33,333 us**:
-
-| cost/call | 1,000 calls/frame | 10,000 | 100,000 |
-|---|---:|---:|---:|
-| 2 cycles (4.5 ns) | 4.5 us (0.01 %) | 45 us (0.14 %) | 450 us (1.35 %) |
-| 4 cycles (9.0 ns) | 9.0 us (0.03 %) | 90 us (0.27 %) | 901 us (2.70 %) |
-| 10 cycles (22.5 ns) | 22.5 us (0.07 %) | 225 us (0.68 %) | 2,252 us (6.76 %) |
-
-**A realistic estimate.** ~40 hot veneers, each hit ~50 times a frame, at ~4 cycles: **18 us, i.e. 0.05 % of
-the frame.** Even the absurd ceiling — 100,000 veneered calls every frame at 10 cycles — is 6.8 %.
-
-**Verdict: hot-ordering has no measurable performance value on this port.** The sibling port's measured
-levers were 18–20 % for the backend and up to 40 % for non-renderer work; 0.05 % is not in the same
-conversation, and it sits far below the ~20 % noise floor here — which is why Vita3K could never have
-shown it (§7.8).
-
-**What it was worth, and neither is frame time:** (1) a **verified mechanism** for a port that needs it —
-`vita_hot_order.py` and the `-T`/`INSERT BEFORE` behaviour are confirmed on this toolchain (§7.18), and it
-pays where a hot set is far from its dependencies, which is not our situation (258 of 316 veneers are cold
-C++ runtime); (2) a **closed question with evidence**, so a future session reading §7.17's enthusiasm does
-not retry it.
-
-**Do not spend more time on code layout here.** If the frame budget matters, §11's answer stands: hardware.
-
 ## 7.20 What to implement for performance, in order, with what is already spent (2026-11-16)
 
 **This is the entry point to §7.13–§7.19.** Each of those sections exists to settle one line of the tables
@@ -2201,6 +1681,532 @@ Vita3K understates CPU-bound guest work by roughly an order of magnitude (§7.8)
 
 **Recommendation: get a console.** One hardware profile turns this ranked list from inference into a work
 order. Everything else here is already at the limit of what the emulator can honestly tell us.
+
+### 7.20a The evidence behind each row, in its original order
+
+Each subsection below settles exactly one row of §7.20 and keeps its number, so `§7.13`–`§7.19c` stay
+citable from `PLAN.md`, `tools/compare_port_frames.py` and elsewhere. Read one only when its row is the one
+you are acting on.
+
+#### Evidence — 7.13 vitaGL vs GXM vs hybrid: what the numbers actually say (2026-11-12)
+
+**This section is the evidence; §7.14 is the model built on it.** Each measurement appears once, here, and
+§7.14 cites it rather than reprinting it.
+
+The only port that ships **both** backends is DuskOnVita, so it is the only source of a same-scene,
+same-console A/B. Everything below is quoted from its `docs/benchmarks.csv` and `docs/PERFORMANCE.md`
+(a clone at `/tmp/DuskOnVita`), not estimated. **None of it was measured on this port.**
+
+##### The direct A/B: build g2c, PS Vita 1000, 444 MHz, 23 Oct
+
+| Scene | vitaGL | GXM + G2 | delta |
+|---|---:|---:|---:|
+| Link's house | 20.24 | 19.45 | **−3.9 %** |
+| Ordon, outside the house | 22.94 | 27.23 | **+18.7 %** |
+| Faron fight | 11.71 | 14.04 | **+19.9 %** |
+
+**It is not a constant win, and the sign flips with the scene.** Their own note says Link's house turned
+out to be *GPU-bound at full resolution* — at 100 % the GPU is the limit, so a cheaper CPU-side backend
+buys nothing and GXM's slightly different submission costs 4 %. The two scenes that gain ~19 % are the
+ones limited by the GX worker or the main thread.
+
+**This A/B is not a pure backend swap, and that matters.** `g2c-gxm` carries G2: resident geometry
+(`--vita-gxm-resident`), packed 8/16-bit vertex formats (`--vita-gxm-compact`) and native
+quads/strips/fans (`--vita-gxm-primitives`). There is **no published "GXM without G2" run**, so the
+backend's own share of that +19 % is unmeasured. Someone reading "+19 % for switching to GXM" would
+overstate the backend by an unknown amount.
+
+##### Why the ceiling is around 20 %, from the frame itself
+
+The GX worker's 37.9 ms per frame (g2c, Link's house) decomposes as:
+
+| part | ms | share |
+|---|---:|---:|
+| **backend draws** | **10.9** | **28.8 %** |
+| pipeline lookup | 8.2 | 21.6 % |
+| XF: matrices, lights | 6.0 | 15.8 % |
+| BP: TEV, blend, textures | 6.0 | 15.8 % |
+| draw parsing | 2.9 | 7.7 % |
+| CP: vertex arrays | 2.3 | 6.1 % |
+| draw setup, command loop, static lists | 1.6 | 4.2 % |
+
+A backend swap can only touch the **10.9 ms** of backend draws. Even making them free cannot exceed about a
+quarter of GX worker time, which is why the measured win is ~19 % on worker-bound scenes and negative where
+the GPU binds first.
+
+**The backend is also not where the frame goes:** *vitaGL calls* are **16.2 %** of the v61 frame, against
+42.9 % for vertex preparation and 20.1 % for GX decode. §7.14 has that profile in full and does the
+arithmetic. **So the renderer is the third-order lever, not the first** — the first-order levers move work
+off one core or remove it: threading, resident/static geometry, and the vertex path.
+
+##### What each non-renderer lever was worth (same backend)
+
+Ordon village centre, 10 Nov, one thing added at a time:
+
+| change | FPS | vs control |
+|---|---:|---:|
+| control (every new speed-up off) | 12.29 | — |
+| GX worker speed-ups only | 13.05 | +6.2 % |
+| + direct uniforms + actor fast paths | 13.87 | +12.9 % |
+| + Performance (picture-only, opt-in) | 15.60 | +26.9 % |
+
+Frame overlap alone, console, Ordon at 75 %: **20.5 → 25.9 FPS (+26 %)**. Clocks 333 → 444 MHz is ~1.33×
+on paper. Those are larger than the backend swap and they compose.
+
+##### Hybrid
+
+Two different things get called "hybrid", and only one is interesting:
+
+1. **Both backends present, selectable at run time** (what DuskOnVita actually does). Cost is one
+   function-pointer table; value is a fallback when one backend cannot start — their GXM writes
+   `gfx_init_failure` and exits if `sceGxmProgramCheck` or a pool allocation fails. That is a
+   robustness argument, not a performance one.
+2. **One scene drawn by both, split by pass.** This is the only hybrid with a performance story, and it
+   comes straight out of their gap list: their GXM backend does **not** yet do off-screen passes and
+   EFB copies — shadows, heat haze, the minimap — and some indirect-texture effects. Those are exactly
+   the paths vitaGL already implements correctly here (§7.6: 11,338 resolve ops, ~11/frame, all reaching
+   `draw_quad`). A hybrid that keeps GXM for the main pass and vitaGL for EFB-copy/off-screen passes
+   would run two GL contexts' worth of state on a 128 MiB GPU budget with no measured data to justify
+   it. **No one has measured it, and this document should not imply otherwise.**
+
+##### What this predicts for `tp-vita`, labelled as a prediction
+
+**All of the above is transfer from another codebase; no hardware run of this port has ever happened.**
+The closest measured anchor is **v61: 6.34 FPS in Link's house, 7.39 outside**, at 333 MHz on one core with
+every draw — not the 12–28 FPS the other port reports, because none of the levers that got it there exist
+here. This port requests 444 MHz (`vita/src/main.cpp:68-71`), so that anchor understates our headroom. The
+151.94 ms/frame figure in §7.6 is a Vita3K number and says nothing about a Cortex-A9. §7.14 turns this into
+a lever-by-lever model.
+
+##### 7.13.1 What "G2" means, and a contradiction in their own docs (2026-11-12)
+
+**"G2" is not a switch.** It is the **third build stage of the GXM backend** (`docs/ARCHITECTURE.md`):
+**G0** the backend table and per-frame draw digest; **G1** the SceGxm backend itself; **G2** the three
+optimisation switches below, all GXM-only and **all default `off`** in the options table:
+
+| switch | values | default | what it does |
+|---|---|---|---|
+| `--vita-gxm-resident` | on/off | **off** | certified geometry and static-list indices stay in a GPU arena instead of being copied every frame |
+| `--vita-gxm-compact` | off/on/colors | **off** | integer positions, normals and texture coords keep their GX format, scaled exactly in the vertex shader; `colors` also sends RGBA8 colours as bytes |
+| `--vita-gxm-primitives` | on/off | **off** | quads, strips and fans drawn natively, without index lists (patch `aurora/0008`) |
+
+**They are not GXM-specific in spirit, only in implementation.** Each removes a copy, a conversion or an
+index list — the same three things a vitaGL port could also stop doing. That is the transferable idea;
+the flags are not portable.
+
+**The contradiction resolves.** The README says "GXM + G2" while the options table defaults all three to
+`off`. Both are true in different modes: the **play profile** (`main_vita.cpp:89`) carries all three
+`on`, and a launch selecting **no** renderer option gets it implicitly (`implicitProfile`), so a normal
+launch has them **on**; selecting **any** renderer option falls back to the table defaults, **off**. So
+"G2 off" is the *explicit-option* state. The `g2c-gxm` benchmark rows do not record which case they were,
+so **the +18.7 % / +19.9 % figures may or may not include G2** — a gap in their record, not a conclusion
+here.
+
+**Where the backend's own share IS separable, and it is small.** Two later GXM additions carry console
+numbers (`main_vita.cpp:126-128`): the pipeline memo took the worker's pipeline step 10.7→5.1 ms in Ordon
+centre and 13.6→3.7 ms in Hyrule Field, and direct default-uniform writes took the **backend step
+24.0→23.1 ms — about 1 ms/frame**. That ~1 ms on a 24 ms step is the resolution a pure backend
+optimisation has, consistent with §7.13's ceiling.
+
+#### Evidence — 7.14 Which backend would theoretically be faster, and how much (2026-11-12)
+
+**A model, not a measurement.** Every number is tagged as measured or assumed so it can be attacked. The
+measurements it uses live in §7.13 and are printed there; this section only does arithmetic with them.
+
+**Short answer: direct GXM, by roughly 1.1x** — only on scenes whose bottleneck is the GX worker, and
+*slower* where the GPU binds first. Switching backend is the **third-largest** lever, behind threading
+and the vertex path.
+
+**Why: the frame does not spend its time in the backend.** Measured, v61 on the console, one core,
+333 MHz, 154 ms/frame (`DuskOnVita docs/PERFORMANCE.md`) — the canonical copy of this table:
+
+| component | ms | share | what a backend swap can do |
+|---|---:|---:|---|
+| vertex preparation | 66 | 42.9 % | **nothing** — happens before the backend |
+| GX command decode | 31 | 20.1 % | **nothing** — happens before the backend |
+| **vitaGL calls** | **25** | **16.2 %** | this is the whole target |
+| J3D draw building | 20 | 13.0 % | **nothing** |
+| game simulation | 12 | 7.8 % | **nothing** |
+
+Even making the GL layer **free** caps the win at 1.19x. The Amdahl rows below use measured components
+with **assumed** removal fractions — only the 154 ms total and the split are measured:
+
+| change | frame | speedup |
+|---|---:|---:|
+| backend only (vitaGL calls −60 %, an **estimate**) | 139.0 ms | **1.11x** |
+| + resident/packed geometry (vertex prep −75 %, assumed) | 89.5 ms | **1.72x** |
+| + GX thread and frame overlap (2 cores busy) | ~54 ms critical path | **~2.9x** |
+
+The ordering does not depend on the assumptions: a layer that is 16 % of the frame cannot beat changes that
+address 43 % and 20 % of it. **A second, independent ceiling agrees** (§7.13's GX-worker decomposition):
+backend draws are 10.9 ms of a 37.9 ms worker = 28.8 %, so a completely free backend buys at most **~22 % of
+frame time** if the worker is ~76 % of the frame.
+
+**Which backend for `tp-vita`.** §7.13's A/B is the answer: −3.9 % on a GPU-bound scene, +18.7 % and
++19.9 % on worker-bound ones, so "which is faster" is **scene-dependent by sign**. This port is **vitaGL
+only, single-threaded, no GX worker, no frame overlap, no resident geometry, no static display lists**, at
+ARM 444 / bus 222 / GPU 222 / xbar 166 (`vita/src/main.cpp:68-71`), where v61 was taken at stock 333 MHz —
+so that anchor **understates** our headroom. Two reasons it is not the first lever: our GL layer is a
+*smaller* share than 16 % (the 25 ms is the whole GL cost inside an already optimised pipeline, while our
+replay thread also does decode, state caching, fog-range LUT rebuilds and shadow-list work), and our nearest
+anchor — 6.34 FPS in the house, 7.39 outside — is *exactly* the single-core, stock-clock, every-draw
+configuration this port ships in, so the gap to the other port's 12–28 FPS is almost entirely the 1.7x and
+2.9x rows.
+
+**Stated plainly:** a direct-GXM rewrite is worth ~**1.1x** and is the most expensive of the three levers,
+because it means reimplementing the GL surface the replay path uses. A GX worker plus frame overlap is
+worth **more** and touches far less code. If the goal is frames, **the backend is the wrong thing to
+rewrite first**.
+
+**What would falsify this:** a run showing our per-frame `vitaGL` time is a much larger share than 16 %
+(instrument the replay's GL calls the way §7.9 instrumented decode — checkable without a console); a
+GXM-without-G2 benchmark, which does not exist (§7.13.1); or any hardware run at all.
+
+#### Evidence — 7.15 The x20 Link heap was live on Vita, and is now x3 — 10.79 MiB back (2026-11-16)
+
+**Trigger:** DuskOnVita published **v0.9.0 on 2026-11-14, the first release with a VPK**. Its commit
+`1b6472c4` ("Crash fix: Link's own heaps are three times the original's size, not twenty", patch
+`dusklight/0077`) describes a failure mode that matches ours, and the check found it live here.
+
+##### The defect was ours too, and the guard that should have stopped it was defeated
+
+`daAlink_c::setOriginalHeap` multiplies Link's two heaps by **20** under `#if TARGET_PC`:
+
+```cpp
+u32 size = ROUND(i_size, 16);
+#if TARGET_PC
+    size *= 20;   // "prevent mods from crashing with higher-quality models"
+#endif
+```
+
+**This tree defines `TARGET_PC=1` for the Vita build as well**
+(`cmake/GameABIConfig.cmake:7`), so a guard that reads like "PC only" was **live on Vita**. Link's
+archive heap became `0xA2800 * 20 + 0xA0 = 0xCB20A0` = **12.70 MiB**, taken in one piece from the game
+heap every time Link is created — a stage change, or the restart after a fall.
+
+Our own `dvd_trace.txt` had this recorded all along:
+
+```
+JKRExpHeap: create: size=0xCB20A0 aligned=0xCB20A0 parent=gameHeap parentFree=0x14385B0
+```
+
+Nobody connected `0xCB20A0` to `0xA2800 * 20`. The lesson is §8 trap 16's, one layer up: **a
+platform guard is only real if the macro is not also defined for your platform** — check the compile
+definitions, not the `#if`.
+
+##### Fix, and the proof
+
+`#if TARGET_VITA` now does `size *= 3` before the `#elif TARGET_PC`. Measured in the same run, same
+harness, only the multiplier changed:
+
+| | request | MiB |
+|---|---:|---:|
+| before | `0xCB20A0` | 12.70 |
+| after | `0x1E78A0` | **1.90** |
+
+Both decompose exactly as `base * N + 0xA0`: `0xA2800*20 + 0xA0` and `0xA2800*3 + 0xA0`. The shield
+heap moved the same way, `0x7D000*3 = 0x177000`. **10.79 MiB reclaimed per Link creation.** No
+`fatal.txt`, no `crash.log`, frames render normally (all five captures `738x544` at the expected bbox),
+and the host suites are unchanged: e2e 91 scenes / 14,266 checks / 0 failed, texture 3,780/0, crash
+PASS, printf clean.
+
+**Not proven:** that this was the §7.1/§7.12b abort. Those runs died in the **attract loop** while
+streaming demo resources, before Link exists, and the failure carried no size. This fix removes a real
+12.70 MiB single-block request that could strand a stage change or a post-fall restart; whether it
+retires the attract-loop abort is **untested**, and the `0xBF18265F` corrupted-size case remains
+unexplained. Do not write "the heap abort is fixed".
+
+##### Their v0.9.0 console numbers, for the record
+
+PS Vita 1000, 13 Nov, default "Speed-ups: Original": Snowpeak Ruins 19 FPS, Kakariko 18–19, Ordon
+village 14 standing / 16 walking, Hyrule Field enemy areas 14.5, Palace of Twilight 14, Ordon widest
+view 10. With "Performance": Ordon village mostly 30, centre 22.6–24.4, Forest Temple 17.5–26.2.
+
+Also recorded by them and relevant here: **the minimap is not drawn in play**, and neither are Link's
+real-time shadow, water, bloom, depth of field or heat haze — the same class of gaps as §7.4b's list.
+Their known issue "some textures flicker" is still open, and Shader compilation stalls ~0.4 s per new
+stage with no warm-up bundle shipped.
+
+##### The §7.12 blocker is closed, and one class of comparison is now possible
+
+§7.12 said a three-way image comparison could not be produced because DuskOnVita "publishes no release
+and no VPK". That is no longer true: `DuskOnVita.vpk` (11,867,758 bytes, SHA-256
+`14c67742…8ed6b3`, verified against the published digest) is downloadable. **It does not make the
+perf comparison possible** — Vita3K cannot resolve frame rate (§7.8) — but it does make the
+**same-scene pixel comparison** possible, which is the one §7.12 was blocked on.
+
+**§7.16 narrows the last sentence**: the capture is now possible and has been done, but the two ports
+render at different widths (theirs 960, ours 738), so a same-scene pair is a comparison of two render
+resolutions, not a like-for-like quality check. What the release does give is a runnable third port
+whose structure can be inspected.
+
+---
+
+#### Evidence — 7.16 DuskOnVita 0.9.0 runs here, and it does NOT letterbox — §7.12's geometry claim was wrong (2026-11-16)
+
+v0.9.0 (2026-11-14) is their first release with a VPK, so the third port is runnable here at last. It
+installs, boots and reaches live 3D gameplay in Vita3K. Receipts: `build_version: DuskOnVita 00.90 build
+72d8bc7d (2026-11-14)`, `arm_mhz: 444`, `gpu_mhz: 222`, `game_main_enter`.
+
+Setup, and three things that each cost a run:
+
+- **Verify the VPK first.** 11,867,758 B, SHA-256 `14c67742…8ed6b3`, checked against the digest in the
+  release notes before use.
+- **A symlink at their disc path does not work.** They read `ux0:data/twilight-vita/`, and a symlink there
+  gives `disc_search: ux0:data/twilight-vita/game.iso=no_image` because Vita3K does not resolve symlinks
+  through the guest filesystem. Use a real copy of the ISO (1.4 GB, reflinked).
+- `libshacccg.suprx` must be at `ur0:data/external/`, not only `ur0:data/` — same as §7.4b.
+- The first run died with `Unhandled SIGSEGV at rip 0x0000708900aeb38d` / `Unhandled access to
+  0x460000000`. That RIP is a **host** address, i.e. a Vita3K fault during their GXM start-up, and the
+  next run with identical inputs went through. Per-run emulator flake, not a defect.
+
+##### The measured finding: their picture is 960 wide, ours is 738
+
+Content box from the captures, non-black span inside the 1280x800 window:
+
+| port | content box (window coords) | width | height |
+|---|---|---:|---:|
+| DuskOnVita 0.9.0 | `(160,128)-(1119,671)` | **960** | 544 |
+| tp-vita | `(271,128)-(1008,671)` | **738** | 544 |
+
+Both start at the same `y` and both fill the Vita surface vertically. **Theirs fills the full 960 px;
+ours is pillarboxed to 738 with 111 px bars each side** (271 = 160 + 111). Three of their four captures
+agree on `960x544`; `dov090_4_04.png` reports `960x408` at `y=205`, which is a cutscene or a dark scene —
+**this detector cannot tell a black bar from a black picture**, so no conclusion rests on that frame.
+
+Quote `tools/compare_port_frames.py`'s own `_content_box` ("any non-zero channel"), never a re-measured
+guess: an ad-hoc harness at a `max > 8` threshold reported `960x391` at `y=206` for the same frame,
+because a louder threshold clips the near-black edge rows. If this document quotes a different box than
+the tool computes, a later session cannot reproduce it.
+
+**This corrects §7.12**, which said the geometry was "NOT the blocker, and that was checked" because
+"both ports letterbox to the same 738 px width at the same x". That came from *source*
+(`tests/gxm_state_test.cpp`'s `viewport(118,0,724,544)`) and from other ports' captures — never from a
+DuskOnVita frame, because none existed then. **The shipped build does not use the viewport its own test
+file states.** `KNOWN_GEOMETRY` now holds the measured box, and the `--port-status` note that they "ship
+no VPK" is corrected.
+
+**For any future diff:** our 738 px is genuinely *inside* their 960 px, so the intersection is
+legitimately 738 px wide — but a viewport difference that large means the pictures are **scaled
+differently**, not just offset. A pixel difference between them measures the resolution mismatch before
+it measures either port.
+
+##### What this does and does not unblock
+
+- **Unblocked:** three of three ports produce frames here, and structural questions about their UI can be
+  answered by looking at it.
+- **NOT unblocked:** a relative-quality claim. The widths differ, so a same-scene pair differs first by
+  that, and the scene must match too — they reach gameplay on their own schedule, ours needs the
+  frame-counted injector (§7.12c).
+- **Still not measurable:** performance. Vita3K's noise exceeds the differences (§7.8), and their
+  `prof_frame_p50_us` of 33.257 ms is the emulator pacing to the 30 Hz tick, **not** a hardware frame time.
+
+#### Evidence — 7.17 Celosia: a second Vita port with a patched vitaGL, and what is actually liftable (2026-11-16)
+
+**A survey of someone else's numbers, none of them verified here.** Read it for the ideas worth lifting and
+the tree you must not copy, not as evidence about this port.
+
+[`HenryKun55/celosia`](https://github.com/HenryKun55/celosia) — GPL-3.0, 76 stars, created 2026-10-02,
+last push 2026-11-15 — is *Shadow of the Colossus* (PS2) statically recompiled to C++ with PS2Recomp,
+rendering through Metal on Apple Silicon and **OpenGL ES / vitaGL on the Vita**. It is a second worked
+precedent for the static-recompilation route and the most detailed public record this project has found
+of vitaGL behaviour on real hardware.
+
+##### It patches vitaGL, and the base is verifiably our pin's child
+
+`PS2Recomp/ps2xRuntime/platform/vita/vitagl/celosia.patch`: **2,131 lines, 16 files, 107 hunks**, its
+additions prefixed `vglCelo*`. The base is not a comment — the patch's blob hash for `source/buffers.c`
+(`9ef4257`) resolves to vitaGL **`92888a7e`, 2026-09-24**, and our `vdpm` pin is **`2bdbe89`,
+2026-09-23**:
+
+    git merge-base --is-ancestor 2bdbe89 92888a7e  ->  true
+    git rev-list --count 2bdbe89..92888a7e          ->  1
+
+**Our installed r1488 is the direct parent of their patch base.** Best possible alignment, and the patch
+still does not apply: with `--fuzz=0` on a pristine `2bdbe89`, `buffers.c` fails outright and `gxm.c`
+loses 2 of 12 hunks; on **its own declared base** `92888a7e` it still fails 3 hunks and reports "patch
+unexpectedly ends in middle of line". **It is a published diff, not an applicable patch series** — read
+it as a *reference for what to change and why*, not as a vendor drop.
+
+##### Their measured wins, which are the part worth reading
+
+Theirs, measured on their port, none verified here:
+
+| Their switch / patch | What it fixes | Their number |
+|---|---|---|
+| `SOTC_VGL_CIRCULAR_KB=3072`, `_IMMEDIATE_KB=64` (from 32768/4096) | the defaults are grossly oversized; immediate mode is unused but was 4 MiB | **29 MB** of main-RAM + phycont pools back |
+| `vglCeloOwnMips` (`SOTC_GL_OWN_MIPS`) | vitaGL **ignored** the texels of mip levels >= 1 and downscaled level 0 with `sceGxmTransferDownscale`, an async GPU transfer | correctness |
+| `vglCeloTexImageSwizzled` | uploads in GXM Morton order instead of rows | texel locality |
+| `SOTC_GL_KEEP_LAYOUT` (`vglCeloLeanDraw` bit 2) | every mesh-pool switch re-patched the vertex program | **~170 re-patches/frame** avoided |
+| `celo_unif_copy` (`vglCeloLeanDraw` bit 0) | default uniform buffers copied via the faster path instead of `sceClibMemcpy` | 0.3–3 KB × ~1,500 draws/frame |
+| `vglCeloDepthTiled` | depth/stencil in GXM's tiled layout | **26.2 → 10.1 MB** depth traffic/frame |
+| `vglCeloUniformPool` | the uniform pool could come round onto uniforms the GPU had not read | ring hazard |
+| `SOTC_GL_KEEP_TARGETS` | **Vita3K** looks textures up in its colour-surface cache by address + stride and keeps a freed surface, so a later texture put there drew the old picture | emulator-only |
+| `SOTC_VGL_POOLS=console` | sizes vitaGL's pools as on a console inside Vita3K instead of from the emulator's larger free memory | testing honesty |
+| `SOTC_GL_INFLIGHT87` | GXM's **16 MB parameter buffer** holds every scene in flight; 2–3 frames in flight can overflow it into partial renders | they measured "matched, GPU idle between frames", so it **stays off** |
+
+**The 16 MB GXM parameter buffer is a hard structural bound on frames in flight**, independent of
+anything §7.13–7.14 counted. It is a third renderer constraint beside bandwidth and draw calls, and
+§7.14's model does not include it.
+
+**Their most valuable result is a negative:** they built the vitaGL-to-GXM **hybrid** by patching vitaGL
+itself, not by bolting a second backend beside it, and still do not ship it as the default. That agrees
+with §7.13 (the backend is not where the frame goes) and §7.14 (the levers' order).
+
+##### Tooling worth adopting, which does not depend on their patch
+
+`tools/vita_hot_order.py` + `vita_hot_order.ld` (hottest functions first in `.text`, from Vita3K profiles);
+`game/pgo/vita-pgo.tar.xz` (PGO profile data — we have never tried PGO); `vita_profile.py` / `vita3k.sh`
+(their harness, same shape as ours); and `-DPS2X_VITA_FUNCTION_SECTIONS=OFF`, i.e. they kept the A/B control.
+
+##### Do not copy their tree: it contains Sony binaries
+
+`PS2Recomp/ps2xRuntime/vita/module/` holds **real Sony modules**, not stubs — `libGL.suprx` 1,325,945 B,
+`libGLESv2.suprx` 1,995,561 B, `libIMGEGL.suprx` 97,629 B, `libgpu_es4_ext.suprx` 39,821 B,
+`libpvrPSP2_WSEGL.suprx` 17,869 B. Redistributing those is the same class of problem as shipping
+`libshacccg.suprx`. Take their **patch, tools and numbers**; take nothing from that directory, and do not
+vendor the repo wholesale.
+
+#### Evidence — 7.18 `vita_hot_order.py` exists now, and the flag that makes it work is not the obvious one (2026-11-16)
+
+**A tool, with a verified mechanism and no measured win.** §7.19 asks whether it is worth running here, and
+the answer is no; read this for the flag that works and the caveat about `-T` fragments.
+
+Celosia's hot-code idea is worth having and does not need their patch, so it is now a skill tool:
+`~/.roo/skills/vita-port/scripts/vita_hot_order.py`. It reads `<profile>:<elf>` pairs (Vita3K's
+`<thread> <pc> <lr> <weight>` samples), attributes each PC with `nm -n -S`, normalises each profile so a
+long run cannot outvote a short one, and writes a linker-script fragment listing the hottest functions
+first.
+
+**Verified here, not assumed:** the generator resolves PCs and orders by weight (a four-function fixture
+heavy-to-light emitted `main, fn_b, fn_c, fn_a`, reproduced twice); `-Wl,-T,<fragment>` works, with the
+symbols at offsets 0/4/8 in the requested order and `.rodata`/`.data`/`.bss` intact (36 sections);
+`-Wl,--section-ordering-file` **does not** work — `output section '.text.<name>' must already exist` —
+because GNU ld orders *output* sections, not per-function input sections (trap 26); and
+`-Wl,--sort-section,name` reorders alphabetically, not by heat.
+
+**Caveat before use on `tp-vita`:** a `-T` fragment can displace the default script's entry-point and
+segment handling (on a bare test link the entry point came out `0x0`). Our VPK goes through
+`vita-elf-create` and `vita-make-fself`, so the fragment must be checked against the whole packaging
+chain, not just the ELF.
+
+**What we still lack** to apply it here: `-ffunction-sections` is **not** enabled (our ELF has one
+`.text` and zero `.text.*` sections), and nothing in `tests/vita3k/` captures a CPU profile. So this is a
+prepared tool with a verified mechanism, not a measured win. Two prerequisites, both small: add
+`-ffunction-sections` behind an option, and run Vita3K with its profiler on for a scripted route.
+
+#### Evidence — 7.19 Whether hot-ordering buys anything HERE: the veneers are real, but only 47 are hot (2026-11-16)
+
+§7.18 prepared the tool. This measures whether it is worth running, and the answer is narrower than the
+premise. **Our `.text` is 18.55 MiB against a 16.00 MiB Thumb-2 `BL` reach**, so the constraint is real
+and the binary is 2.55 MiB over it. `arm-vita-eabi-nm` finds **316 `_veneer` symbols**, i.e. the linker
+genuinely had to stub 316 call sites.
+
+**But a veneer is not evidence that a hot call is paying for it.** Classifying all 316 by resolved target:
+
+| Class | Count | Hot? |
+|---|---:|---|
+| C++ runtime: exceptions, iostream, locale, chrono, filesystem | **156** | no |
+| other libc (`rename`, `vsnprintf`, `atan`, `remainderf`, `__init_vita_heap`, `__sinit`) | 72 | mostly no |
+| **libc inner loops** (`memcpy`, `memset`, `malloc`, `fwrite`, `strtol`, `fflush`, `fgets`) | **31** | **yes** |
+| **libgcc** (`__aeabi_idiv`, `__aeabi_ldivmod`, `__aeabi_l2d`, `__aeabi_ul2d`, `__aeabi_d2ulz`) | **11** | **yes** |
+| **`operator new` / `delete`** (`_Znwj`, `_ZdlPv`, `_Znaj`, `_ZdaPv`) | **5** | **yes** |
+
+**So roughly 47 of 316 are on hot paths**, and they are the ones that hurt: allocation, `memcpy`, integer
+division and float conversion are called from inside inner loops.
+
+**The mechanism is not "hot code is far from libc".** Measured: `memcpy` is at `0x82273cb8`, i.e. **18.45
+MiB into `.text`** — the very end. Every call site in the **first 2.45 MiB** is out of range of it. The
+veneers cluster around `0x813f8xxx` (≈4.0 MiB in), where code crossing the limit begins.
+
+**So the suspected fix was narrower than a profile-driven hot set:** move the ~47 hot libc/libgcc/
+new-delete targets from the end of `.text` to the **start**, put them in reach of the whole 18.55 MiB
+(18.55 < 2 × 16), and drop those veneers with no profile at all — a link-order fix for a few known
+libraries, not a hot-code problem.
+
+**What is NOT claimed:** that removing a veneer is worth a measurable frame time. A veneer is one extra
+branch through a stub plus an extra instruction fetch — plausibly a few cycles per call on a Cortex-A9
+with a small BTB, so 47 sites in inner loops is a real but small effect. **Vita3K cannot resolve it**
+(§7.8), so measure it on hardware or do not claim it.
+
+**Cheapest experiment:** ~~order the hot libraries first~~ — **DONE AND IT FAILED, §7.19b**. The only
+remaining option is function-granular: `-ffunction-sections` plus a CPU profile through
+`vita_hot_order.py` (§7.18).
+
+#### Evidence — 7.19b Experiment 1 was run and it FAILED: moving libc first made the hot veneers worse (2026-11-16)
+
+**A failed experiment, kept so it is not repeated.** The A/B is real and the numbers are the point; do not
+re-derive it.
+
+§7.19 predicted that moving the hot libc/libgcc/new-delete code to the front of `.text` would remove
+roughly 47 veneers **without any profile**. Tested on the real binary; it is **wrong** (trap 28).
+
+**Method, a controlled A/B.** The baseline ELF was saved, then relinked from the *identical* object files
+by replaying `build/CMakeFiles/tpv_vita.dir/link.txt` with one fragment inserted:
+
+    SECTIONS { .text.hotlibs : {
+        *libc.a:*(.text .text.*)  *libgcc.a:*(.text .text.*)
+        *libsupc++.a:*(.text .text.*)  *libstdc++.a:*(.text .text.*)  *libm.a:*(.text .text.*)
+    } }
+    INSERT BEFORE .text;
+
+`INSERT BEFORE` was chosen over §7.18's plain `-T` fragment because it merges with the default script
+instead of replacing it, and it worked: `.text.hotlibs` appeared at `0x81000010`, before `.text` at
+`0x81099580`, with 4,921 functions moved into it.
+
+**Result: worse.**
+
+| | total `_veneer` | **hot** veneers | cold veneers |
+|---|---:|---:|---:|
+| baseline | 316 | **58** | 258 |
+| libc-first | 310 | **90** | 220 |
+
+The total fell by 6 but the number that matters **rose by 32**. Only `_ZdlPv` and `__aeabi_d2ulz` were
+removed; `_ZnwjRKSt9nothrow_t`, `__aeabi_d2lz`, `__aeabi_f2lz`, `__aeabi_uidiv`, `calloc`, `realloc`,
+`sprintf` and `strcpy` were added.
+
+**Why: `libc.a` is not a pile of leaf functions.** It is mostly stdio, locale, time and filesystem code,
+so moving the whole archive forward put that bulk *between* the game code and where `memcpy`/`malloc` had
+been — and those two did not move at all (still ~18.4 MiB out, still out of range of the first 2.4 MiB).
+
+**Killed:** §7.19's claim that this needs no profile and no `-ffunction-sections`; it moves 4,921
+functions to reach perhaps 40. **Not killed:** the constraint (`.text` 18.55 MiB against a 16.00 MiB
+reach). The next step is function-granular: `-ffunction-sections`, a CPU profile, and
+`vita_hot_order.py` naming the ~40 targets individually. **No source change was made** — the build was
+restored and verified (316 veneers, `memcpy` back at `0x82273cb9`).
+
+#### Evidence — 7.19c Is any of this worth a frame? No — the arithmetic says ~0.05 % (2026-11-16)
+
+**The verdict, and the end of this thread.** If a future session is tempted by code layout, read this table
+first and stop.
+
+The constraint is real (`.text` 18.55 MiB vs a 16.00 MiB reach) and the cheap fix failed. This prices the
+remaining idea so nobody spends a day on it for nothing.
+
+A veneer costs **one extra branch** (caller `BL` -> stub -> `B` -> target) plus one extra instruction
+fetch. At 444 MHz a cycle is **2.25 ns**, and a 30 Hz frame is **33,333 us**:
+
+| cost/call | 1,000 calls/frame | 10,000 | 100,000 |
+|---|---:|---:|---:|
+| 2 cycles (4.5 ns) | 4.5 us (0.01 %) | 45 us (0.14 %) | 450 us (1.35 %) |
+| 4 cycles (9.0 ns) | 9.0 us (0.03 %) | 90 us (0.27 %) | 901 us (2.70 %) |
+| 10 cycles (22.5 ns) | 22.5 us (0.07 %) | 225 us (0.68 %) | 2,252 us (6.76 %) |
+
+**A realistic estimate.** ~40 hot veneers, each hit ~50 times a frame, at ~4 cycles: **18 us, i.e. 0.05 % of
+the frame.** Even the absurd ceiling — 100,000 veneered calls every frame at 10 cycles — is 6.8 %.
+
+**Verdict: hot-ordering has no measurable performance value on this port.** The sibling port's measured
+levers were 18–20 % for the backend and up to 40 % for non-renderer work; 0.05 % is not in the same
+conversation, and it sits far below the ~20 % noise floor here — which is why Vita3K could never have
+shown it (§7.8).
+
+**What it was worth, and neither is frame time:** (1) a **verified mechanism** for a port that needs it —
+`vita_hot_order.py` and the `-T`/`INSERT BEFORE` behaviour are confirmed on this toolchain (§7.18), and it
+pays where a hot set is far from its dependencies, which is not our situation (258 of 316 veneers are cold
+C++ runtime); (2) a **closed question with evidence**, so a future session reading §7.17's enthusiasm does
+not retry it.
+
+**Do not spend more time on code layout here.** If the frame budget matters, §11's answer stands: hardware.
 
 ### 7.21 Where OUR frame actually goes, measured — and it vindicates Rank 1 (2026-11-16)
 
