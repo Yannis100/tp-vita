@@ -1613,6 +1613,9 @@ unchanged (exit 1), so the guard still catches the accident it was built for.
 
 ### 7.13 vitaGL vs GXM vs hybrid: what the numbers actually say (2026-11-12)
 
+**This section is the evidence; §7.14 is the model built on it.** Each measurement appears once, here, and
+§7.14 cites it rather than reprinting it.
+
 The only port that ships **both** backends is DuskOnVita, so it is the only source of a same-scene,
 same-console A/B. Everything below is quoted from its `docs/benchmarks.csv` and `docs/PERFORMANCE.md`
 (a clone at `/tmp/DuskOnVita`), not estimated. **None of it was measured on this port.**
@@ -1650,16 +1653,14 @@ The GX worker's 37.9 ms per frame (g2c, Link's house) decomposes as:
 | CP: vertex arrays | 2.3 | 6.1 % |
 | draw setup, command loop, static lists | 1.6 | 4.2 % |
 
-A backend swap can only touch the **10.9 ms** of backend draws. Even making them free cannot exceed
-about a quarter of GX worker time, which is why the measured win is ~19 % on worker-bound scenes and
-negative where the GPU binds first.
+A backend swap can only touch the **10.9 ms** of backend draws. Even making them free cannot exceed about a
+quarter of GX worker time, which is why the measured win is ~19 % on worker-bound scenes and negative where
+the GPU binds first.
 
-And the backend is not where the frame goes. Their first console profile (v61, one core, 333 MHz,
-154 ms/frame) put **vertex preparation at 66 ms = 42.9 %**, GX decode 31 ms = 20.1 %, *vitaGL calls*
-25 ms = 16.2 %, J3D draw building 20 ms = 13.0 %, simulation 12 ms = 7.8 %.
-
-**So the renderer is the third-order lever, not the first.** The first-order levers are the ones that
-move work off one core or remove it: threading, resident/static geometry, and the vertex path.
+**The backend is also not where the frame goes:** *vitaGL calls* are **16.2 %** of the v61 frame, against
+42.9 % for vertex preparation and 20.1 % for GX decode. §7.14 has that profile in full and does the
+arithmetic. **So the renderer is the third-order lever, not the first** — the first-order levers move work
+off one core or remove it: threading, resident/static geometry, and the vertex path.
 
 #### What each non-renderer lever was worth (same backend)
 
@@ -1693,13 +1694,12 @@ Two different things get called "hybrid", and only one is interesting:
 
 #### What this predicts for `tp-vita`, labelled as a prediction
 
-The closest measured point is **v61: 6.34 FPS in Link's house, 7.39 outside, at 333 MHz on one core with
-every draw** — the band to expect from the current build on hardware, not the 12–28 FPS the other port
-reports, because none of the levers that got it there exist here. This port does request 444 MHz
-(`vita/src/main.cpp:68-71`), so that anchor **understates** our headroom. **What is NOT claimed:** no
-hardware run of this port has ever happened, so all of the above is transfer from a different codebase.
-The 151.94 ms/frame figure in §7.6 is a Vita3K number and says nothing about a Cortex-A9. §7.14 carries
-the lever-by-lever version of this argument.
+**All of the above is transfer from another codebase; no hardware run of this port has ever happened.**
+The closest measured anchor is **v61: 6.34 FPS in Link's house, 7.39 outside**, at 333 MHz on one core with
+every draw — not the 12–28 FPS the other port reports, because none of the levers that got it there exist
+here. This port requests 444 MHz (`vita/src/main.cpp:68-71`), so that anchor understates our headroom. The
+151.94 ms/frame figure in §7.6 is a Vita3K number and says nothing about a Cortex-A9. §7.14 turns this into
+a lever-by-lever model.
 
 #### 7.13.1 What "G2" means, and a contradiction in their own docs (2026-11-12)
 
@@ -1733,14 +1733,15 @@ optimisation has, consistent with §7.13's ceiling.
 
 ### 7.14 Which backend would theoretically be faster, and how much (2026-11-12)
 
-**A model, not a measurement.** Every number is tagged as measured or assumed so it can be attacked.
+**A model, not a measurement.** Every number is tagged as measured or assumed so it can be attacked. The
+measurements it uses live in §7.13 and are printed there; this section only does arithmetic with them.
 
 **Short answer: direct GXM, by roughly 1.1x** — only on scenes whose bottleneck is the GX worker, and
 *slower* where the GPU binds first. Switching backend is the **third-largest** lever, behind threading
 and the vertex path.
 
 **Why: the frame does not spend its time in the backend.** Measured, v61 on the console, one core,
-333 MHz, 154 ms/frame (`DuskOnVita docs/PERFORMANCE.md`):
+333 MHz, 154 ms/frame (`DuskOnVita docs/PERFORMANCE.md`) — the canonical copy of this table:
 
 | component | ms | share | what a backend swap can do |
 |---|---:|---:|---|
@@ -1759,21 +1760,21 @@ with **assumed** removal fractions — only the 154 ms total and the split are m
 | + resident/packed geometry (vertex prep −75 %, assumed) | 89.5 ms | **1.72x** |
 | + GX thread and frame overlap (2 cores busy) | ~54 ms critical path | **~2.9x** |
 
-The ordering does not depend on the assumptions: a layer that is 16 % of the frame cannot beat changes
-that address 43 % and 20 % of it. **A second, independent ceiling agrees** — in g2c's GX worker (37.9 ms
-total) backend draws are 10.9 ms (28.8 %), so a completely free backend buys at most **~22 % of frame
-time** if the worker is ~76 % of the frame.
+The ordering does not depend on the assumptions: a layer that is 16 % of the frame cannot beat changes that
+address 43 % and 20 % of it. **A second, independent ceiling agrees** (§7.13's GX-worker decomposition):
+backend draws are 10.9 ms of a 37.9 ms worker = 28.8 %, so a completely free backend buys at most **~22 % of
+frame time** if the worker is ~76 % of the frame.
 
-**Which backend for `tp-vita`.** The measured A/B is §7.13's table: −3.9 % on a GPU-bound scene, +18.7 % and
+**Which backend for `tp-vita`.** §7.13's A/B is the answer: −3.9 % on a GPU-bound scene, +18.7 % and
 +19.9 % on worker-bound ones, so "which is faster" is **scene-dependent by sign**. This port is **vitaGL
-only, single-threaded, no GX worker, no frame overlap, no resident geometry, no static display lists**, and
-it sets ARM 444 / bus 222 / GPU 222 / xbar 166 (`vita/src/main.cpp:68-71`), where v61 was taken at stock
-333 MHz — so that anchor **understates** our headroom. Two reasons it is not the first lever: our GL layer
-is a *smaller* share than 16 % (the 25 ms is the whole GL cost inside an already optimised pipeline, while
-our replay thread also does decode, state caching, fog-range LUT rebuilds and shadow-list work), and our
-nearest anchor — 6.34 FPS in the house, 7.39 outside — is *exactly* the single-core, stock-clock,
-every-draw configuration this port ships in, so the gap to the other port's 12–28 FPS is almost entirely
-the 1.7x and 2.9x rows.
+only, single-threaded, no GX worker, no frame overlap, no resident geometry, no static display lists**, at
+ARM 444 / bus 222 / GPU 222 / xbar 166 (`vita/src/main.cpp:68-71`), where v61 was taken at stock 333 MHz —
+so that anchor **understates** our headroom. Two reasons it is not the first lever: our GL layer is a
+*smaller* share than 16 % (the 25 ms is the whole GL cost inside an already optimised pipeline, while our
+replay thread also does decode, state caching, fog-range LUT rebuilds and shadow-list work), and our nearest
+anchor — 6.34 FPS in the house, 7.39 outside — is *exactly* the single-core, stock-clock, every-draw
+configuration this port ships in, so the gap to the other port's 12–28 FPS is almost entirely the 1.7x and
+2.9x rows.
 
 **Stated plainly:** a direct-GXM rewrite is worth ~**1.1x** and is the most expensive of the three levers,
 because it means reimplementing the GL surface the replay path uses. A GX worker plus frame overlap is
