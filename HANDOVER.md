@@ -1921,6 +1921,9 @@ it measures either port.
 
 ### 7.17 Celosia: a second Vita port with a patched vitaGL, and what is actually liftable (2026-11-16)
 
+**A survey of someone else's numbers, none of them verified here.** Read it for the ideas worth lifting and
+the tree you must not copy, not as evidence about this port.
+
 [`HenryKun55/celosia`](https://github.com/HenryKun55/celosia) — GPL-3.0, 76 stars, created 2026-10-02,
 last push 2026-11-15 — is *Shadow of the Colossus* (PS2) statically recompiled to C++ with PS2Recomp,
 rendering through Metal on Apple Silicon and **OpenGL ES / vitaGL on the Vita**. It is a second worked
@@ -1983,6 +1986,9 @@ with §7.13 (the backend is not where the frame goes) and §7.14 (the levers' or
 vendor the repo wholesale.
 
 ### 7.18 `vita_hot_order.py` exists now, and the flag that makes it work is not the obvious one (2026-11-16)
+
+**A tool, with a verified mechanism and no measured win.** §7.19 asks whether it is worth running here, and
+the answer is no; read this for the flag that works and the caveat about `-T` fragments.
 
 Celosia's hot-code idea is worth having and does not need their patch, so it is now a skill tool:
 `~/.roo/skills/vita-port/scripts/vita_hot_order.py`. It reads `<profile>:<elf>` pairs (Vita3K's
@@ -2047,6 +2053,9 @@ remaining option is function-granular: `-ffunction-sections` plus a CPU profile 
 
 ### 7.19b Experiment 1 was run and it FAILED: moving libc first made the hot veneers worse (2026-11-16)
 
+**A failed experiment, kept so it is not repeated.** The A/B is real and the numbers are the point; do not
+re-derive it.
+
 §7.19 predicted that moving the hot libc/libgcc/new-delete code to the front of `.text` would remove
 roughly 47 veneers **without any profile**. Tested on the real binary; it is **wrong** (trap 28).
 
@@ -2086,6 +2095,9 @@ restored and verified (316 veneers, `memcpy` back at `0x82273cb9`).
 
 ### 7.19c Is any of this worth a frame? No — the arithmetic says ~0.05 % (2026-11-16)
 
+**The verdict, and the end of this thread.** If a future session is tempted by code layout, read this table
+first and stop.
+
 The constraint is real (`.text` 18.55 MiB vs a 16.00 MiB reach) and the cheap fix failed. This prices the
 remaining idea so nobody spends a day on it for nothing.
 
@@ -2116,16 +2128,21 @@ not retry it.
 
 ## 7.20 What to implement for performance, in order, with what is already spent (2026-11-16)
 
-Asked directly, so this is the ranked answer grounded in measurements already in this document. **Three
-of the obvious levers are already spent or already closed**, and saying so first stops the next session
-from re-opening them:
+**This is the entry point to §7.13–§7.19.** Each of those sections exists to settle one line of the tables
+below, and none of them needs to be read first.
+
+Asked directly, so this is the ranked answer grounded in measurements already in this document. **Most of the
+obvious levers are already spent or already closed**, and saying so first stops the next session from
+re-opening them:
 
 | lever | state | evidence |
 |---|---|---|
 | clocks 333 -> 444 MHz | **already done** | `vita/src/main.cpp:68-71` sets ARM 444 / bus 222 / GPU 222 / xbar 166. Not a lever, it is the configuration all our numbers were taken in |
 | draw batching | **closed** | 442 draws reach only 377 calls = 1.17x, and two earlier surveys over-counted it (§7.3c) |
-| code layout / hot ordering | **closed** | worth ~0.05 % of a frame; the cheap version made the hot veneer count worse (§7.19c) |
-| direct GXM backend | **wrong lever first** | 1.11x Amdahl, and the most code of any option (§7.14) |
+| vertex decode cache | **built and kept, gain unproven** | 74 % hit rate, correct, halves decode work — and still not measurable in Vita3K (§7.9). It is the base Rank 2 extends, not a win already banked |
+| code layout / hot ordering | **closed** | worth ~0.05 % of a frame; the cheap version made the hot veneer count worse (§7.18 → §7.19 → §7.19b → §7.19c) |
+| direct GXM backend | **wrong lever first** | 1.11x Amdahl, and the most code of any option (§7.13 evidence, §7.14 model) |
+| 4th core / affinity | **not yet, and not first** | mechanism built and verified in Vita3K, nothing pinned by default, no gain claimed (§7.23, §7.24) |
 
 ### Rank 1 -- a GX worker thread plus frame overlap. The biggest lever, and we have none of it.
 
@@ -2145,16 +2162,17 @@ threading** — thread-local allocation failures were the original symptom.
 
 ### Rank 2 -- resident / static geometry. Second biggest, and mostly a memory question.
 
-Vertex preparation is the largest single component of the frame at **42.9 %**. The sibling port's
-`--vita-gxm-resident` keeps decoded vertices resident instead of re-decoding per frame, and its `+6.2 %`
-from GX worker speed-ups stacks on that. From §7.14: resident/packed geometry is worth **more than the
-backend and more than threading alone** in the optimism-matched row (vertex prep −75 % gives 1.72x alone).
+Vertex preparation is the largest single component of the frame at **42.9 %** (§7.13's v61 profile). The
+sibling port's `--vita-gxm-resident` keeps decoded vertices resident instead of re-decoding per frame, and
+its `+6.2 %` from GX worker speed-ups stacks on that. §7.14's Amdahl row: resident/packed geometry is worth
+**more than the backend and more than threading alone** (vertex prep −75 % gives 1.72x on its own).
 
-The cost is **memory, not risk**: resident geometry trades our reclaimed heap for lookups. That is why
-Rank 1 comes first — it makes the frame cheaper before we spend 100 MB.
+The cost is **memory, not risk**: resident geometry trades our reclaimed heap for lookups. That is why Rank 1
+comes first — it makes the frame cheaper before we spend 100 MB.
 
 §7.9's vertex cache is the partial version and already works: **74 % hit rate**, correct, and it halves
-decode work. Extending it from "cache the decode" to "keep the decoded meshes" is the incremental path.
+decode work. Extending it from "cache the decode" to "keep the decoded meshes" is the incremental path, and
+§7.21's measurement (decode 36.9 %) says how much that step is worth.
 
 ### Rank 3 -- GXM for the main pass only, keeping vitaGL for EFB copies. The honest hybrid.
 
@@ -2948,12 +2966,26 @@ recorded frame) and `vita/aurora/overlay/gx/vita_shader.cpp` (GX TEV/lighting �
 
 ## 10. Suggested reading order for a new session
 
-1. This file.
-2. `PLAN.md` — milestones and the honesty section.
-3. `README.md` — build/run, and what a pass proves.
-4. `tests/vita3k/README.md` — what an emulator run proves and does not.
-5. `vita/aurora/patches.py` — read the header comment; it explains why `505b5eb` must not be adopted.
-6. `vita/aurora/overlay/gfx/vita_gl_replay.cpp` — the renderer.
+**Do not read this file front to back.** It is a record, not a narrative, and §7 in particular is ordered by
+when things were measured, not by what a reader needs. Pick the route:
+
+**Route A — "what is this and does it work".** §1, §2, then §3d's four-row table. Stop there unless the task
+is performance.
+
+**Route B — "what should I implement".** §11 for the single next thing, then §7.20's tables, which name the
+evidence section for every lever. Read a §7.13–§7.19 section only when its row is the one you are acting on;
+each says at its top whether it is evidence, a model, or a closed question.
+
+**Route C — "the picture or the boot is wrong".** §3d (route to gameplay), §3c (the borealis FATAL), then §8's
+trap list. §7.3 is the worked example of a rendering defect found by measurement rather than by looking.
+
+Whichever route, these are worth reading in full and are short:
+
+1. `PLAN.md` — milestones and the honesty section.
+2. `README.md` — build/run, and what a pass proves.
+3. `tests/vita3k/README.md` — what an emulator run proves and does not.
+4. `vita/aurora/patches.py` — the header comment; it explains why `505b5eb` must not be adopted.
+5. `vita/aurora/overlay/gfx/vita_gl_replay.cpp` — the renderer.
 
 ---
 
