@@ -44,6 +44,9 @@ __pycache__/
 PSVUPDAT.PUP
 build-dev/
 build-debug/
+# The timing-clean variant (TPV_TIMING_CLEAN=ON) builds here, so the phase timers can be compiled out
+# without touching the instrumented tree. See HANDOVER.md section 7.28.
+/build-timing/
 
 # Screenshots of the game and of other ports are kept locally, not published: they are frames of a
 # commercial title. The nine that were already pushed stay tracked (documentation refers to them).

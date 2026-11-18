@@ -2961,6 +2961,104 @@ end to end rather than merely compiled.
 reduces the chance that it fails for a reason unrelated to the question. The three arms to run are
 worker off, worker on, and the vertex cache on (§7.9, one constant, already correct).
 
+### 7.28 The instrument was not free, and a console run would have measured it (2026-11-18)
+
+Before shipping the console test, one question had to be answered: **is the measurement apparatus
+itself inside the number it reports?** It was.
+
+#### What was wrong
+
+The `pass` and `submit` **split** timers were correctly gated behind `TPV_PASS_SPLIT` /
+`TPV_SUBMIT_SPLIT` (§7.25, §7.26 both say why). The **phase** timers were not gated at all, so the
+shipping VPK contained this:
+
+```cpp
+void submit_geometry(...) {
+  const auto submitStart = std::chrono::steady_clock::now();
+  struct SubmitTimer { ... ~SubmitTimer() { sPhase.submitMs += ms_since(start); } } submitTimer{submitStart};
+```
+
+Two clock reads **per `glDraw`**, inside the span they measure. At ~400 draws that is ~800 clock reads
+folded into the `submit` figure -- and `submit` is the phase whose 85 % share is the entire basis for
+the current work order. On this host `steady_clock::now()` is a cheap vDSO read and the cost vanishes;
+on a Cortex-A9 it is a counter read costing on the order of microseconds, which is not nothing against
+a 30-50 ms frame.
+
+This is trap 31's failure mode in a new place. Trap 31 is "only one arm of an A/B carries the
+instrumentation". This is worse in one respect: **a single build whose readings are inflated by its own
+instrument**, so the number looks precise and is biased, and turning a feature off does not turn the
+bias off.
+
+#### The fix, and the measurement that proves it
+
+`TPV_NO_PHASE_TIMERS` compiles the phase instruments out (the default stays ON, so no existing result
+moves). Every per-draw and per-op span is gated: `SubmitTimer`, `PassTimer`, the inline-decode span, the
+release probe, the drain, the worker's own decode span, the rendezvous wait, the resolve span, the
+`other` breakdown, and the shader-compile span. `frameStart` deliberately remains in **every** build --
+the ms/frame line is the decision, and one read per frame is genuinely negligible.
+
+The gate was verified by **disassembling the object**, not by reading the source or the preprocessor:
+
+| build | `steady_clock::now()` call sites | on a per-draw path |
+|---|---:|---:|
+| instrumented (default) | **32** | yes |
+| timing-clean (`-DTPV_NO_PHASE_TIMERS`) | **9** | **0** |
+
+The 9 that remain are one per frame, one per window, and static init. Object size drops by 4.6 KiB.
+
+That check cost three attempts because of trap 44: the first two "0 occurrences" results came from a
+**failed** preprocessor run and from compiling `build/aurora_lib` -- the ASSEMBLED COPY, not the edit.
+Both produced a clean-looking answer to the wrong question. Disassembly of a freshly assembled tree gave
+the numbers above.
+
+#### The report had no exit path
+
+Every report fired on `sFrameIndex % 120 == 0` and there was **no flush at shutdown**, so a console
+session shorter than 120 frames -- or one where the player quits from a menu -- produced **no numbers at
+all**. The e2e harness, which is exactly that shape, printed nothing: it runs `95 frames`.
+
+Now `report_final_phases()` runs at the top of `shutdown_gl()` and reports the **partial** window,
+labelled as partial so a 95-frame figure is not averaged as if it were 120. A second form,
+`note_final_phases()`, hands the same summary to the crash recorder through `tpv_crash_note()` once per
+window; that is the only form that survives a fatal path that cannot flush, which is why `boot.log` was
+empty in §7.9. It is `#if defined(__vita__)` because `crash_record.cpp` is not in the host target.
+
+#### Two VPKs, with distinct title ids
+
+`-DTPV_TIMING_CLEAN=ON` builds the console-measurement target into `build-timing/` and **changes the
+title id to `TPLG30001`**, so both can be installed on one console and a log line, screenshot or savedata
+folder is always attributable to the build that produced it. That is not tidiness: this project has
+already had an A/B arm silently run the other arm's feature (§7.25, §7.27).
+
+| build | title id | VPK bytes | text->data gap |
+|---|---|---:|---:|
+| instrumented | `TPLG00001` | 16,679,958 | 23,524 B |
+| timing-clean | `TPLG30001` | 16,679,430 | 25,120 B |
+
+#### The link broke, and the guard named the fix
+
+Adding this code grew `.text` by about 7 KiB and pushed the text segment's end across a 64 KiB
+boundary, leaving a gap of **7140 bytes** against the 8192 `vita-elf-create` needs. The link failed with
+`tools/check_text_gap.py`'s message rather than a cryptic "segment 1 overlaps", which is the guard
+working as designed. `TPV_TEXT_PAD_KIB` went 32 -> 16, restoring **23,524 bytes** of headroom. The gap
+depends on text size *modulo* 64 KiB, so the remedy is to move the end away from the boundary, not to
+enlarge the image.
+
+#### Verified
+
+| check | result |
+|---|---|
+| gate test (new suite) | 19 checks, 0 failed |
+| e2e, timers ON and OFF | 91 scenes, 14,266 pixel checks, 0 failed, identical on both |
+| byte-exact A/B, worker ON | 80 compared, **0 differed** |
+| vertex / texture / shader / disc / crash | 71,063 / 3,780 / ok / 10,686 / PASS |
+| final report on exit | fires in BOTH builds: `95 frames, PARTIAL 95-frame window` |
+| both VPKs | built; `check_text_gap.py` passes on both |
+
+**What to read on the console:** ms/frame from the **timing-clean** build for the decision (worker off
+vs on vs cache on), and the phase split from the **instrumented** build for attribution only. A number
+from one must never be compared against a number from the other.
+
 ## 8. Traps and gotchas
 
 1. **`tp-vita/` is a git repo** (`Yannis100/tp-vita`), but `build/` and `deps/` are gitignored, so **a
@@ -3162,6 +3260,26 @@ different point in the frame from where it was written.
     38 commits that did contain 17 PNGs, i.e. a clean result produced by a broken query. The same test
     written as `... | grep '\.png$'` found all 17. When an audit's answer is "nothing found", re-run it
     against a case you know is positive before believing it.
+43. **`build/aurora_lib/` is a generated copy, not your source.** `tools/build_aurora_tree.py` assembles
+    upstream Aurora plus the `vita/aurora/overlay/` files into `build/aurora_lib/`, and the compiler
+    consumes *that*. Editing `vita/aurora/overlay/gfx/vita_gl_replay.cpp` and then compiling
+    `build/aurora_lib/gfx/vita_gl_replay.cpp` by hand measures the **previous** revision and returns a
+    perfectly-shaped, plausible, stale number. I hit this counting `steady_clock::now()` sites: the
+    overlay had 9, the copy still had 34, and the "measurement" quietly answered a question about the
+    code from before the edit. The tell is in the compiler's own output: warnings and errors name the
+    file under `build/aurora_lib/...`, not the file you just saved. Two rules follow. Re-run
+    `python3 tools/build_aurora_tree.py` after any overlay edit, before measuring or building. And put
+    a token from the *new* code into the probe, so a zero result is a failure rather than a finding --
+    my first attempt at this count returned `0` in **both** configurations because the probe itself
+    failed to compile and printed nothing.
+44. **A few KiB of `.text` growth can break `vita-elf-create`, and the failure looks unrelated to the
+    edit.** The SCE-data gap depends on text size **modulo 64 KiB**, so adding ~7 KiB of code (§7.28)
+    can land the segment boundary badly and produce `gap 7140 < 8192 bytes; vita-elf-create will fail
+    to place its SCE data` on a change that has nothing to do with linking. `tools/check_text_gap.py`
+    prints the gap and names the padding variable; raising `TPV_TEXT_PAD_KIB` (32 -> 16 here, which
+    moved the boundary the other way) restored a 23,524-byte gap. When a link fails this way, change
+    the padding, not the code. And check the VPK's timestamp afterwards -- a build that failed can
+    still leave the previous VPK in place, so a stale artifact passes a "did it build" eyeball test.
 
 ## 9. Files the port owns (`tp-vita/`)
 

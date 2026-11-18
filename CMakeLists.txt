@@ -113,6 +113,16 @@ message(STATUS "TPV flags: ${_tpv_opt_list} -g")
 # Title IDs must be 4 uppercase letters followed by 5 digits (check_vpk.py enforces it), so the
 # variant goes in the digit field: 00001 release, 10001 dev, 20001 debug. Readable, distinct, and
 # accepted by the packager.
+# TPV_TIMING_CLEAN: the console-measurement build (HANDOVER 7.28). The per-phase instruments are compiled
+# out, so ms/frame is measured by a build that contains no per-draw clock reads. Measured effect on this
+# translation unit: 32 -> 9 `steady_clock::now()` call sites, and ZERO of them on a per-draw path.
+#
+# It gets its OWN title id (30001) as well as its own binary, because the two builds are made to be
+# installed on the same console and A/B'd against each other. A distinct title id is the only thing that
+# makes a log line, a screenshot or a savedata folder attributable to the build that produced it -- and
+# this project has already been bitten once by an A/B arm that silently ran the other arm's feature.
+option(TPV_TIMING_CLEAN "Compile out the per-phase timers, for honest frame timing on hardware" OFF)
+
 if(TPV_VARIANT STREQUAL "release")
   set(VITA_APP_NAME "Twilight Princess")
   set(VITA_TITLEID  "TPLG00001")   # what ships
@@ -123,7 +133,14 @@ else()
   set(VITA_APP_NAME "Twilight Princess (debug)")
   set(VITA_TITLEID  "TPLG20001")
 endif()
-message(STATUS "TPV title id=${VITA_TITLEID} name='${VITA_APP_NAME}' asserts=${TPV_ENABLE_ASSERTS}")
+if(TPV_TIMING_CLEAN)
+  # Only the release variant is ever rebuilt this way; the digit field stays within the packagers rules.
+  set(VITA_APP_NAME "Twilight Princess (timing)")
+  set(VITA_TITLEID  "TPLG30001")
+  add_compile_options(-DTPV_NO_PHASE_TIMERS)
+endif()
+message(STATUS "TPV title id=${VITA_TITLEID} name='${VITA_APP_NAME}' asserts=${TPV_ENABLE_ASSERTS} "
+               "timing_clean=${TPV_TIMING_CLEAN}")
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 20)
@@ -389,7 +406,14 @@ set(CMAKE_CXX_STANDARD_LIBRARIES "-lbz2 -lpng16 -lz -lstdc++ -lpthread -lm")
 # at the next 64 KiB boundary, so whether it fits depends on the text size modulo 64 KiB (see
 # vita/src/text_pad.cpp). The pad moves the text end away from a boundary; the check fails the link
 # step early, with the remedy, when a later code change lands in the window again.
-set(TPV_TEXT_PAD_KIB 32 CACHE STRING "KiB of .rodata filler that keeps vita-elf-create's SCE data from overlapping the data segment")
+# 2026-11-18: 32 -> 16. The 7.28 work (gates, final report, crash note) grew .text by about 7 KiB, which
+# pushed the text segment's end across a 64 KiB boundary and left a gap of 7140 bytes -- under the 8192
+# vita-elf-create needs, so the LINK failed (a good failure: tools/check_text_gap.py names the remedy
+# instead of letting vita-elf-create emit a cryptic "segment 1 overlaps"). The gap depends on text size
+# modulo 64 KiB, so the fix is to move the end away from the boundary, not to make the image bigger.
+# 16 KiB restores roughly 23 KiB of headroom. Any future growth of a few KiB should re-run the check
+# rather than assume this constant is still right.
+set(TPV_TEXT_PAD_KIB 16 CACHE STRING "KiB of .rodata filler that keeps vita-elf-create's SCE data from overlapping the data segment")
 set_source_files_properties(${TPV_DIR}/vita/src/text_pad.cpp PROPERTIES COMPILE_DEFINITIONS TPV_TEXT_PAD_KIB=${TPV_TEXT_PAD_KIB})
 add_custom_command(TARGET tpv_vita POST_BUILD
   COMMAND ${Python3_EXECUTABLE} ${TPV_DIR}/tools/check_text_gap.py $<TARGET_FILE:tpv_vita>

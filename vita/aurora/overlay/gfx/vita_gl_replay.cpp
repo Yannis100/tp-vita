@@ -39,6 +39,9 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#if defined(__vita__)
+#include "crash_record.hpp"
+#endif
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -947,11 +950,19 @@ Program* get_program(const gx::PipelineConfig& config, bool replace, bool pnZero
   std::snprintf(label, sizeof(label), "gx-%08x", static_cast<uint32_t>(hash));
   Log.info("compiling {}: vertex {} B ({} vec4), fragment {} B ({} vec4), {} attributes", label, source.vertex.size(),
            source.vsVec4, source.fragment.size(), source.fsVec4, source.layout.count);
+  // Rare (a cache miss, not a per-draw path), so its cost is irrelevant either way -- gated anyway so the
+  // clean build contains no clock read that is not needed for the ms/frame figure the console run needs.
+#if TPV_PHASE_TIMERS
   const auto compileStart = std::chrono::steady_clock::now();
+#endif
   program->program = link_program(source.vertex, source.fragment, names, source.layout.count, label);
   if (program->program != 0) {
+#if TPV_PHASE_TIMERS
     Log.info("{} ready in {} ms", label,
              std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - compileStart).count());
+#else
+    Log.info("{} ready (compile timing disabled in this build)", label);
+#endif
     program->valid = true;
     use_program(program->program);
     program->locVS = source.vsVec4 != 0 ? glGetUniformLocation(program->program, "uVS") : -1;
@@ -1189,6 +1200,42 @@ struct SubmitSplit {
 SubmitSplit sSubmit;
 SubmitSplit sSubmitWindow;
 
+// PHASE TIMERS: ON by default, and that default is the calibrated one -- but NOT free, so it is a switch.
+//
+// Measured 2026-11-18, before the first console run: the per-phase spans below were unconditional, so the
+// shipping VPK contained 17 ungated `steady_clock::now()` calls, and `submit_geometry` paid TWO of them
+// per glDraw INSIDE the span it measures. At ~400 draws that is ~800 clock reads folded into the `submit`
+// figure that the whole work order is based on. On this host `now()` is a cheap vDSO read and the cost
+// vanishes; on a Cortex-A9 it is a counter read costing on the order of microseconds, which is not
+// nothing against a 30-50 ms frame.
+//
+// That is trap 31's failure mode in a different place. Trap 31 is "only one arm of an A/B contains the
+// instrumentation". This is subtler and would have been worse: ONE build, whose own readings are inflated
+// by the instrument that produced them, so the number looks precise and is biased, and turning a feature
+// off does not turn the bias off.
+//
+// So: `-DTPV_NO_PHASE_TIMERS` builds the clean timing target, and everything the phase split needs is
+// compiled out together. The default stays ON so no existing result changes and no test needs the flag.
+// The console experiment uses BOTH builds -- clean for ms/frame (the decision), instrumented for the
+// split (the attribution) -- and never compares a number from one against a number from the other.
+#if !defined(TPV_NO_PHASE_TIMERS)
+#define TPV_PHASE_TIMERS 1
+#else
+#define TPV_PHASE_TIMERS 0
+#endif
+
+// A clock read that compiles to NOTHING in the clean build, so a gated span costs zero instructions rather
+// than a call that returns a value nobody reads. std::chrono::steady_clock::now() cannot be relied on to
+// be elided, so the gate has to be at the call site.
+struct PhaseStamp {
+  std::chrono::steady_clock::time_point t{};
+#if TPV_PHASE_TIMERS
+  PhaseStamp() : t(std::chrono::steady_clock::now()) {}
+#else
+  PhaseStamp() = default;
+#endif
+};
+
 inline double ms_since(std::chrono::steady_clock::time_point a) {
   return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
 }
@@ -1368,7 +1415,9 @@ void decode_worker_main() {
     // the GL thread writes -- that is the invariant the 7.21 measurement bought, and 23,600 byte-exact
     // comparisons say it holds.
     DecodeSlot& slot = sWorker.slots[ordinal % kDecodeSlots];
+#if TPV_PHASE_TIMERS
     const auto start = std::chrono::steady_clock::now();
+#endif
     const gx::DrawData& draw = frame->draws[job.drawIndex];
     const gx::vita::DecodedLayout layout = gx::vita::decoded_layout(job.config->shaderConfig);
     bool grew = false; // set when a slot allocated, which is when the footprint needs re-measuring
@@ -1403,9 +1452,11 @@ void decode_worker_main() {
         sWorker.peakSlotBytes = held;
       }
     }
+#if TPV_PHASE_TIMERS
     const double ms = ms_since(start);
-    ++sWorker.nextJob;
     sWorker.decodeMs += ms; // worker thread only, so no lock; read under the lock at report time
+#endif
+    ++sWorker.nextJob;
     ++sWorker.decodedDraws;
     // Publish LAST, release-ordered: the slot's contents must be visible before the counter says so.
     sWorker.readyCount.store(ordinal + 1, std::memory_order_release);
@@ -1570,12 +1621,16 @@ const DecodeSlot* decode_wait(uint32_t ordinal, uint32_t drawIndex) {
   // Fast path: one acquire load, no lock. This is the normal case (>99 % of draws, measured).
   if (sWorker.readyCount.load(std::memory_order_acquire) <= ordinal) {
     ++sWorker.waitBlocks;
+#if TPV_PHASE_TIMERS
     const auto start = std::chrono::steady_clock::now();
+#endif
     std::unique_lock<std::mutex> lock(sWorker.mu);
     sWorker.cvReady.wait(lock, [ordinal] {
       return sWorker.readyCount.load(std::memory_order_acquire) > ordinal;
     });
+#if TPV_PHASE_TIMERS
     sPhase.decodeMs += ms_since(start);
+#endif
   }
   return &sWorker.slots[ordinal % kDecodeSlots];
 }
@@ -1622,10 +1677,16 @@ double sReleaseMs = 0;    // per frame, inside the `pass` span
 double sNotifyMs = 0;     // per frame, inside the `pass` span
 uint32_t sReleaseCalls = 0;
 void decode_release_timed(uint32_t ordinal) {
+#if TPV_PHASE_TIMERS
   const auto start = std::chrono::steady_clock::now();
   decode_release(ordinal);
   sReleaseMs += ms_since(start);
   ++sReleaseCalls;
+#else
+  // The release is ONE per draw and was measured at 24-29 % of the frame before 7.25 coarsened it. Its
+  // probe is exactly the kind of instrument that must not exist in the timing build.
+  decode_release(ordinal);
+#endif
 }
 
 // End of frame: every posted draw has been consumed and released by now, so this is a formality that
@@ -1663,7 +1724,9 @@ void decode_drain() {
   if (!sWorker.running) {
     return;
   }
+#if TPV_PHASE_TIMERS
   const auto start = std::chrono::steady_clock::now();
+#endif
   {
     std::unique_lock<std::mutex> lock(sWorker.mu);
     // Make the predicate satisfiable: with coarse release (kReleaseStride) the last partial stride may
@@ -1677,17 +1740,24 @@ void decode_drain() {
       return sWorker.freeCount.load(std::memory_order_acquire) >= sWorker.jobCount;
     });
   }
+#if TPV_PHASE_TIMERS
   sOtherTailMs += ms_since(start);
+#endif
 }
 
 // submit_geometry is the only place that issues glDraw*, so its time IS the submit phase.
 void submit_geometry(const Program& p, const uint8_t* vertices, uint32_t vertexCount, const uint16_t* indices,
                      uint32_t indexCount) {
+  // THE HOTTEST INSTRUMENT IN THE PORT: two clock reads per glDraw, inside the span they measure. Compiled
+  // out entirely by TPV_NO_PHASE_TIMERS -- see the gate's comment. Do not "simplify" this back to an
+  // unconditional `now()` pair; that is what put ~800 clock reads per frame into the `submit` figure.
+#if TPV_PHASE_TIMERS
   const auto submitStart = std::chrono::steady_clock::now();
   struct SubmitTimer {
     std::chrono::steady_clock::time_point start;
     ~SubmitTimer() { sPhase.submitMs += ms_since(start); }
   } submitTimer{submitStart};
+#endif
 #if defined(TPV_SUBMIT_SPLIT)
   // HANDOVER 7.26. `submit` is 85 % of this frame, and it contains two kinds of work: the attribute
   // setup (one glVertexAttribPointer per attribute plus a bitmask diff, PER DRAW, even when nothing
@@ -1870,7 +1940,9 @@ void draw_op(const Frame& frame, const gx::DrawData& draw, uint32_t drawIndex) {
     decoded.vertices = slot->decoded.data();
     decoded.chunks = &slot->chunks;
   } else {
+#if TPV_PHASE_TIMERS
     const auto decodeStart = std::chrono::steady_clock::now();
+#endif
     ++sWorker.inlineDecodes;
     if (lineMode) {
       gx::vita::expand_lines(*config, draw, frame, layout, sScratch.chunks);
@@ -1880,7 +1952,9 @@ void draw_op(const Frame& frame, const gx::DrawData& draw, uint32_t drawIndex) {
       gx::vita::decode_draw(*config, draw, frame, layout, sScratch.decoded);
       decoded.vertices = sScratch.decoded.data();
     }
+#if TPV_PHASE_TIMERS
     sPhase.decodeMs += ms_since(decodeStart);
+#endif
   }
   // A line draw whose expansion produced no chunk has nothing to submit; release the slot either way.
   if (lineMode && (decoded.chunks == nullptr || decoded.chunks->empty())) {
@@ -1889,11 +1963,12 @@ void draw_op(const Frame& frame, const gx::DrawData& draw, uint32_t drawIndex) {
     }
     return;
   }
-  ++sPhase.draws;
   // `pass` = everything draw_op spends that is not decode and not submit_geometry: program/uniform binds,
   // texture binds, the fog-range LUT upload. Taken as the enclosing span minus what the two inner timers
-  // already booked, so the four phases stay disjoint and sum to the frame.
-  const auto passStart = std::chrono::steady_clock::now();
+  // already booked, so the four phases stay disjoint and sum to the frame. Two more clock reads per draw,
+  // and gated for the same reason as SubmitTimer.
+#if TPV_PHASE_TIMERS
+  const PhaseStamp passStart;
   const double submitBefore = sPhase.submitMs;
   struct PassTimer {
     std::chrono::steady_clock::time_point start;
@@ -1904,7 +1979,8 @@ void draw_op(const Frame& frame, const gx::DrawData& draw, uint32_t drawIndex) {
       const double pass = whole - submitInside;
       sPhase.passMs += pass > 0 ? pass : 0.0;
     }
-  } passTimer{passStart, submitBefore};
+  } passTimer{passStart.t, submitBefore};
+#endif
   if (dst_alpha_active(*config) && needs_source_alpha(*config)) {
     // No dual-source blending: write the constant destination alpha first (no color, no depth), then
     // draw the colors with alpha masked out.
@@ -1966,11 +2042,13 @@ uint32_t sBatchingSurveys = 0;
 
 void resolve_op(const ResolveOp& r) {
   ++sResolveSeen;
-  const auto resolveStart = std::chrono::steady_clock::now();
+#if TPV_PHASE_TIMERS
+  const PhaseStamp resolveStart;
   struct ResolveTimer {
     std::chrono::steady_clock::time_point start;
     ~ResolveTimer() { sPhase.resolveMs += ms_since(start); }
-  } resolveTimer{resolveStart};
+  } resolveTimer{resolveStart.t};
+#endif
   Target& source = *sCurrent;
   const bool fullTarget = r.rect.x <= 0 && r.rect.y <= 0 && r.rect.x + r.rect.width >= int32_t(source.width) &&
                           r.rect.y + r.rect.height >= int32_t(source.height);
@@ -2066,6 +2144,11 @@ void set_present_size(uint32_t width, uint32_t height) noexcept {
   sPresentHeight = std::max<uint32_t>(height, 1);
 }
 
+// Forward declaration: `replay()` refreshes the crash note once per window, and both helpers are defined
+// below it (they read state declared above, and shutdown_gl sits at the end of the file).
+void note_final_phases();
+void report_final_phases(const char* why);
+
 void replay(Frame& frame) {
   ++sFrameIndex;
   if (sVerifyFrames > 0) {
@@ -2082,13 +2165,21 @@ void replay(Frame& frame) {
   sLastClearMs = sOtherClearMs;
   sLastTailMs = sOtherTailMs;
   sOtherSetupMs = sOtherClearMs = sOtherTailMs = 0;
+  // `frameStart` STAYS in every build: the ms/frame figure is the whole point of the console run and the
+  // line that decides whether the worker wins. One clock read per frame is also genuinely negligible, which
+  // is why only the per-draw and per-op instruments above were worth gating. `setupStart` is attribution
+  // detail -- per frame, but only feeds the `other` breakdown -- so it goes with the rest.
   const auto frameStart = std::chrono::steady_clock::now();
+#if TPV_PHASE_TIMERS
   const auto setupStart = std::chrono::steady_clock::now();
+#endif
   init_gl();
   flush_texture_deletions();
   ensure_efb();
   invalidate_cache();
+#if TPV_PHASE_TIMERS
   sOtherSetupMs += ms_since(setupStart);
+#endif
   // Hand the frame's whole draw list to the decode worker BEFORE the op loop starts, so 36.9 % of the
   // frame decodes while this thread does the clear, the state changes and the GL calls. See the block
   // above decode_worker_main() for why this is safe and what it is worth.
@@ -2120,6 +2211,9 @@ void replay(Frame& frame) {
              "{} draws this frame, {} programs total, {} resolve ops seen",
              sFrameIndex, windowMs, windowMs / 120.0, 120000.0 / (windowMs > 0 ? windowMs : 1),
              frame.draws.size(), sPrograms.size(), sResolveSeen);
+    // Refresh the crash note at the same cadence, so a fatal path between windows reports the frame count
+    // and phase split as they were, not as they were 120 frames ago.
+    note_final_phases();
     // WHERE OUR FRAME GOES (HANDOVER 7.21). Reported as a share of the summed phases so it stays
     // meaningful in an emulator whose absolute times are not a console's: read the RATIOS, not the ms.
     {
@@ -2506,10 +2600,75 @@ bool read_efb_rgba(std::vector<uint8_t>& out, uint32_t& width, uint32_t& height)
   return true;
 }
 
+// FINAL REPORT (2026-11-18). Everything above reports on `sFrameIndex % 120 == 0`, and there is no flush
+// on exit -- so a console session that ends before a window boundary, or one where the player quits after
+// loading, produced NO numbers at all. On a device that has already cost two sessions to a silent abort
+// (7.10, 7.14), "no output" is a likely outcome, not an edge case. This banks whatever is accumulated.
+//
+// It reports the PARTIAL window deliberately, and says so: a 40-frame window is noisier than a 120-frame
+// one, and a reader must not average it as if it were full. `sFrameIndex` is included because it is also
+// the answer to "how far did it get before it stopped".
+void report_final_phases(const char* why) {
+#if TPV_PHASE_TIMERS
+  const double total = sPhaseWindow.decodeMs + sPhaseWindow.submitMs + sPhaseWindow.passMs +
+                       sPhaseWindow.resolveMs + sPhaseWindow.otherMs;
+  if (total <= 0.0) {
+    Log.warn("final report ({}): no phase window accumulated after {} frames", why, sFrameIndex);
+    return;
+  }
+  const auto pct = [total](double v) { return 100.0 * v / total; };
+  Log.warn("final report ({}): {} frames, PARTIAL {}-frame window; phases: decode {:.1f}% | submit "
+           "{:.1f}% | pass {:.1f}% | resolve {:.1f}% | other {:.1f}%; {} draws",
+           why, sFrameIndex, sFrameIndex % 120, pct(sPhaseWindow.decodeMs), pct(sPhaseWindow.submitMs),
+           pct(sPhaseWindow.passMs), pct(sPhaseWindow.resolveMs), pct(sPhaseWindow.otherMs),
+           sPhaseWindow.draws);
+#else
+  // The clean timing build does not maintain the phase split, but the frame count is still the useful
+  // thing to bank: it says how far the run got.
+  Log.warn("final report ({}): {} frames (phase split compiled out with TPV_NO_PHASE_TIMERS)",
+           why, sFrameIndex);
+#endif
+}
+
+// The same summary, handed to the CRASH RECORDER as a note. `tpv_crash_note` copies a string into a fixed
+// buffer and builds no log line, so this is the one form that survives a fatal path that cannot flush
+// (the reason boot.log was empty, HANDOVER 7.9). Called once per window, not per frame: it is for "what
+// was the last state before it died", not for a timeline.
+//
+// VITA ONLY. crash_record.cpp is part of the Vita target and not of the host harness, so on the host the
+// symbol does not exist -- and guarding on __vita__ rather than on the build variant is deliberate: the
+// host e2e suite must keep linking without the crash recorder, exactly as it does today.
+void note_final_phases() {
+#if defined(__vita__)
+  static char note[200];
+#if TPV_PHASE_TIMERS
+  const double total = sPhaseWindow.decodeMs + sPhaseWindow.submitMs + sPhaseWindow.passMs +
+                       sPhaseWindow.resolveMs + sPhaseWindow.otherMs;
+  if (total <= 0.0) {
+    tpv_crash_note("frames so far: no phase window accumulated");
+    return;
+  }
+  const auto pct = [total](double v) { return 100.0 * v / total; };
+  std::snprintf(note, sizeof(note),
+                "frame %llu; last window phases: decode %.1f%% submit %.1f%% pass %.1f%% resolve %.1f%% "
+                "other %.1f%% (%u draws)",
+                static_cast<unsigned long long>(sFrameIndex), pct(sPhaseWindow.decodeMs),
+                pct(sPhaseWindow.submitMs), pct(sPhaseWindow.passMs), pct(sPhaseWindow.resolveMs),
+                pct(sPhaseWindow.otherMs), sPhaseWindow.draws);
+#else
+  std::snprintf(note, sizeof(note), "frame %llu; phase timers compiled out",
+                static_cast<unsigned long long>(sFrameIndex));
+#endif
+  tpv_crash_note(note);
+#endif // __vita__
+}
+
 void shutdown_gl() {
   if (!sGlReady) {
     return;
   }
+  // Bank the window BEFORE tearing GL down, so an exit that is not frame-120 still leaves numbers.
+  report_final_phases("shutdown");
   for (auto& [hash, program] : sPrograms) {
     if (program->program != 0) {
       glDeleteProgram(program->program);
