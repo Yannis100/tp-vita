@@ -1,0 +1,71 @@
+From a69adc9fc25f7dd9b0c95ec51096410b7bc2920e Mon Sep 17 00:00:00 2001
+From: Yannis Ansermoz <yannis.ansermoz@bcu.unil.ch>
+Date: Tue, 3 Nov 2026 11:30:42 +0100
+Subject: [PATCH] Install borealis log::Options::onFatal so a FATAL message
+ survives the abort
+
+The port's intermittent death was proven (via the crash recorder in the sibling
+tp-vita repo) to be a LogLevel::Fatal raised through borealis write_fatal. The
+function was identified but the message was not, because of a real gap in the
+logger:
+
+  write_fatal() -> if state.initialized: write_locked (goes to the sinks)
+                -> else: write_bootstrap_locked (pushes onto state.bootstrap)
+
+and state.bootstrap is replayed only INSIDE init(). A fatal that happens after
+init began but before it completed is therefore written nowhere at all, and the
+process aborts with no record of why. That is exactly the window this port dies
+in, and it is why ten surviving logs contained no critical line.
+
+onFatal is copied out of state.options and called in both branches, after the
+flush and before std::abort(), so it is the one reliable hook. It writes the
+message to stderr (which lands in vita3k.log) and to ux0:data/tpvita/fatal.txt,
+unbuffered and flushed, deliberately not routed through the logging system that
+failed to deliver it.
+
+Diagnostic addition only; no gameplay behaviour changes.
+---
+ src/dusk/logging.cpp | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/src/dusk/logging.cpp b/src/dusk/logging.cpp
+index b85635f1a5..af70b3fd3b 100644
+--- a/src/dusk/logging.cpp
++++ b/src/dusk/logging.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <tracy/Tracy.hpp>
+ 
++#include <cstdio>
+ #include <string_view>
+ 
+ bool StubLogEnabled = true;
+@@ -45,6 +46,25 @@ void dusk::InitializeLogging(
+     options.filePrefix = "dusklight";
+     options.legacyFilePrefixes = {"dusk"};
+     options.divert = &divert_stub_messages;
++    // A fatal message is otherwise LOST, and that is the whole difficulty of diagnosing this port's
++    // intermittent death. borealis::log has two paths for a fatal: if the logger is initialised it
++    // goes to the sinks, but if it is not, write_bootstrap_locked only pushes it onto a queue that
++    // is replayed *inside init()* -- so a fatal that happens after init started but before it
++    // completed is never written anywhere, and the process aborts with no record of why. onFatal is
++    // called in both cases, after the flush and before std::abort(), so it is the one reliable hook.
++    //
++    // Writes to stderr (which reaches vita3k.log) and to ux0:data/tpvita/fatal.txt, unbuffered and
++    // flushed, because the process is about to die. Deliberately not routed through the logging
++    // system: that is the thing that failed to deliver the message.
++    options.onFatal = [](std::string_view text) {
++        std::fprintf(stderr, "[dusk] FATAL: %.*s\n", static_cast<int>(text.size()), text.data());
++        std::fflush(stderr);
++        if (std::FILE* out = std::fopen("ux0:data/tpvita/fatal.txt", "wb")) {
++            std::fwrite(text.data(), 1, text.size(), out);
++            std::fputc('\n', out);
++            std::fclose(out);
++        }
++    };
+     standard.apply_to(options);
+     borealis::log::init(options);
+ }
+-- 
+2.43.0
+

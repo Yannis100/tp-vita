@@ -54,6 +54,8 @@ pattern: GameCube GX → GL on Vita, TEV → precompiled CG shaders). See
 ```
 tp-vita/
 ├─ CMakeLists.txt              # Vita build (VITASDK required, TP_DEPS=dusklight)
+├─ patches/dusklight/          # this port's modifications to Dusklight, as patches
+├─ tools/fetch_dusklight.sh    # pinned upstream + those patches = the tree the VPKs came from
 ├─ cmake/                      # aurora.cmake, borealis.cmake, deps.cmake,
 │                              # game_sources.cmake (JSystem capture)
 ├─ tools/fetch_deps.sh         # fetch deps/ (abseil, imgui, rmlui, …)
@@ -80,19 +82,25 @@ tp-vita/
 ## Requirements
 
 - **VitaSDK** (`arm-vita-eabi-gcc`, `vita-create-*`, vitaGL, `vitashark`, `taihen`, SDL3), `cmake`, `python3`.
-- A checkout of **TwilitRealm/dusklight** (branch `vita`) at `../dusklight`
-  (or point `TP_DEPS` at it).
+- A checkout of **TwilitRealm/dusklight** at `../dusklight` (or point `TP_DEPS` at it) that contains
+  this port's modifications. Build it with `tools/fetch_dusklight.sh`, which clones upstream's pinned
+  revision, asserts the Aurora and Borealis submodule revisions, and applies `patches/dusklight/`.
+  There is no `vita` branch on the upstream repository, so do not go looking for one.
 - `tools/fetch_deps.sh` run once (fetches into `deps/`).
 
 ## Build
 
 ```sh
-tools/fetch_deps.sh
+tools/fetch_dusklight.sh   # ../dusklight: pinned upstream + this port's patches
+tools/fetch_deps.sh        # deps/: abseil, imgui, rmlui, ...
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTPV_PACKAGE=ON
 cmake --build build --target tpv_vita-release.vpk-vpk -j"$(nproc)"
-# optional sanity check; the script ships with the vita-port skill, so substitute your own path
-python3 ~/.roo/skills/vita-port/scripts/check_vpk.py build/tpv_vita-release.vpk
+python3 tools/check_vpk.py build/tpv_vita-release.vpk
+python3 tools/check_vpk_contents.py build/tpv_vita-release.vpk   # no Sony modules, no disc image
 ```
+
+A fresh clone plus those two scripts is enough: the reconstruction was verified to produce a
+byte-identical Dusklight tree to the one the published VPKs were built from.
 
 `tools/build.sh release|dev|debug` builds the three variants (distinct title IDs, so a dev build cannot
 overwrite a release install). **Always re-run the `cmake -S . -B build` configure step after editing

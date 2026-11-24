@@ -1,0 +1,1211 @@
+diff --git a/include/d/d_event_lib.h b/include/d/d_event_lib.h
+index b0ee88a6f3..ae522c4da0 100644
+--- a/include/d/d_event_lib.h
++++ b/include/d/d_event_lib.h
+@@ -3,6 +3,16 @@
+ 
+ #include <types.h>
+ 
++/*
++ * Vita port: the newlib <ctype.h> in VitaSDK defines the macro _C as a
++ * character-class bit (040). That collides with the data member named _C
++ * declared below, so the macro must be dropped before this struct is parsed.
++ * The upstream PC build is unaffected (host ctype.h does not define _C).
++ */
++#ifdef _C
++#undef _C
++#endif
++
+ class fopAc_ac_c;
+ 
+ template <typename A0>
+diff --git a/include/helpers/endian.h b/include/helpers/endian.h
+index b9727ce4c7..a535b8be28 100644
+--- a/include/helpers/endian.h
++++ b/include/helpers/endian.h
+@@ -6,7 +6,7 @@
+ #include "dolphin/mtx.h"
+ 
+ // Platform detection - Little Endian targets
+-#if defined(_WIN32) || defined(__x86_64__) || defined(__i386__) || defined(__aarch64__) || defined(_M_X64) || defined(_M_IX86)
++#if defined(_WIN32) || defined(__x86_64__) || defined(__i386__) || defined(__aarch64__) || (defined(__arm__) && !defined(__ARMEB__)) || defined(_M_X64) || defined(_M_IX86)
+     #define TARGET_LITTLE_ENDIAN 1
+ #else
+     #define TARGET_LITTLE_ENDIAN 0
+diff --git a/libs/JSystem/src/J3DGraphAnimator/J3DJointTree.cpp b/libs/JSystem/src/J3DGraphAnimator/J3DJointTree.cpp
+index 6a0a5297e6..a622e8ce51 100644
+--- a/libs/JSystem/src/J3DGraphAnimator/J3DJointTree.cpp
++++ b/libs/JSystem/src/J3DGraphAnimator/J3DJointTree.cpp
+@@ -52,19 +52,32 @@ void J3DJointTree::makeHierarchy(J3DJoint* pJoint, const J3DModelHierarchy** pHi
+             break;
+         }
+ 
++        // NOTE: pJoint is NULL on the top-level call (J3DModelLoader passes NULL
++        // for the root). J3DJoint::getType() returns the constant 'NJNT' and does
++        // not read `this`, so `pJoint->getType()` silently succeeds through a NULL
++        // pointer; the dereference that follows is the real fault. Well-formed BMD
++        // hierarchy records only carry materials and shapes inside a kTypeBeginChild
++        // block, so pJoint is non-NULL there in practice, but a malformed record at
++        // the top level used to load from absolute address 0x58 (mMesh). Guard it.
+         if (newJoint != NULL) {
+             curJoint = newJoint;
+             if (pJoint == NULL)
+                 mRootNode = newJoint;
+             else
+                 pJoint->appendChild(newJoint);
+-        } else if (newMaterial != NULL && pJoint->getType() == 'NJNT') {
+-            pJoint->addMesh(newMaterial);
+-            newMaterial->setJoint(pJoint);
+-        } else if (newShape != NULL && pJoint->getType() == 'NJNT') {
+-            J3DMaterial* newMaterial = pJoint->getMesh();
+-            newMaterial->addShape(newShape);
+-            newShape->setMaterial(newMaterial);
++        } else if (pJoint != NULL) {
++            if (newMaterial != NULL) {
++                pJoint->addMesh(newMaterial);
++                newMaterial->setJoint(pJoint);
++            } else if (newShape != NULL) {
++                // NOTE: was a nested `J3DMaterial* newMaterial` that shadowed the
++                // outer one and was dereferenced without a NULL check.
++                J3DMaterial* pMesh = pJoint->getMesh();
++                if (pMesh != NULL) {
++                    pMesh->addShape(newShape);
++                    newShape->setMaterial(pMesh);
++                }
++            }
+         }
+     }
+ }
+diff --git a/libs/JSystem/src/JFramework/JFWSystem.cpp b/libs/JSystem/src/JFramework/JFWSystem.cpp
+index e0f9f58ef6..2f6e032773 100644
+--- a/libs/JSystem/src/JFramework/JFWSystem.cpp
++++ b/libs/JSystem/src/JFramework/JFWSystem.cpp
+@@ -13,6 +13,19 @@
+ #include "JSystem/JUtility/JUTResFont.h"
+ #include "JSystem/JUtility/JUTDbPrint.h"
+ 
++// TEMPORARY BRINGUP TRACE. See m_Do_machine.cpp: this port aborted inside JFWSystem::init()
++// with an uncaught std::system_error thrown from a context no handler can catch. Per-statement
++// tracing names the exact call. One-shot at boot, so the cost is negligible. Remove with every
++// jfw_trace call below.
++#include <cstdio>
++static void jfw_trace(const char* what) {
++    FILE* tf = std::fopen("ux0:data/tpvita/dvd_trace.txt", "a");
++    if (tf != nullptr) {
++        std::fprintf(tf, "JFWSystem: %s\n", what);
++        std::fclose(tf);
++    }
++}
++
+ DUSK_GAME_DATA s32 JFWSystem::CSetUpParam::maxStdHeaps = 2;
+ 
+ DUSK_GAME_DATA u32 JFWSystem::CSetUpParam::sysHeapSize = 0x400000;
+@@ -62,42 +75,57 @@ DUSK_GAME_DATA JUTConsole* JFWSystem::systemConsole;
+ DUSK_GAME_DATA bool JFWSystem::sInitCalled = false;
+ 
+ void JFWSystem::init() {
++    jfw_trace("enter");
+     JUT_ASSERT(101, sInitCalled == false);
++    jfw_trace("assert done");
+ 
+     if (rootHeap == NULL) {
+         firstInit();
+     }
+     sInitCalled = true;
++    jfw_trace("firstInit done");
+ 
+     JKRAram::create(CSetUpParam::aramAudioBufSize, CSetUpParam::aramGraphBufSize,
+                     CSetUpParam::streamPriority, CSetUpParam::decompPriority,
+                     CSetUpParam::aPiecePriority);
++    jfw_trace("JKRAram::create done");
+     mainThread = JKR_NEW JKRThread(OSGetCurrentThread(), 4);
++    jfw_trace("mainThread JKRThread done");
+ 
+     JUTVideo::createManager(CSetUpParam::renderMode);
++    jfw_trace("JUTVideo::createManager done");
+     JUTCreateFifo(CSetUpParam::fifoBufSize);
++    jfw_trace("JUTCreateFifo done");
+ 
+     JUTGamePad::init();
++    jfw_trace("JUTGamePad::init done");
+ 
+ #ifndef TARGET_PC
+     JUTDirectPrint* dbPrint = JUTDirectPrint::start();
+ #endif
+ 
+     JUTAssertion::create();
++    jfw_trace("JUTAssertion::create done");
+ 
+ #ifndef TARGET_PC
+     JUTException::create(dbPrint);
+ #endif
+ 
+     systemFont = JKR_NEW JUTResFont(CSetUpParam::systemFontRes, NULL);
++    jfw_trace("JUTResFont done");
+ 
+     debugPrint = JUTDbPrint::start(NULL, NULL);
++    jfw_trace("JUTDbPrint::start done");
+     debugPrint->changeFont(systemFont);
++    jfw_trace("changeFont done");
+ 
+     systemConsoleManager = JUTConsoleManager::createManager(NULL);
++    jfw_trace("JUTConsoleManager::createManager done");
+ 
+     systemConsole = JUTConsole::create(60, 200, NULL);
++    jfw_trace("JUTConsole::create done");
+     systemConsole->setFont(systemFont);
++    jfw_trace("setFont done");
+ 
+     if (CSetUpParam::renderMode->efbHeight < 300) {
+         systemConsole->setFontSize(systemFont->getWidth() * 0.85f, systemFont->getHeight() * 0.5f);
+@@ -113,8 +141,11 @@ void JFWSystem::init() {
+     JUTSetReportConsole(systemConsole);
+     JUTSetWarningConsole(systemConsole);
+ 
++    jfw_trace("console geometry done");
+     void* buffer = systemHeap->alloc(CSetUpParam::exConsoleBufferSize, 4);
++    jfw_trace("exConsole buffer alloc done");
+     JUTException::createConsole(buffer, CSetUpParam::exConsoleBufferSize);
++    jfw_trace("createConsole done -> return");
+ }
+ 
+ #if TARGET_PC
+diff --git a/libs/JSystem/src/JKernel/JKRAram.cpp b/libs/JSystem/src/JKernel/JKRAram.cpp
+index 98829765bc..7f834760bc 100644
+--- a/libs/JSystem/src/JKernel/JKRAram.cpp
++++ b/libs/JSystem/src/JKernel/JKRAram.cpp
+@@ -14,6 +14,7 @@
+ #include <dolphin/os.h>
+ #endif
+ #include <cstring>
++#include <cstdio> // TEMPORARY BRINGUP TRACE; remove with aram_trace below.
+ 
+ #if PLATFORM_GCN
+ const u32 stack_size = 0xc00;
+@@ -29,16 +30,31 @@ int decompSZS_subroutine(u8* src, u8* dest);
+ 
+ DUSK_GAME_DATA JKRAram* JKRAram::sAramObject;
+ 
++// TEMPORARY BRINGUP TRACE. See JFWSystem.cpp. One-shot at boot, so the cost is negligible.
++// Remove with every aram_trace call below.
++static void aram_trace(const char* what) {
++    FILE* tf = std::fopen("ux0:data/tpvita/dvd_trace.txt", "a");
++    if (tf != nullptr) {
++        std::fprintf(tf, "JKRAram: %s\n", what);
++        std::fclose(tf);
++    }
++}
++
+ JKRAram* JKRAram::create(u32 aram_audio_buffer_size, u32 aram_audio_graph_size, s32 stream_priority,
+                          s32 decomp_priority, s32 piece_priority) {
++    aram_trace("create enter");
+     if (!sAramObject) {
+         sAramObject = JKR_NEW_ARGS (JKRGetSystemHeap(), 0)
+             JKRAram(aram_audio_buffer_size, aram_audio_graph_size, piece_priority);
++        aram_trace("JKRAram ctor done");
+     }
+ 
+     JKRCreateAramStreamManager(stream_priority);
++    aram_trace("AramStreamManager done");
+     JKRCreateDecompManager(decomp_priority);
++    aram_trace("DecompManager done");
+     sAramObject->resume();
++    aram_trace("resume done");
+     return sAramObject;
+ }
+ 
+diff --git a/libs/JSystem/src/JKernel/JKRCompArchive.cpp b/libs/JSystem/src/JKernel/JKRCompArchive.cpp
+index acac590ec0..1ccbd85d96 100644
+--- a/libs/JSystem/src/JKernel/JKRCompArchive.cpp
++++ b/libs/JSystem/src/JKernel/JKRCompArchive.cpp
+@@ -86,11 +86,30 @@ bool JKRCompArchive::open(s32 entryNum) {
+     else {
+         int alignment;
+ 
+-        JKRDvdToMainRam(entryNum, (u8 *)arcHeader, EXPAND_SWITCH_UNKNOWN1, 32, NULL, JKRDvdRipper::ALLOC_DIRECTION_FORWARD, 0, &mCompression, NULL);
+-        DCInvalidateRange(arcHeader, 32);
++        void* arcReadResult = JKRDvdToMainRam(entryNum, (u8 *)arcHeader, EXPAND_SWITCH_UNKNOWN1, 32, NULL, JKRDvdRipper::ALLOC_DIRECTION_FORWARD, 0, &mCompression, NULL);
+ 
+         mSizeOfMemPart = arcHeader->field_0x14;
+         mSizeOfAramPart = arcHeader->field_0x18;
++
++        // NOTE: temporary bring-up tracing (see tp-vita/HANDOVER 7.1/7.12b). The assertion below is the
++        // ONLY thing that checks this header, and on a release build JUT_ASSERT compiles out, so a short
++        // or failed read leaves arcHeader uninitialised and the bogus sizes reach JKRAllocFromHeap, which
++        // aborts (TARGET_PC has no soft failure path). This trace writes one line per archive opened so
++        // the failing archive names itself; remove it once the cause is fixed.
++        {
++            FILE* f = std::fopen("ux0:data/tpvita/dvd_trace.txt", "a");
++            if (f != nullptr) {
++                std::fprintf(f,
++                    "JKRCompArchive::open entry=%d readRet=%p compression=%d sig=0x%08X fileLen=%u hdrLen=%u "
++                    "dataOff=%u dataLen=%u memPart=0x%08X aramPart=0x%08X\n",
++                    (int)entryNum, arcReadResult, (int)mCompression, (u32)arcHeader->signature,
++                    (u32)arcHeader->file_length, (u32)arcHeader->header_length,
++                    (u32)arcHeader->file_data_offset, (u32)arcHeader->file_data_length,
++                    (u32)mSizeOfMemPart, (u32)mSizeOfAramPart);
++                std::fclose(f);
++            }
++        }
++
+         JUT_ASSERT(352, ( mSizeOfMemPart & 0x1f ) == 0);
+         JUT_ASSERT(353, ( mSizeOfAramPart & 0x1f ) == 0);
+ 
+diff --git a/libs/JSystem/src/JKernel/JKRExpHeap.cpp b/libs/JSystem/src/JKernel/JKRExpHeap.cpp
+index dc88090a47..dd8cbd4d69 100644
+--- a/libs/JSystem/src/JKernel/JKRExpHeap.cpp
++++ b/libs/JSystem/src/JKernel/JKRExpHeap.cpp
+@@ -9,8 +9,28 @@
+ #include "JSystem/JSupport/JSupport.h"
+ #include "JSystem/JUtility/JUTConsole.h"
+ #include "JSystem/JUtility/JUTException.h"
++#include <cstdarg>
++#include <cstdio>
+ #include <cstdlib>
+ 
++// TEMPORARY BRINGUP TRACE. Written with a per-call fopen/fprintf/fclose because a guest abort
++// discards any buffered stdio, and because OSReport output is lost when the process dies.
++// Only the failure path calls this: tracing every successful do_alloc() opened a file per
++// allocation, which is far too expensive to leave enabled. The heap sizing bugs it was written
++// for are fixed, so only a failure still needs to be identifiable.
++static void exp_trace(const char* fmt, ...) {
++    FILE* tf = std::fopen("ux0:data/tpvita/dvd_trace.txt", "a");
++    if (tf != nullptr) {
++        va_list args;
++        va_start(args, fmt);
++        std::fprintf(tf, "JKRExpHeap: ");
++        std::vfprintf(tf, fmt, args);
++        std::fprintf(tf, "\n");
++        va_end(args);
++        std::fclose(tf);
++    }
++}
++
+ JKRExpHeap* JKRExpHeap::createRoot(int maxHeaps, bool errorFlag) {
+     JKRExpHeap* heap = NULL;
+     if (!sRootHeap) {
+@@ -74,11 +94,20 @@ JKRExpHeap* JKRExpHeap::create(u32 size, JKRHeap* parent, bool errorFlag) {
+     if (alignedSize < expHeapSize + blockSize)
+         return NULL;
+ 
++    exp_trace("create: size=0x%X aligned=0x%X parent=%s parentFree=0x%X before JKRAllocFromHeap",
++              size, alignedSize, parent->getName(), parent->getTotalFreeSize());
++
++    // NOTE: dataPtr is deliberately computed AFTER the null check. The original computed it before,
++    // which is undefined behaviour on a failed allocation (GCC happily folds it into the branch on
++    // some versions). Behaviour is otherwise identical.
+     u8* memory = (u8*)JKRAllocFromHeap(parent, alignedSize, 0x10);
+-    u8* dataPtr = (memory + expHeapSize);
+     if (!memory) {
++        exp_trace("create: JKRAllocFromHeap returned null for 0x%X from %s", alignedSize,
++                  parent->getName());
+         return NULL;
+     }
++    u8* dataPtr = (u8*)memory + expHeapSize;
++    exp_trace("create: JKRAllocFromHeap ok dataPtr=%p", (void*)dataPtr);
+ 
+     newHeap = JKR_NEW_ARGS (memory) JKRExpHeap(dataPtr, alignedSize - expHeapSize, parent, errorFlag);
+ 
+@@ -215,6 +244,13 @@ void* JKRExpHeap::do_alloc(u32 size, int alignment) {
+ 
+ #if TARGET_PC
+     if (!ptr) {
++        // TEMPORARY BRINGUP TRACE: record the failing request before CRASH() aborts the process.
++        // A size this large cannot be a real request, so also record the return address of the
++        // caller: the stack trace printed by the abort path is unwound after this frame.
++        exp_trace("do_alloc FAILING size=0x%X align=%d heap=%s heapsize=0x%X used=0x%X free=0x%X "
++                  "caller=%p",
++                  size, alignment, getName(), getSize(), getTotalUsedSize(), getTotalFreeSize(),
++                  __builtin_return_address(0));
+         // Allocation failed.
+         OSReport_Error(
+             "Failed to alloc memory! (%s) (0x%X bytes).\n  Heap size: 0x%X\n  Used size: 0x%X\n",
+diff --git a/sdk/include/mods/api.h b/sdk/include/mods/api.h
+index 3015130ae3..9964eb14e8 100644
+--- a/sdk/include/mods/api.h
++++ b/sdk/include/mods/api.h
+@@ -158,6 +158,14 @@ typedef enum ServiceExportFlags {
+ #define MOD_META_ALIGN __attribute__((aligned(8)))
+ #endif
+ 
++/* The record sizes below describe the 64-bit mod ABI. 32-bit targets (PS Vita) do not load
++ * native mods, so only check them where pointers are 8 bytes. */
++#if UINTPTR_MAX > 0xFFFFFFFFu
++#define MOD_META_CHECK_SIZE(T, N) static_assert(sizeof(T) == (N), #T " size")
++#else
++#define MOD_META_CHECK_SIZE(T, N) static_assert(sizeof(T) > 0, #T " size")
++#endif
++
+ typedef enum ModMetaKind {
+     MOD_META_PAD = 0,
+     MOD_META_HEADER = 1,
+@@ -194,7 +202,7 @@ typedef struct MOD_META_ALIGN ModMetaImport {
+     ModMetaServiceId service_id;
+ } ModMetaImport;
+ 
+-static_assert(sizeof(ModMetaImport) == 16 + MOD_META_SERVICE_ID_SIZE);
++MOD_META_CHECK_SIZE(ModMetaImport, 16 + MOD_META_SERVICE_ID_SIZE);
+ 
+ typedef struct MOD_META_ALIGN ModMetaExport {
+     ModMetaRecord rec;
+@@ -204,7 +212,7 @@ typedef struct MOD_META_ALIGN ModMetaExport {
+     ModMetaServiceId service_id;
+ } ModMetaExport;
+ 
+-static_assert(sizeof(ModMetaExport) == 16 + MOD_META_SERVICE_ID_SIZE);
++MOD_META_CHECK_SIZE(ModMetaExport, 16 + MOD_META_SERVICE_ID_SIZE);
+ 
+ /* Hook on a function named at link time: `target` carries the &fn relocation. */
+ typedef struct MOD_META_ALIGN ModMetaHookFn {
+@@ -214,7 +222,7 @@ typedef struct MOD_META_ALIGN ModMetaHookFn {
+     void* resolved; /* runtime only */
+ } ModMetaHookFn;
+ 
+-static_assert(sizeof(ModMetaHookFn) == 24);
++MOD_META_CHECK_SIZE(ModMetaHookFn, 24);
+ 
+ /*
+  * Hook on a member function: `pmf` holds the compiler's pointer-to-member representation
+@@ -230,7 +238,7 @@ typedef struct MOD_META_ALIGN ModMetaHookMem {
+     void* resolved; /* runtime only */
+ } ModMetaHookMem;
+ 
+-static_assert(sizeof(ModMetaHookMem) == 32);
++MOD_META_CHECK_SIZE(ModMetaHookMem, 32);
+ 
+ /*
+  * Extended member-function hook record. The Microsoft x64 ABI uses a 24-byte member pointer for
+@@ -251,7 +259,7 @@ typedef struct MOD_META_ALIGN ModMetaHookMemExt {
+     void* resolved; /* runtime only */
+ } ModMetaHookMemExt;
+ 
+-static_assert(sizeof(ModMetaHookMemExt) == 24);
++MOD_META_CHECK_SIZE(ModMetaHookMemExt, 24);
+ 
+ /*
+  * Hook on a function by symbol name, for targets that cannot be named in C++ (file-local statics,
+@@ -264,7 +272,7 @@ typedef struct MOD_META_ALIGN ModMetaHookName {
+     void* resolved; /* runtime only */
+ } ModMetaHookName;
+ 
+-static_assert(sizeof(ModMetaHookName) == 16);
++MOD_META_CHECK_SIZE(ModMetaHookName, 16);
+ 
+ typedef struct ModMeta {
+     uint32_t struct_size;
+diff --git a/src/d/actor/d_a_alink_swindow.inc b/src/d/actor/d_a_alink_swindow.inc
+index 33f1fee37b..a2dabc899d 100644
+--- a/src/d/actor/d_a_alink_swindow.inc
++++ b/src/d/actor/d_a_alink_swindow.inc
+@@ -40,7 +40,17 @@ void daAlink_c::setOriginalHeap(JKRExpHeap** i_ppheap, u32 i_size) {
+         u32 var_r29 = 0x90;
+         u32 var_r28 = 0x10;
+         u32 size = ROUND(i_size, 16);
+-#if TARGET_PC
++#if TARGET_VITA
++        // PORT (tp-vita, taken from DuskOnVita patches/dusklight/0077, HANDOVER 7.15): three times
++        // the original's size, not twenty. Twenty made Link's archive heap 13.3 MiB (0xA2800 * 20 +
++        // 0xA0 = 0xCB20A0), taken in ONE PIECE from the game heap every time Link is created - a
++        // stage change, or the restart after a fall. When no free block that large existed, the
++        // allocation failed and JKRExpHeap's CRASH stopped the game. This tree defines TARGET_PC=1
++        // for the Vita build as well (cmake/GameABIConfig.cmake), so the x20 was live here too:
++        // our own dvd_trace records the identical 0xCB20A0 request against gameHeap.
++        // Measured use on their port: 715-800 KiB archive, 23 KiB shield.
++        size *= 3;
++#elif TARGET_PC
+         size *= 20; // Increase Link's heap size to prevent mods from crashing with higher-quality models.
+ #endif
+         JKRHeap* parent = mDoExt_getGameHeap();
+diff --git a/src/d/d_name.cpp b/src/d/d_name.cpp
+index c41d90ed37..08f73708b6 100644
+--- a/src/d/d_name.cpp
++++ b/src/d/d_name.cpp
+@@ -8,6 +8,7 @@
+ #include "m_Do/m_Do_controller_pad.h"
+ #include <cstdio>
+ #include <cstring>
++#include "dusk/logging.h" // PORT: [name-proc] diagnostic (HANDOVER 3d.6)
+ #include "JSystem/J2DGraph/J2DAnmLoader.h"
+ #include "f_op/f_op_msg_mng.h"
+ 
+@@ -331,6 +332,29 @@ void dName_c::showIcon() {
+ 
+ void dName_c::_move() {
+     stick->checkTrigger();
++    // PORT: [name-proc] diagnostic (HANDOVER 3d.6). The name screen would not close and every guess
++    // about which state it was stuck in was wrong, so log the transition itself. One line per DISTINCT
++    // (mSelProc, mSelMenu, mSelRow/Col) tuple, so a 6,000-frame driven run costs a handful of lines and
++    // the last one printed is the state it ended in.
++    static u8 sLastProc = 0xFF;
++    static u8 sLastMenu = 0xFF;
++    static u8 sLastRow = 0xFF;
++    static u8 sLastCol = 0xFF;
++    if (mSelProc != sLastProc || mSelMenu != sLastMenu || mCharRow != sLastRow ||
++        mCharColumn != sLastCol) {
++        sLastProc = mSelProc;
++        sLastMenu = mSelMenu;
++        sLastRow = mCharRow;
++        sLastCol = mCharColumn;
++        // Values are from the enum in d_name.h, in declaration order:
++        //   proc 0=MOJI_SELECT 1=MOJI_SEL_ANM 2=MOJI_SEL_ANM2 3=MOJI_SEL_ANM3
++        //        4=MENU_SELECT 5=MENU_SEL_ANM 6=MENU_SEL_ANM2 7=MENU_SEL_ANM3 8=WAIT
++        //   menu 0=HIRA 1=KATA 2=EIGO 3=END
++        DuskLog.warn("[name-proc] proc={} menu={} charRow={} charCol={} (proc: 0=MOJI_SELECT 1=MOJI_ANM "
++                     "2=MOJI_ANM2 3=MOJI_ANM3 4=MENU_SELECT 5=MENU_ANM 6=MENU_ANM2 7=MENU_ANM3 8=WAIT; "
++                     "menu: 0=HIRA 1=KATA 2=EIGO 3=END)",
++                     (int)mSelProc, (int)mSelMenu, (int)mCharRow, (int)mCharColumn);
++    }
+     (this->*SelProc[mSelProc])();
+ 
+     #if TARGET_PC || REGION_PAL || REGION_JPN
+@@ -382,6 +406,30 @@ void dName_c::_move() {
+         }
+     } else
+ #endif
++    // PORT: [name-press] diagnostic (HANDOVER 3d.6). [name-proc] proved the screen reaches MENU_SELECT
++    // on MENU_EIGO (menu=2) and then never changes again, while START was pressed 35 times. Two
++    // hypotheses remained and they need different fixes: the press is not DELIVERED (so mDoCPd reports
++    // it to nobody), or it is delivered and every branch ignores it. Log the delivery, once per state.
++    {
++      static u8 sSeenStart = 0xFF;
++      static u8 sSeenA = 0xFF;
++      static u8 sSeenB = 0xFF;
++      const bool pStart = mDoCPd_c::getTrigStart(PAD_1);
++      const bool pA = mDoCPd_c::getTrigA(PAD_1);
++      const bool pB = mDoCPd_c::getTrigB(PAD_1);
++      if (pStart && sSeenStart != mSelProc) {
++        sSeenStart = mSelProc;
++        DuskLog.warn("[name-press] START delivered in proc={} menu={}", (int)mSelProc, (int)mSelMenu);
++      }
++      if (pA && sSeenA != mSelProc) {
++        sSeenA = mSelProc;
++        DuskLog.warn("[name-press] A delivered in proc={} menu={}", (int)mSelProc, (int)mSelMenu);
++      }
++      if (pB && sSeenB != mSelProc) {
++        sSeenB = mSelProc;
++        DuskLog.warn("[name-press] B delivered in proc={} menu={}", (int)mSelProc, (int)mSelMenu);
++      }
++    }
+     if (mDoCPd_c::getTrigB(PAD_1)) {
+         if (mCurPos == 0) {
+             mDoAud_seStart(Z2SE_SY_MENU_BACK, 0, 0, 0);
+diff --git a/src/d/d_s_play.cpp b/src/d/d_s_play.cpp
+index 4bc620d5e2..5c47bfedb1 100644
+--- a/src/d/d_s_play.cpp
++++ b/src/d/d_s_play.cpp
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "d/dolzel.h" // IWYU pragma: keep
++#include "dusk/logging.h" // PORT: [play-phase] diagnostic (HANDOVER 3d.6)
+ 
+ #include "d/d_s_play.h"
+ #include "JSystem/JUtility/JUTConsole.h"
+@@ -1658,8 +1659,30 @@ static int dScnPly_Create(scene_class* i_this) {
+     };
+ 
+     dScnPly_c* a_this = (dScnPly_c*)i_this;
++
++    // PORT DIAGNOSTIC (2026-11-05, HANDOVER 3d.6). The port stalls with the play scene created but
++    // never drawing: draws collapse 441 -> 1 and the resolve counter freezes. The cause is somewhere in
++    // this 11-phase chain, and several phases retry forever by design (return cPhs_INIT_e until a load
++    // completes). Guessing which one costs a session, so this names it: one line per distinct
++    // (phase, returned state) pair, which is at most ~20 lines per process for the whole run.
++    //
++    // The phase index is read from the request itself rather than inferred, so a phase that is never
++    // entered cannot be confused with one that is entered and immediately succeeds.
++    static u8 sSeenPhase[ARRAY_SIZEU(l_method)] = {};
++    static u8 sSeenState[ARRAY_SIZEU(l_method)] = {};
++    const int phaseBefore = a_this->field_0x1c4.id; // index of the phase about to run
++
+     int phase_state = dComLbG_PhaseHandler(&a_this->field_0x1c4, l_method, a_this);
+ 
++    if (phaseBefore >= 0 && phaseBefore < (int)ARRAY_SIZEU(l_method) &&
++        (sSeenPhase[phaseBefore] & (1u << phase_state)) == 0)
++    {
++        sSeenPhase[phaseBefore] |= (u8)(1u << phase_state);
++        sSeenState[phaseBefore] = (u8)phase_state;
++        DuskLog.warn("[play-phase] index={} -> state={} (0=INIT/retry 1=LOADING 2=NEXT 3=UNK3 4=COMPLEATE 5=ERROR)",
++                     phaseBefore, phase_state);
++    }
++
+     #if TARGET_PC
+     autoSaved = FALSE;
+     #endif
+diff --git a/src/dusk/audio/DspStub.cpp b/src/dusk/audio/DspStub.cpp
+index c2dec809f2..e6749d1331 100644
+--- a/src/dusk/audio/DspStub.cpp
++++ b/src/dusk/audio/DspStub.cpp
+@@ -4,8 +4,33 @@
+ #include "global.h"
+ #include "os.h"
+ 
++/*
++ * Lifeline for the legacy DSP-task entry points.
++ *
++ * Dusklight does not emulate the GameCube DSP as a task processor. Audio is
++ * instead produced entirely by the software DSP in DuskDsp.cpp, driven by the
++ * SDL3 audio-stream callback (DuskAudioSystem::GetNewAudio). These functions
++ * are the *old* direct-DSP-emulation interface; the game's JAudio path does not
++ * reach them (no source file in the tree calls them, but they are present in
++ * the linked Vita ELF). They are kept as resolvable, non-fatal no-ops so that any code path
++ * that does link one (e.g. a future audio rework) cannot abort the whole app.
++ * Each is called at most once per boot for diagnostics; repeated calls are
++ * suppressed.
++ */
++
++namespace {
++bool s_logged = false;
++void log_once() {
++    if (!s_logged) {
++        s_logged = true;
++        OSReport("DspStub: legacy DSP-task entry point called; software DSP "
++                 "(DuskDsp) is the active audio path.\n");
++    }
++}
++}  // namespace
++
+ void DSPReleaseHalt2(u32) {
+-    CRASH("We do not directly emulate the DSP");
++    log_once();
+ }
+ void DsetupTable(u32, u32, u32, u32, u32) {
+     // Nada.
+@@ -14,22 +39,23 @@ void DsetMixerLevel(f32) {
+     // Nada for now, but maybe we should care about this?
+ }
+ void DsyncFrame2ch(u32, u32, u32) {
+-    CRASH("We do not directly emulate the DSP");
++    log_once();
+ }
+ void DsyncFrame4ch(u32, u32, u32, u32, u32) {
+-    CRASH("We do not directly emulate the DSP");
++    log_once();
+ }
+ 
+ void DspBoot(void (*)(void*)) {
+-    CRASH("We do not directly emulate the DSP");
++    log_once();
+ }
+ void DspFinishWork(u16) {
+-    CRASH("We do not directly emulate the DSP");
++    log_once();
+ }
+ int DSPSendCommands2(u32*, u32, void (*)(u16)) {
+-    CRASH("We do not directly emulate the DSP");
++    log_once();
++    return 0;
+ }
+ 
+ void DsyncFrame2(u32, u32, u32) {
+-    CRASH("We do not directly emulate the DSP");
++    log_once();
+ }
+diff --git a/src/dusk/iso_validate.cpp b/src/dusk/iso_validate.cpp
+index bd8e293805..b68d9f1a23 100644
+--- a/src/dusk/iso_validate.cpp
++++ b/src/dusk/iso_validate.cpp
+@@ -126,6 +126,17 @@ ValidationError validate(const char* path, VerificationStatus& status, DiscInfo&
+ ValidationError inspect(const char* path, DiscInfo& info) {
+     const auto result = borealis::disc::inspect(
+         path == nullptr ? std::string_view{} : std::string_view{path}, DiscCatalog);
++    // TEMPORARY bring-up tracing (remove with the dvd.cpp patches): record nod's own status/message so
++    // a device-side validation failure can be told apart from a host-side one.
++    {
++        FILE* tf = std::fopen("ux0:data/tpvita/dvd_trace.txt", "a");
++        if (tf != nullptr) {
++            std::fprintf(tf, "inspect: status=%d message='%s' gameId='%s' logicalSize=%llu\n",
++                static_cast<int>(result.status), result.message.c_str(), result.metadata.gameId.c_str(),
++                static_cast<unsigned long long>(result.metadata.logicalSize));
++            std::fclose(tf);
++        }
++    }
+     update_info(result, info);
+     return validation_error(result.status);
+ }
+diff --git a/src/dusk/main.h b/src/dusk/main.h
+index e3db4420d1..4fcb4495f6 100644
+--- a/src/dusk/main.h
++++ b/src/dusk/main.h
+@@ -21,7 +21,7 @@ struct StageRequest {
+ extern StageRequest StageRequested;
+ 
+ #if defined(__ANDROID__) || (defined(TARGET_OS_IOS) && TARGET_OS_IOS) ||                           \
+-    (defined(TARGET_OS_TV) && TARGET_OS_TV)
++    (defined(TARGET_OS_TV) && TARGET_OS_TV) || defined(__vita__)
+ inline constexpr bool SupportsProcessRestart = false;
+ #else
+ inline constexpr bool SupportsProcessRestart = true;
+diff --git a/src/dusk/ui/ui.cpp b/src/dusk/ui/ui.cpp
+index 88f19a5914..551482c31c 100644
+--- a/src/dusk/ui/ui.cpp
++++ b/src/dusk/ui/ui.cpp
+@@ -123,6 +123,10 @@ bool initialize() noexcept {
+     return true;
+ }
+ 
++bool is_initialized() noexcept {
++    return sInitialized && aurora::rmlui::is_initialized();
++}
++
+ void shutdown() noexcept {
+     mods::updates::shutdown();
+     mods::queue::shutdown();
+diff --git a/src/dusk/ui/ui.hpp b/src/dusk/ui/ui.hpp
+index 3478134d4c..ee8dab486f 100644
+--- a/src/dusk/ui/ui.hpp
++++ b/src/dusk/ui/ui.hpp
+@@ -85,6 +85,10 @@ struct Insets {
+ bool initialize() noexcept;
+ void shutdown() noexcept;
+ 
++// False when the platform exposes no RmlUi context. Every UI document constructor dereferences
++// the RmlUi ElementDocument it loads, so callers must not build documents while this is false.
++bool is_initialized() noexcept;
++
+ void handle_event(const SDL_Event& event) noexcept;
+ void update() noexcept;
+ 
+diff --git a/src/m_Do/m_Do_machine.cpp b/src/m_Do/m_Do_machine.cpp
+index 3d0acca1a9..f4fc6e61a2 100644
+--- a/src/m_Do/m_Do_machine.cpp
++++ b/src/m_Do/m_Do_machine.cpp
+@@ -29,6 +29,11 @@
+ #include "DynamicLink.h"
+ #include "os_report.h"
+ 
++// TEMPORARY BRINGUP TRACE includes; remove with mch_trace below.
++#include <cstdio>
++#include <exception>
++#include <system_error>
++
+ #if TARGET_PC
+ #include <assert.h>
+ #include "dusk/ui/ui.hpp"
+@@ -753,12 +758,25 @@ void myGXVerifyCallback(GXWarningLevel param_1, u32 param_2, const char* param_3
+ }
+ #endif
+ 
++// TEMPORARY BRINGUP TRACE. Written with a per-call fopen/fprintf/fclose because a guest abort
++// discards any buffered stdio, and because OSReport output is lost when the process dies.
++// Remove this helper (and every mch_trace call below) once the game reaches its main loop.
++static void mch_trace(const char* what) {
++    FILE* tf = std::fopen("ux0:data/tpvita/dvd_trace.txt", "a");
++    if (tf != nullptr) {
++        std::fprintf(tf, "mDoMch: %s\n", what);
++        std::fclose(tf);
++    }
++}
++
+ int mDoMch_Create() {
++    mch_trace("enter");
+ #ifdef NDEBUG
+     if (mDoMain::developmentMode == 0 || !(OSGetConsoleType() & 0x10000000)) {
+         OSReportDisable();
+     }
+ #endif
++    mch_trace("OSReportDisable path done");
+ 
+     JKRHeap::setDefaultDebugFill(mDoMch::mDebugFill);
+     #if DEBUG
+@@ -767,8 +785,21 @@ int mDoMch_Create() {
+     JKRSetDebugFillDelete(mDoMch::mDebugFillDelete);
+     #endif
+     JFWSystem::setMaxStdHeap(1);
+-
+-    #if !DEBUG
++    mch_trace("setMaxStdHeap done");
++
++    #if !DEBUG && !TARGET_VITA
++    // NOTE: retail hardware trim, GameCube-only. OSGetArenaHi() is 0x81700000 on a real console, and
++    // the retail build reclaimed the 24 MiB that development hardware reserved for its debug arena.
++    // The threshold is a physical GameCube address; a Vita process relocates the guest arena (the
++    // executable and the newlib heap live outside it), so the comparison is meaningless here.
++    //
++    // It is not merely meaningless, it fires. Measured in Vita3K with this branch enabled:
++    //   arena lo=0x8314c1a8 hi=0x871481a8 size=41926416   (40 MiB, after the trim)
++    // with the branch compiled out, the same run reports:
++    //   arena lo=0x8314c1a8 hi=0x871481a8 size=67092240   (64 MiB)
++    // The delta is exactly 0x1800000 = 24 MiB. So the guest arena had 24 MiB removed on every run,
++    // for a machine that is not there, and the heaps carved from it were sized against a figure that
++    // the platform never returns. Bounded heaps are chosen further down under #if TARGET_VITA.
+     uintptr_t arenaHi = (uintptr_t)OSGetArenaHi();
+     uintptr_t arenaLo = (uintptr_t)OSGetArenaLo();
+ 
+@@ -779,6 +810,13 @@ int mDoMch_Create() {
+ 
+     u32 arenaSize = ((uintptr_t)OSGetArenaHi() - (uintptr_t)OSGetArenaLo()) - 0xF0;
+     my_PrintHeap("アリーナ", arenaSize);
++    {
++        char buf[192];
++        std::snprintf(buf, sizeof(buf), "arena lo=%08x hi=%08x size=%u",
++                      (unsigned)(uintptr_t)OSGetArenaLo(), (unsigned)(uintptr_t)OSGetArenaHi(),
++                      (unsigned)arenaSize);
++        mch_trace(buf);
++    }
+ 
+     if (mDoMain::memMargin != -1) {
+         arenaSize += mDoMain::memMargin;
+@@ -855,18 +893,81 @@ int mDoMch_Create() {
+ 
+ #if TARGET_PC
+     // Change heap sizes to account for 64bit pointers & extra memory available.
+-    arenaSize = 32 * 1024 * 1024;
+     commandHeapSize *= 2;
+ #if DEBUG
+     dynamicLinkHeapSize *= 2;
+ #endif
++#if TARGET_VITA
++    // The numbers above arrive here as the GameCube layout ("*= 2 for 64-bit pointers", and a
++    // gameHeapSize multiplied by 20 because the desktop port kept hitting allocation failures).
++    // On a Vita those multipliers are impossible: the whole arena is about 40 MiB, while this block
++    // was asking for archive 17.7 MiB + game 86.1 MiB + system 32 MiB. JKRExpHeap::create returned
++    // NULL and JKRHEAP_NAME wrote through the null heap, which is the "Invalid write at 0x1" abort
++    // seen on device.
++    //
++    // This is a 32-bit build like the GameCube, so the "64-bit pointer" doubling does not apply:
++    // the archive and J2D heaps keep their GameCube sizes. The game heap gets a moderate factor
++    // instead of 20x. The system heap then takes whatever the arena has left, which is not waste:
++    // mDoExt_createZeldaHeap() carves zeldaHeap out of the system heap's free space further down,
++    // so the system heap doubles as the Zelda/engine pool.
++    {
++        // Size the budget from the arena that OSInit() actually handed us rather than from
++        // arenaSize, which has already had the GameCube-only reserves (0xDAB400 and friends)
++        // subtracted from it and so under-reports the real arena by ~14 MiB.
++        const u32 arenaTotal =
++            (u32)((uintptr_t)OSGetArenaHi() - (uintptr_t)OSGetArenaLo());
++
++        archiveHeapSize = 0x8E0000;  // 8.875 MiB, the un-doubled GameCube value
++        j2dHeapSize = 0x7D000;       // 500 KiB, the un-doubled GameCube value
++        // 23 MiB. The desktop build uses 20x the GameCube value (~85 MiB), which cannot exist in a
++        // 40 MiB arena, so the size is set from measurement instead: with 17 MiB the heap ran dry
++        // (a 0x9AF30 request failed with free=0x0) while the System/zelda pool still held ~8 MiB
++        // unused. The extra 6 MiB here is taken from that idle pool.
++        gameHeapSize = 0x1700000;
++
++        // The system heap (arenaSize below) is created as a child of the R00T heap, not as the
++        // root heap itself, so it cannot be given the whole arena. Whatever the root heap keeps
++        // has to cover:
++        //   * the dvdHeap created further down in this function: JKRCreateExpHeap(0x10000, NULL),
++        //     i.e. 64 KiB from the root heap, plus its own JKRExpHeap/CMemBlock overhead;
++        //   * the system heap's own JKRExpHeap object plus one CMemBlock.
++        // Without this reserve the root heap is left with ~480 bytes too few, do_alloc() fails, and
++        // the TARGET_PC error path calls CRASH() -> Log.fatal() -> abort(): the process dies with
++        // SIGABRT a few statements before "dvdHeap created" in the bring-up trace.
++        //
++        // VitaRootReserve is rounded up generously (192 KiB) rather than computed exactly, because
++        // the size of JKRExpHeap differs between GCC/versions and the failure mode is a hard abort.
++        constexpr u32 VitaRootReserve = 0x30000;
++
++        u32 reserved = archiveHeapSize + j2dHeapSize + gameHeapSize + commandHeapSize +
++                       dbPrintHeapSize + VitaRootReserve;
++#if DEBUG
++        reserved += dynamicLinkHeapSize;
++#endif
++
++        // Always leave the system/zelda pool a usable share: JUT_ASSERT in mDoMch_Create() requires
++        // the Zelda heap (carved from this heap's free space) to be non-empty.
++        arenaSize = (reserved < arenaTotal) ? (arenaTotal - reserved) : (arenaTotal / 4);
++
++        char buf[192];
++        std::snprintf(buf, sizeof(buf),
++                      "vita heap budget: arenaTotal=%u sys=%u archive=%u j2d=%u game=%u reserved=%u rootReserve=%u",
++                      (unsigned)arenaTotal, (unsigned)arenaSize, (unsigned)archiveHeapSize,
++                      (unsigned)j2dHeapSize, (unsigned)gameHeapSize, (unsigned)reserved,
++                      (unsigned)VitaRootReserve);
++        mch_trace(buf);
++    }
++#else
++    arenaSize = 32 * 1024 * 1024;
+     archiveHeapSize *= 2;
+     j2dHeapSize *= 2;
+     gameHeapSize *= 20; // NOTE: increased from 2 to 20 to try to solve heap alloc crashes. maybe do a better fix later
++#endif
+ #endif
+ 
+     JFWSystem::setSysHeapSize(arenaSize);
+     my_PrintHeap("システムヒープ", arenaSize);
++    mch_trace("setSysHeapSize done");
+ 
+     if (arenaSize) {
+         // Fakematch to force arenaSize into a register for debug.
+@@ -879,6 +980,7 @@ int mDoMch_Create() {
+     JFWSystem::setAramAudioBufSize(0xA00000);
+     #endif
+     JFWSystem::setAramGraphBufSize(-1);
++    mch_trace("aram/gfx buffer sizes set");
+ 
+     #if DEBUG
+     VIInit();
+@@ -910,10 +1012,31 @@ int mDoMch_Create() {
+ 
+     JFWSystem::setRenderMode(mDoMch_render_c::getRenderModeObj());
+     JFWSystem::firstInit();
++    mch_trace("JFWSystem::firstInit done");
+     JKRExpHeap* dbPrintHeap = mDoExt_createDbPrintHeap(dbPrintHeapSize, JKRGetRootHeap());
++    mch_trace("createDbPrintHeap done");
+     JUTDbPrint::start(NULL, dbPrintHeap);
++    mch_trace("JUTDbPrint::start done");
+     mDoExt_createAssertHeap(JKRGetRootHeap());
+-    JFWSystem::init();
++    mch_trace("createAssertHeap done");
++    // TEMPORARY BRINGUP DIAGNOSTIC: the guest aborts with an uncaught std::system_error somewhere
++    // inside JFWSystem::init(). Catch it here so the trace records what() and the error code,
++    // which names the failing operation instead of only its unwind frame.
++    try {
++        JFWSystem::init();
++    } catch (const std::system_error& e) {
++        char buf[512];
++        std::snprintf(buf, sizeof(buf), "JFWSystem::init threw system_error code=%d what=%s",
++                      e.code().value(), e.what());
++        mch_trace(buf);
++        throw;
++    } catch (const std::exception& e) {
++        char buf[512];
++        std::snprintf(buf, sizeof(buf), "JFWSystem::init threw exception what=%s", e.what());
++        mch_trace(buf);
++        throw;
++    }
++    mch_trace("JFWSystem::init done");
+ 
+     if (mDoMain::developmentMode == 0) {
+         JUTAssertion::setVisible(false);
+@@ -923,6 +1046,7 @@ int mDoMch_Create() {
+     JKRSetErrorHandler(myMemoryErrorRoutine);
+     JKRSetErrorFlag(JKRHeap::getRootHeap(), true);
+     JKRSetErrorFlag(JFWSystem::getSystemHeap(), true);
++    mch_trace("error handlers set");
+ 
+     JKRHeap* rootHeap = (JKRHeap*)JKRGetRootHeap();
+     #if DEBUG
+@@ -931,8 +1055,10 @@ int mDoMch_Create() {
+     JKRHeap* rootHeap2 = rootHeap;
+     #endif
+ 
++    mch_trace("about to create command heap");
+     // Command Heap size: 4 KB
+     heap = mDoExt_createCommandHeap(commandHeapSize, rootHeap);
++    mch_trace("command heap created");
+     my_SysPrintHeap("コマンドヒープ", heap, commandHeapSize);
+ 
+     #if DEBUG
+@@ -940,17 +1066,31 @@ int mDoMch_Create() {
+     my_SysPrintHeap("ダイナミックリンクヒープ", heap, dynamicLinkHeapSize);
+     #endif
+ 
++    {
++        char buf[256];
++        std::snprintf(buf, sizeof(buf),
++                      "sizes: arena=%u sys=%u cmd=%u archive=%u j2d=%u game=%u rootFree=%d sysFree=%d",
++                      (unsigned)arenaSize, (unsigned)JFWSystem::CSetUpParam::sysHeapSize,
++                      (unsigned)commandHeapSize, (unsigned)archiveHeapSize, (unsigned)j2dHeapSize,
++                      (unsigned)gameHeapSize, (int)JKRGetRootHeap()->getTotalFreeSize(),
++                      (int)JKRGetSystemHeap()->getTotalFreeSize());
++        mch_trace(buf);
++    }
+     // Archive Heap size: 9085 KB
+     heap = mDoExt_createArchiveHeap(archiveHeapSize, rootHeap2);
++    mch_trace("mDoExt_createArchiveHeap returned");
+     my_SysPrintHeap("アーカイブヒープ", heap, archiveHeapSize);
++    mch_trace("archive heap created");
+ 
+     // J2D Heap size: 500 KB
+     heap = mDoExt_createJ2dHeap(j2dHeapSize, rootHeap2);
++    mch_trace("j2d heap created");
+     my_SysPrintHeap("Ｊ２Ｄ用ヒープ", heap, j2dHeapSize);
+ 
+     // Game Heap size: 4408 KB
+     heap = mDoExt_createGameHeap(gameHeapSize, rootHeap);
+     my_SysPrintHeap("ゲームヒープ", heap, gameHeapSize);
++    mch_trace("game heap created");
+ 
+     #if DEBUG
+     JKRHeap* sp28 = rootHeap2;
+@@ -967,6 +1107,7 @@ int mDoMch_Create() {
+     JKRHeap* zeldaHeap = mDoExt_createZeldaHeap(size, systemHeap);
+     my_SysPrintHeap("ゼルダヒープ", zeldaHeap, size);
+     JKRSetCurrentHeap(zeldaHeap);
++    mch_trace("zelda heap created");
+ 
+     #if DEBUG
+     my_PrintHeap("システムヒープ", JKRGetSystemHeap()->getTotalFreeSize());
+@@ -976,13 +1117,16 @@ int mDoMch_Create() {
+ 
+     JKRSetAramTransferBuffer(NULL, 0x2000, JKRGetSystemHeap());
+     JKRThreadSwitch::createManager(NULL);
++    mch_trace("JKRThreadSwitch::createManager done");
+     { // Fakematch to fix stack on debug, unsure where this block is supposed to go
+     JKRThread* thread = JKR_NEW JKRThread(OSGetCurrentThread(), 0);
+     }
++    mch_trace("JKRThread(current) constructed");
+ 
+     JUTConsole* sysConsole = JFWSystem::getSystemConsole();
+     sysConsole->setOutput(JUTConsole::OUTPUT_CONSOLE | JUTConsole::OUTPUT_OSREPORT);
+     sysConsole->setPosition(16, 42);
++    mch_trace("system console configured");
+ 
+     JUTException::setMapFile(MAP_FOLDER MAP_FILE);
+     #if TARGET_PC
+@@ -994,22 +1138,32 @@ int mDoMch_Create() {
+     #endif
+ 
+     cMl::init(mDoExt_getZeldaHeap());
++    mch_trace("cMl::init done");
+     cM_initRnd(100, 100, 100);
++    mch_trace("cM_initRnd done");
+     #if DEBUG
+     GXSetVerifyLevel((GXWarningLevel)mDoMch::GXWarningLevel);
+     GXSetVerifyCallback((GXVerifyCallback)&myGXVerifyCallback);
+     #endif
+     JKRDvdRipper::setSZSBufferSize(0x4000);
++    mch_trace("JKRDvdRipper::setSZSBufferSize done");
+ #if TARGET_PC
++    mch_trace("before dvdHeap create");
+     JKRHeap* dvdHeap = JKRCreateExpHeap(0x10000, NULL, false);
+-    JKRHEAP_NAME(dvdHeap, "dvdHeap");
+-    assert(dvdHeap != NULL);
+-    JKRDvdRipper::setHeap(dvdHeap);
++    mch_trace(dvdHeap != NULL ? "dvdHeap created" : "dvdHeap create FAILED (null)");
++    if (dvdHeap != NULL) {
++        JKRHEAP_NAME(dvdHeap, "dvdHeap");
++        JKRDvdRipper::setHeap(dvdHeap);
++        mch_trace("dvdHeap installed");
++    }
+ #endif
+     JKRDvdAramRipper::setSZSBufferSize(0x4000);
+     JKRAram::setSZSBufferSize(0x2000);
++    mch_trace("dvd aram/aram szs buffer sizes set");
+     mDoDvdThd::create(OSGetThreadPriority(OSGetCurrentThread()) - 2);
++    mch_trace("mDoDvdThd::create done");
+     mDoDvdErr_ThdInit();
++    mch_trace("mDoDvdErr_ThdInit done");
+ 
+ #if TARGET_PC
+     if (!dusk::ui::is_prelaunch_open()) {
+@@ -1018,7 +1172,9 @@ int mDoMch_Create() {
+ #else
+     mDoMemCd_ThdInit();
+ #endif
++    mch_trace("mDoMemCd_ThdInit path done");
+ 
++    mch_trace("return 1");
+     return 1;
+ }
+ 
+diff --git a/src/m_Do/m_Do_main.cpp b/src/m_Do/m_Do_main.cpp
+index e713e1308d..14615c9e5a 100644
+--- a/src/m_Do/m_Do_main.cpp
++++ b/src/m_Do/m_Do_main.cpp
+@@ -188,12 +188,21 @@ bool launchUILoop() {
+ }
+ 
+ void main01(void) {
++    const auto m01 = [](const char* what) {
++        FILE* tf = std::fopen("ux0:data/tpvita/dvd_trace.txt", "a");
++        if (tf != nullptr) { std::fprintf(tf, "main01: %s\n", what); std::fclose(tf); }
++    };
++    m01("enter");
+     OS_REPORT("\x1b[m");
+ 
+     // 1. Setup
++    m01("mDoMch_Create");
+     mDoMch_Create();
++    m01("mDoGph_Create");
+     mDoGph_Create();
++    m01("mDoCPd_c::create");
+     mDoCPd_c::create();
++    m01("setup done");
+ 
+     // Console Setup
+     JUTConsole* console = JFWSystem::getSystemConsole();
+@@ -229,6 +238,7 @@ void main01(void) {
+ 
+     dusk::game_clock::initialize();
+ 
++    m01("entering main loop");
+     do {
+         // 1. Update Window Events
+         const AuroraEvent* event = aurora_update();
+@@ -758,12 +768,16 @@ int game_main(int argc, char* argv[]) {
+     }
+ 
+     dusk::texture_replacements::reload();
+-    dusk::ui::initialize();
+-    dusk::ui::apply_scale();
+-    dusk::ui::push_document(std::make_unique<dusk::ui::Overlay>(), true, true);
+-    dusk::ui::push_document(std::make_unique<dusk::ui::TouchControls>(), false, true);
+-    dusk::ui::push_document(std::make_unique<dusk::ui::MenuBar>(), false);
+-    dusk::ui::push_document(std::make_unique<dusk::ui::CommandConsole>(), false);
++    // ui::initialize() returns false when the platform has no RmlUi context (the Vita backend does
++    // not implement aurora::rmlui yet). Building the documents anyway dereferences the null
++    // ElementDocument: Overlay's constructor calls mDocument->GetElementById() with no guard.
++    if (dusk::ui::initialize()) {
++        dusk::ui::apply_scale();
++        dusk::ui::push_document(std::make_unique<dusk::ui::Overlay>(), true, true);
++        dusk::ui::push_document(std::make_unique<dusk::ui::TouchControls>(), false, true);
++        dusk::ui::push_document(std::make_unique<dusk::ui::MenuBar>(), false);
++        dusk::ui::push_document(std::make_unique<dusk::ui::CommandConsole>(), false);
++    }
+ 
+     // Invalidate a bad saved isoPath so that Dusklight can't get blocked from starting up.
+     // This is only a metadata check; full hash verification is handled by the prelaunch UI.
+@@ -797,20 +811,60 @@ int game_main(int argc, char* argv[]) {
+     if (parsed_arg_options.count("dvd")) {
+         dvdLocation = parsed_arg_options["dvd"].as<std::string>();
+         dvdPath = resolveDvdLocation(dvdLocation);
+-        if (dusk::iso::inspect(dvdLocation.c_str(), discInfo) ==
++        // TEMPORARY bring-up tracing (remove with the dvd.cpp patches): the game aborts before the
++        // buffered game log is flushed, so append the stage to a file that flushes per call.
++        {
++            FILE* tf = std::fopen("ux0:data/tpvita/dvd_trace.txt", "a");
++            if (tf != nullptr) {
++                std::fprintf(tf, "main: --dvd passed, location='%s' resolved='%s'\n",
++                    dvdLocation.c_str(), dvdPath.c_str());
++                std::fclose(tf);
++            }
++        }
++        const auto inspectResult = dusk::iso::inspect(dvdLocation.c_str(), discInfo);
++        {
++            FILE* tf = std::fopen("ux0:data/tpvita/dvd_trace.txt", "a");
++            if (tf != nullptr) {
++                std::fprintf(tf, "main: inspect returned %d\n", static_cast<int>(inspectResult));
++                std::fclose(tf);
++            }
++        }
++        if (inspectResult ==
+             dusk::iso::ValidationError::Success)
+         {
+             DuskLog.info("Loading DVD image from command line: {}", dvdPath);
+             dvd_opened = aurora_dvd_open(dvdPath.c_str());
++            {
++                FILE* tf = std::fopen("ux0:data/tpvita/dvd_trace.txt", "a");
++                if (tf != nullptr) {
++                    std::fprintf(tf, "main: aurora_dvd_open returned %d\n", dvd_opened ? 1 : 0);
++                    std::fclose(tf);
++                }
++            }
+             if (!dvd_opened) {
+                 DuskLog.warn("Failed to open DVD image from command line: {}, opening prelaunch UI",
+                     dvdPath);
+                 forcePreLaunchUI = true;
+             } else {
+-                dusk::getSettings().backend.isoPath.setValue(dvdLocation);
+-                dusk::getSettings().backend.isoVerification.setValue(
+-                    dusk::DiscVerificationState::Unknown);
+-                dusk::config::save();
++                // TEMPORARY bring-up tracing: find which statement in this branch aborts. Each step is
++                // caught so the trace shows whether the exception escapes or is swallowed.
++                const auto tstep = [](const char* what) {
++                    FILE* tf = std::fopen("ux0:data/tpvita/dvd_trace.txt", "a");
++                    if (tf != nullptr) {
++                        std::fprintf(tf, "main: %s\n", what);
++                        std::fclose(tf);
++                    }
++                };
++                tstep("setValue(isoPath) begin");
++                try { dusk::getSettings().backend.isoPath.setValue(dvdLocation); }
++                catch (const std::exception& e) { tstep((std::string("setValue(isoPath) threw: ") + e.what()).c_str()); }
++                tstep("setValue(isoVerification) begin");
++                try { dusk::getSettings().backend.isoVerification.setValue(dusk::DiscVerificationState::Unknown); }
++                catch (const std::exception& e) { tstep((std::string("setValue(isoVerification) threw: ") + e.what()).c_str()); }
++                tstep("config::save begin");
++                try { dusk::config::save(); }
++                catch (const std::exception& e) { tstep((std::string("config::save threw: ") + e.what()).c_str()); }
++                tstep("branch done");
+                 dusk::IsGameLaunched = true;
+                 skipPreLaunchUI = true;
+             }
+@@ -835,9 +889,17 @@ int game_main(int argc, char* argv[]) {
+         skipPreLaunchUI = true;
+     }
+ 
++    {
++        FILE* tf = std::fopen("ux0:data/tpvita/dvd_trace.txt", "a");
++        if (tf != nullptr) { std::fprintf(tf, "main: log_verification_state begin\n"); std::fclose(tf); }
++    }
+     dusk::iso::log_verification_state(
+         dusk::getSettings().backend.isoPath.getValue(),
+         dusk::getSettings().backend.isoVerification.getValue());
++    {
++        FILE* tf = std::fopen("ux0:data/tpvita/dvd_trace.txt", "a");
++        if (tf != nullptr) { std::fprintf(tf, "main: log_verification_state done\n"); std::fclose(tf); }
++    }
+ 
+     bool showPrelaunchAfterInit = true;
+     if (!dvd_opened && (dusk::getSettings().backend.isoPath.getValue().empty() || (forcePreLaunchUI && skipPreLaunchUI))) {
+@@ -863,7 +925,7 @@ int game_main(int argc, char* argv[]) {
+         }
+ 
+         if (!skipPreLaunchUI) {
+-            if (!showPrelaunchAfterInit) {
++            if (!showPrelaunchAfterInit && dusk::ui::is_initialized()) {
+                 dusk::ui::push_document(std::make_unique<dusk::ui::Prelaunch>(), true);
+             }
+ 
+@@ -902,10 +964,22 @@ int game_main(int argc, char* argv[]) {
+         dusk::IsGameLaunched = true;
+     }
+ 
++    {
++        FILE* tf = std::fopen("ux0:data/tpvita/dvd_trace.txt", "a");
++        if (tf != nullptr) { std::fprintf(tf, "main: version::init begin\n"); std::fclose(tf); }
++    }
+     dusk::version::init();
+     LanguageInit();
++    {
++        FILE* tf = std::fopen("ux0:data/tpvita/dvd_trace.txt", "a");
++        if (tf != nullptr) { std::fprintf(tf, "main: LanguageInit done, OSInit begin\n"); std::fclose(tf); }
++    }
+ 
+     OSInit();
++    {
++        FILE* tf = std::fopen("ux0:data/tpvita/dvd_trace.txt", "a");
++        if (tf != nullptr) { std::fprintf(tf, "main: OSInit done\n"); std::fclose(tf); }
++    }
+ 
+     mDoMain::sPowerOnTime = DUSK_IF_ELSE(OSGetSystemTime(), OSGetTime());
+ 
+@@ -934,12 +1008,12 @@ int game_main(int argc, char* argv[]) {
+         mods_init(dusk::ConfigPath / "mods");
+     }
+ 
+-    if (!skipPreLaunchUI && showPrelaunchAfterInit) {
++    if (!skipPreLaunchUI && showPrelaunchAfterInit && dusk::ui::is_initialized()) {
+         dusk::ui::push_document(std::make_unique<dusk::ui::Prelaunch>(), true);
+     }
+ 
+     if (skipPreLaunchUI == true) {
+-        if (dusk::gamemode::getGameModeManager().getRegisteredGameModes().size() > 1 && dusk::getSettings().backend.skipPreLaunchUI.getValue()) {
++        if (dusk::gamemode::getGameModeManager().getRegisteredGameModes().size() > 1 && dusk::getSettings().backend.skipPreLaunchUI.getValue() && dusk::ui::is_initialized()) {
+             // Force pre-launch if we have registered gamemodes that we need to choose from
+             dusk::ui::push_document(std::make_unique<dusk::ui::Prelaunch>(), true);
+         } else {
+@@ -949,18 +1023,26 @@ int game_main(int argc, char* argv[]) {
+     }
+ 
+ #if BOREALIS_HAS_SENTRY
+-    if (borealis::sentry::get_consent() == borealis::sentry::Consent::Unknown) {
++    if (borealis::sentry::get_consent() == borealis::sentry::Consent::Unknown && dusk::ui::is_initialized()) {
+         dusk::ui::push_document(std::make_unique<dusk::ui::CrashReportWindow>());
+     }
+ #endif
+ 
+-    if (!dusk::getSettings().backend.wasPresetChosen) {
++    if (!dusk::getSettings().backend.wasPresetChosen && dusk::ui::is_initialized()) {
+         dusk::ui::push_document(std::make_unique<dusk::ui::PresetWindow>());
+     }
+ 
++    {
++        FILE* tf = std::fopen("ux0:data/tpvita/dvd_trace.txt", "a");
++        if (tf != nullptr) { std::fprintf(tf, "main: reached main01\n"); std::fclose(tf); }
++    }
+     OSReport("Starting main01 (Game Loop)...\n");
+ 
+     main01();
++    {
++        FILE* tf = std::fopen("ux0:data/tpvita/dvd_trace.txt", "a");
++        if (tf != nullptr) { std::fprintf(tf, "main: main01 returned\n"); std::fclose(tf); }
++    }
+     borealis::shutdown();
+ 
+     // We need to cleanly shut down the threads to avoid crashes on shutdown.

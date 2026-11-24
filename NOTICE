@@ -29,6 +29,11 @@ Game code and libraries (git submodules of the Dusklight checkout)
   modifications and are listed in HANDOVER.md; they are not applied to the upstream repository.
   No copy of the Dusklight tree is redistributed here.
 
+  Because the edits are not pushed anywhere, they are carried in patches/dusklight/ instead:
+  tools/fetch_dusklight.sh clones the pin above, asserts both submodule revisions, and applies the
+  series. Applying the series to that pin reproduces this project's build tree exactly; no upstream
+  source is vendored in this repository, only the delta against it.
+
   Aurora is built from a merged tree generated at configure time by tools/build_aurora_tree.py, from
   upstream lib/** plus the whole-file replacements in vita/aurora/overlay/ and the substitutions in
   vita/aurora/patches.py. build/aurora_lib is a build product and is never edited or committed.
