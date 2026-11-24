@@ -1,0 +1,151 @@
+name: Release VPK
+
+# Builds both deliverable VPKs and attaches them to a GitHub release.
+#
+# Two triggers:
+#   * a tag push builds and attaches to that tag's release;
+#   * workflow_dispatch builds the same artifacts as run artifacts and publishes nothing, so a
+#     build can be checked without creating a release.
+#
+# What this does NOT claim: that a VPK built here behaves like the v0.1 artifacts, which were built
+# locally. Nothing in this workflow has been run on a Vita or in Vita3K, and the emulator step that
+# would test "it boots" is deliberately absent. The only claims made here are the ones the steps
+# check: it compiles, it packages, each VPK carries the title id its build type promises, and the
+# text segment leaves room for vita-elf-create's SCE data.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # The pin the port is built and measured against. HANDOVER.md 7.4c records why this matters: the
+  # port consumes a PREBUILT libvitaGL.a, so the channel's revision is the only one available
+  # without building vitaGL from source. A different revision here is a different renderer.
+  VITAGL_PKG: "vitaGL 0.0.0.r1488.g2bdbe89-1"
+
+jobs:
+  build:
+    name: Build VPKs
+    runs-on: ubuntu-24.04
+    container:
+      image: vitasdk/vitasdk:latest
+      options: --user root
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # tp-vita does not vendor Dusklight: CMakeLists.txt requires TP_DEPS to point at a checkout
+      # that already contains this port's modifications. Until tools/fetch_dusklight.sh existed,
+      # those modifications had never been committed anywhere, so no fresh clone could be built.
+      # The script clones the pin, asserts the submodule revisions, and applies patches/dusklight/.
+      - name: Reconstruct the pinned Dusklight tree
+        run: |
+          set -eux
+          ./tools/fetch_dusklight.sh "$GITHUB_WORKSPACE/../dusklight"
+
+      - name: Report toolchain and pin
+        run: |
+          set -eux
+          echo "VITASDK=${VITASDK:-/usr/local/vitasdk}"
+          cmake --version | head -1
+          arm-vita-eabi-gcc --version | head -1
+          # If the reconstruction silently produced a different tree, the build would still succeed
+          # and ship a different program. Assert the shape instead of printing it: the pin, the two
+          # submodules, and the number of files the patch series touched. That count is the cheap
+          # tripwire -- a skipped or double-applied patch changes it.
+          git -C ../dusklight rev-parse HEAD
+          git -C ../dusklight/extern/aurora rev-parse HEAD
+          git -C ../dusklight/extern/borealis rev-parse HEAD
+          n=$(git -C ../dusklight status --porcelain | wc -l)
+          echo "patched files: $n"
+          test "$n" -eq 19
+
+      - name: Install pinned Vita packages
+        run: |
+          set -eux
+          vdpm refresh 2026.08 || vdpm refresh
+          vdpm upgrade
+          # Installed explicitly so a channel change cannot silently swap the renderer out from
+          # under a release build.
+          vdpm install ${VITAGL_PKG}
+          vdpm install SceShaccCgExt sdl3 kubridge taihen libmathneon vitaShaRK zlib
+          vdpm list | grep -iE "vitaGL|sdl3|kubridge|taihen|SceShaccCg|mathneon|vitaShaRK"
+
+      - name: Fetch pinned third-party sources
+        run: |
+          set -eux
+          ./tools/fetch_deps.sh
+
+      - name: Build the shipping VPK (TPLG00001)
+        run: |
+          set -eux
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTPV_PACKAGE=ON
+          cmake --build build --target tpv_vita-release.vpk-vpk -j "$(nproc)"
+
+      - name: Build the timing-clean VPK (TPLG30001)
+        run: |
+          set -eux
+          # A separate build tree: sharing one rebuilds everything on every switch, and one tree
+          # holds one set of flags. See tools/build.sh.
+          cmake -S . -B build-timing -DCMAKE_BUILD_TYPE=Release -DTPV_PACKAGE=ON -DTPV_TIMING_CLEAN=ON
+          cmake --build build-timing --target tpv_vita-release.vpk-vpk -j "$(nproc)"
+
+      - name: Verify both VPKs
+        run: |
+          set -eux
+          # check_vpk.py is the packaging gate: SELF magic, TITLE_ID shape, APP_VER shape, LiveArea
+          # PNG sizes and colour type, well-formed template.xml. These are the causes of most
+          # "installs but no bubble" and 0x8010113D.
+          python3 tools/check_vpk.py build/tpv_vita-release.vpk
+          python3 tools/check_vpk.py build-timing/tpv_vita-release.vpk
+          # Each must carry the title id its build type promises, so a packaging mix-up cannot
+          # publish the timing build under the release name.
+          python3 tools/verify_release_vpks.py \
+            build/tpv_vita-release.vpk build-timing/tpv_vita-release.vpk
+          sha256sum build/tpv_vita-release.vpk build-timing/tpv_vita-release.vpk
+
+      # The text-gap guard is NOT repeated here on purpose. It takes an ELF, not a VPK, and
+      # CMakeLists.txt already runs it as a POST_BUILD hook on $<TARGET_FILE:tpv_vita> after every
+      # link. Calling it again would need an ELF path that does not exist in this tree.
+
+      - name: Confirm neither VPK contains Sony modules or game data
+        run: |
+          set -eux
+          # Packaging checks cannot catch a copyright mistake: a VPK carrying libshacccg.suprx or
+          # the tester's own .ciso installs perfectly and is not distributable.
+          python3 tools/check_vpk_contents.py \
+            build/tpv_vita-release.vpk build-timing/tpv_vita-release.vpk
+
+      - name: Stage assets with release names
+        run: |
+          set -eux
+          cp build/tpv_vita-release.vpk        tpv_vita-release.vpk
+          cp build-timing/tpv_vita-release.vpk tpv_vita-timing.vpk
+          sha256sum tpv_vita-release.vpk tpv_vita-timing.vpk | tee SHA256SUMS.txt
+
+      - name: Upload as run artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tpv_vita-vpk
+          path: |
+            tpv_vita-release.vpk
+            tpv_vita-timing.vpk
+            SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Attach to the release for this tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            tpv_vita-release.vpk
+            tpv_vita-timing.vpk
+            SHA256SUMS.txt
+          fail_on_unmatched_files: true
+          prerelease: true
