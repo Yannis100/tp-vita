@@ -57,6 +57,23 @@ const unsigned int sceUserMainThreadStackSize = 8 * 1024 * 1024;
 /* Lower = higher priority. */
 const int sceUserMainThreadPriority = 0x60;
 
+/* ^^^ THE TWO `const` ABOVE DO NOTHING, AND THAT IS A MEASURED FACT, NOT A
+ * SUSPICION. At namespace scope in C++ a `const` object has INTERNAL linkage, so
+ * `sceUserMainThreadStackSize` and `sceUserMainThreadPriority` are invisible to
+ * the linker: crt0's weak references resolve to nothing and the stack stays at
+ * its small default. Verified with `arm-vita-eabi-nm` on build/tpv_vita: both
+ * symbols are absent from the ELF, while the two non-const ones above are `D`
+ * (defined, external). `objdump -s -j .data` shows the two values that ARE there.
+ *
+ * Consequence: the 8 MiB stack this file intends has never been applied. Any
+ * crash previously blamed on "deep recursion" should be re-examined with a stack
+ * that is actually 8 MiB before concluding the game needs more.
+ *
+ * The fix is `extern "C"` with non-const types, exactly as b3-vita/vita/src/
+ * main.cpp does it. It is left unapplied here because it changes a shipping
+ * port's runtime behaviour and belongs in its own tested change; recorded so it
+ * is not lost. */
+
 namespace {
 // The port's own folder: the disc image goes here, and so does boot.log.
 constexpr const char* kDataDir = "ux0:data/tpvita";
